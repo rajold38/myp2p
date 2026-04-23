@@ -1,10 +1,8 @@
 /**
- * PRO P2P — Telegram Bot (FIXED v3)
- * FIXES:
- *  1. Multiple active orders supported — cbId index keyed per-order
- *  2. Trade cbId always resolves correctly even with multiple orders
- *  3. processAdminAction: credit uses actionData.amt (not .amount)
- *  4. All other v2 fixes retained
+ * PRO P2P — Telegram Bot (FIXED v4)
+ * KEY FIX: processCallback always does a fresh Firebase scan — never relies
+ * solely on the in-memory index. This means approve/reject always works even
+ * for Order 1 after Order 2, 3, 4... are created.
  */
 
 const https = require("https");
@@ -23,10 +21,6 @@ const PORT        = process.env.PORT || 3000;
 let lastUpdateId   = 0;
 const seenUpdates  = new Set();
 const processingCb = new Set();
-
-const cbIdIndex   = new Map();
-let   indexBuiltAt = 0;
-const INDEX_TTL    = 30_000;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -86,7 +80,7 @@ async function tgPost(method, body) {
   try { return await req(`${TG_API}/${method}`, "POST", body, 15_000); }
   catch(e) { return { ok: false }; }
 }
-const tgSend     = (text) => tgPost("sendMessage", { chat_id: TG_CHAT, text, parse_mode: "Markdown" });
+const tgSend     = (text) => tgPost("sendMessage", { chat_id: TG_CHAT,     text, parse_mode: "Markdown" });
 const tgSendLog  = (text) => tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text, parse_mode: "Markdown" });
 const tgSendBoth = (text) => { tgSend(text); tgSendLog(text); };
 const tgAnswer   = (id, text, alert = false) => tgPost("answerCallbackQuery", { callback_query_id: id, text, show_alert: alert });
@@ -97,8 +91,8 @@ async function tgButtons(text, cbId) {
     { text: "✅ APPROVE", callback_data: `approve_${cbId}` },
     { text: "❌ REJECT",  callback_data: `reject_${cbId}`  }
   ]]};
-  const d = await tgPost("sendMessage", { chat_id: TG_CHAT, text, parse_mode: "Markdown", reply_markup: keyboard });
-  await tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text, parse_mode: "Markdown", reply_markup: keyboard });
+  const d = await tgPost("sendMessage", { chat_id: TG_CHAT,     text, parse_mode: "Markdown", reply_markup: keyboard });
+  await    tgPost("sendMessage",        { chat_id: TG_CHAT_LOG, text, parse_mode: "Markdown", reply_markup: keyboard });
   return d.ok ? d.result.message_id : null;
 }
 
@@ -125,10 +119,11 @@ async function updateHistStatus(firebaseUid, hid, status) {
   }
 }
 
-// ── NOTIFY CLIENT ─────────────────────────────────────
+// ── NOTIFY CLIENT VIA FIREBASE ────────────────────────
+// Client has onValue listener on adminActions — this triggers it instantly
 async function notifyClient(firebaseUid, cbId, payload) {
-  const key = cbId.replace(/[.#$\[\]/]/g, "_");
-  await fbSet(`users/${firebaseUid}/adminActions/${key}`, {
+  const safeKey = cbId.replace(/[.#$\[\]/]/g, "_");
+  await fbSet(`users/${firebaseUid}/adminActions/${safeKey}`, {
     ...payload,
     ts:        Date.now(),
     processed: false
@@ -136,58 +131,48 @@ async function notifyClient(firebaseUid, cbId, payload) {
 }
 
 // ════════════════════════════════════════════════════
-// cbId INDEX — rebuilt every 30s
-// KEY FIX: chats are keyed by ordId, scan ALL orders per user
+// CORE FIX: Fresh Firebase scan to resolve ANY cbId
+// This replaces the buggy index-only approach.
+// Scans: dep pendingReqs, wit pendingReqs, ALL chat states across ALL orders.
 // ════════════════════════════════════════════════════
-async function buildCbIndex() {
-  try {
-    const users = await fbGet("users");
-    if (!users || typeof users !== "object") return;
+async function findCbIdOwner(cbId) {
+  const users = await fbGet("users");
+  if (!users || typeof users !== "object") return null;
 
-    cbIdIndex.clear();
+  for (const [firebaseUid, userData] of Object.entries(users)) {
+    if (!userData) continue;
 
-    for (const [firebaseUid, userData] of Object.entries(users)) {
-      if (!userData) continue;
+    // Check deposit
+    const dep = userData.pendingReqs?.dep;
+    if (dep?.cbId === cbId) {
+      return { firebaseUid, type: "dep", data: dep };
+    }
 
-      // Deposit pending req
-      const dep = userData.pendingReqs?.dep;
-      if (dep?.cbId) cbIdIndex.set(dep.cbId, { firebaseUid, type: "dep" });
+    // Check withdrawal
+    const wit = userData.pendingReqs?.wit;
+    if (wit?.cbId === cbId) {
+      return { firebaseUid, type: "wit", data: wit };
+    }
 
-      // Withdrawal pending req
-      const wit = userData.pendingReqs?.wit;
-      if (wit?.cbId) cbIdIndex.set(wit.cbId, { firebaseUid, type: "wit" });
-
-      // Trade chat states — ALL orders, not just one
-      const chats = userData.chats;
-      if (chats && typeof chats === "object") {
-        for (const [ordId, cs] of Object.entries(chats)) {
-          if (cs?.cbId) {
-            cbIdIndex.set(cs.cbId, { firebaseUid, type: "trade", ordId });
-          }
+    // Check ALL chat states (supports multiple active orders)
+    const chats = userData.chats;
+    if (chats && typeof chats === "object") {
+      for (const [ordId, cs] of Object.entries(chats)) {
+        if (cs && cs.cbId === cbId) {
+          return { firebaseUid, type: "trade", ordId, data: cs };
         }
       }
     }
-
-    indexBuiltAt = Date.now();
-    console.log(`📇 cbId index built: ${cbIdIndex.size} entries`);
-  } catch(e) {
-    console.error("buildCbIndex error:", e.message);
   }
-}
 
-async function resolveCbId(cbId) {
-  if (cbIdIndex.has(cbId)) return cbIdIndex.get(cbId);
-  console.log(`cbId not in index, doing full scan: ${cbId}`);
-  await buildCbIndex();
-  if (cbIdIndex.has(cbId)) return cbIdIndex.get(cbId);
-  return null;
+  return null; // Not found anywhere
 }
 
 // ════════════════════════════════════════════════════
 // HANDLE DEPOSIT
 // ════════════════════════════════════════════════════
 async function handleDeposit(firebaseUid, dep, action) {
-  const t = nowIST();
+  const t        = nowIST();
   const userData = await fbGet(`users/${firebaseUid}`);
   if (!userData) return;
 
@@ -226,7 +211,7 @@ async function handleDeposit(firebaseUid, dep, action) {
 // HANDLE WITHDRAWAL
 // ════════════════════════════════════════════════════
 async function handleWithdrawal(firebaseUid, wit, action) {
-  const t = nowIST();
+  const t        = nowIST();
   const userData = await fbGet(`users/${firebaseUid}`);
   if (!userData) return;
 
@@ -265,11 +250,17 @@ async function handleWithdrawal(firebaseUid, wit, action) {
 // HANDLE TRADE
 // ════════════════════════════════════════════════════
 async function handleTrade(firebaseUid, ordId, chatState, action) {
-  const t = nowIST();
+  const t        = nowIST();
   const userData = await fbGet(`users/${firebaseUid}`);
   if (!userData) return;
+
+  // Always fetch the order fresh from Firebase
   const order = await fbGet(`users/${firebaseUid}/orders/${ordId}`);
-  if (!order) { console.log("Order not found:", ordId); return; }
+  if (!order) {
+    console.log(`Order not found in Firebase: ${ordId} for user ${firebaseUid}`);
+    await tgSend(`⚠️ Order \`#${ordId}\` not found — may already be completed.`);
+    return;
+  }
 
   if (action === "approve") {
     const txId = genTxId("TRD");
@@ -343,35 +334,38 @@ async function handleTrade(firebaseUid, ordId, chatState, action) {
 }
 
 // ════════════════════════════════════════════════════
-// PROCESS CALLBACK
+// PROCESS CALLBACK — always does a fresh scan
 // ════════════════════════════════════════════════════
 async function processCallback(cbId, action) {
-  const entry = await resolveCbId(cbId);
-  if (!entry) return false;
+  console.log(`🔍 Scanning Firebase for cbId: ${cbId}`);
+  const entry = await findCbIdOwner(cbId);
 
-  const { firebaseUid, type, ordId } = entry;
+  if (!entry) {
+    console.log(`cbId not found anywhere: ${cbId}`);
+    return false;
+  }
+
+  const { firebaseUid, type, ordId, data } = entry;
+  console.log(`Found cbId ${cbId} → type=${type} uid=${firebaseUid}`);
 
   if (type === "dep") {
-    const dep = await fbGet(`users/${firebaseUid}/pendingReqs/dep`);
-    if (!dep || dep.cbId !== cbId) return false;
-    await handleDeposit(firebaseUid, dep, action);
-    cbIdIndex.delete(cbId);
+    await handleDeposit(firebaseUid, data, action);
     return true;
   }
 
   if (type === "wit") {
-    const wit = await fbGet(`users/${firebaseUid}/pendingReqs/wit`);
-    if (!wit || wit.cbId !== cbId) return false;
-    await handleWithdrawal(firebaseUid, wit, action);
-    cbIdIndex.delete(cbId);
+    await handleWithdrawal(firebaseUid, data, action);
     return true;
   }
 
   if (type === "trade") {
-    const chatState = await fbGet(`users/${firebaseUid}/chats/${ordId}`);
-    if (!chatState || chatState.cbId !== cbId) return false;
-    await handleTrade(firebaseUid, ordId, chatState, action);
-    cbIdIndex.delete(cbId);
+    // data is the chatState; fetch fresh from Firebase to be sure
+    const freshChatState = await fbGet(`users/${firebaseUid}/chats/${ordId}`);
+    if (!freshChatState) {
+      console.log(`Chat state gone for ordId ${ordId} — already processed?`);
+      return false;
+    }
+    await handleTrade(firebaseUid, ordId, freshChatState, action);
     return true;
   }
 
@@ -408,7 +402,6 @@ async function handleCredit(targetUID, addAmt) {
       txid:    `p2ppro_${Date.now()}`
     });
 
-    // KEY FIX: use 'amt' not 'amount' — matches frontend processAdminAction
     const creditCbId = `credit_${Date.now()}`;
     await notifyClient(firebaseUid, creditCbId, {
       action:     "credit",
@@ -438,7 +431,7 @@ async function handleStats() {
     if (u.orders) activeOrders += Object.keys(u.orders).length;
   }
   await tgSend(
-    `📊 *SITE STATS*\n\n👥 Users: *${userCount}*\n💰 Total USDT: *${totalBal.toFixed(2)}*\n📥 Pending Deposits: *${pendingDep}*\n💼 Pending Withdrawals: *${pendingWit}*\n🤝 Active Orders: *${activeOrders}*\n📇 Cached cbIds: *${cbIdIndex.size}*\n⏰ ${nowIST()} IST`
+    `📊 *SITE STATS*\n\n👥 Users: *${userCount}*\n💰 Total USDT: *${totalBal.toFixed(2)}*\n📥 Pending Deposits: *${pendingDep}*\n💼 Pending Withdrawals: *${pendingWit}*\n🤝 Active Orders: *${activeOrders}*\n⏰ ${nowIST()} IST`
   );
 }
 
@@ -449,12 +442,13 @@ async function handleTxLookup(txid) {
   for (const [firebaseUid, userData] of Object.entries(users)) {
     if (!userData) continue;
 
+    // Search history
     const hist = userData.history;
     if (hist) {
       for (const [, h] of Object.entries(hist)) {
         if (!h) continue;
-        const matchTx  = (h.txid  || "").toUpperCase() === txid;
-        const matchHid = (h.hid   || "").toUpperCase() === txid;
+        const matchTx  = (h.txid || "").toUpperCase() === txid;
+        const matchHid = (h.hid  || "").toUpperCase() === txid;
         if (matchTx || matchHid) {
           const st     = (h.status || "PENDING").toUpperCase();
           const stIcon = { COMPLETED:"✅", REJECTED:"❌", CANCELLED:"🚫", PENDING:"⏳" }[st] || "⏳";
@@ -464,7 +458,7 @@ async function handleTxLookup(txid) {
           if (h.inr)      msg += `\n💵 ₹${Number(h.inr).toLocaleString()}`;
 
           if (st === "PENDING") {
-            const pr = userData.pendingReqs;
+            const pr      = userData.pendingReqs;
             const pending = pr?.dep?.hid === h.hid ? pr.dep : pr?.wit?.hid === h.hid ? pr.wit : null;
             if (pending) { await tgButtons(msg + "\n\n⚡ *Re-send approval:*", pending.cbId); return; }
           }
@@ -474,13 +468,13 @@ async function handleTxLookup(txid) {
       }
     }
 
-    // Search active orders — supports multiple orders
-    const ordId = txid.replace(/^ORD-?/i, "");
+    // Search active orders
+    const ordIdStr = txid.replace(/^ORD-?/i, "");
     const allOrders = userData.orders;
     if (allOrders && typeof allOrders === "object") {
       for (const [oKey, order] of Object.entries(allOrders)) {
         if (!order) continue;
-        if (String(order.id) === String(ordId) || String(order.id).toUpperCase() === txid) {
+        if (String(order.id) === String(ordIdStr) || String(order.id).toUpperCase() === txid) {
           const cs  = userData.chats?.[oKey] || {};
           let msg = `🔍 *ACTIVE ORDER*\n\n📋 \`#${order.id}\`\n👤 \`${userData.uid}\` | *${userData.name}*\n💹 *${order.mode}*\n🪙 ${order.usdt.toFixed(2)} USDT | ₹${Number(order.inr).toLocaleString()}\n📊 Stage: ${cs.dealStage || "init"}\n\n⏳ *PENDING*`;
           if (cs.cbId && cs.dealStage === "pending_verify") {
@@ -502,8 +496,7 @@ async function handleTxLookup(txid) {
 async function poll() {
   const data = await req(
     `${TG_API}/getUpdates?offset=${lastUpdateId + 1}&timeout=25&allowed_updates=["message","callback_query"]`,
-    "GET", null,
-    35_000
+    "GET", null, 35_000
   );
 
   if (!data.ok || !data.result?.length) return;
@@ -519,7 +512,7 @@ async function poll() {
       arr.slice(0, 500).forEach(x => seenUpdates.delete(x));
     }
 
-    // ── CALLBACK ────────────────────────────────────
+    // ── CALLBACK ──────────────────────────────────
     if (update.callback_query) {
       const cb     = update.callback_query;
       const d      = cb.data || "";
@@ -546,18 +539,20 @@ async function poll() {
       try {
         const found = await processCallback(cbId, action);
         if (!found) {
-          await tgSend(`⚠️ *Not found or already processed*\n\ncbId: \`${cbId}\`\n\nTry \`#ORD-XXXXXXXX\` or \`#DEP-XXXXXX\` to look it up.`);
+          await tgSend(
+            `⚠️ *Not found or already processed*\n\ncbId: \`${cbId}\`\n\nOrder may have already been completed or cancelled.\nUse \`#ORD-XXXXXXXX\` to check status.`
+          );
         }
       } catch(e) {
         console.error("processCallback error:", e.message);
-        await tgSend(`❌ *Error processing*\n\n\`${e.message}\``);
+        await tgSend(`❌ *Error:* \`${e.message}\``);
       } finally {
         processingCb.delete(cbId);
       }
       continue;
     }
 
-    // ── TEXT MESSAGES ────────────────────────────────
+    // ── TEXT MESSAGES ──────────────────────────────
     if (update.message) {
       const msg    = update.message;
       const text   = (msg.text || "").trim();
@@ -567,11 +562,10 @@ async function poll() {
 
       if (text === "/help" || text === "/start" || text === "/txhelp") {
         await tgSend(
-          `📖 *PRO P2P BOT v3 — MULTI-ORDER*\n\n` +
-          `✅ Multiple active orders supported\n` +
-          `✅ Approve/Reject works even 24h later\n` +
-          `✅ Near-instant response (long-polling)\n` +
-          `✅ Old buttons never expire\n\n` +
+          `📖 *PRO P2P Bot v4 — Multi-Order Fixed*\n\n` +
+          `✅ All orders always approvable\n` +
+          `✅ Fresh Firebase scan per callback\n` +
+          `✅ No stale index issues\n\n` +
           `*Lookup:*\n` +
           `\`#DEP-XXXXXX\` — deposit\n` +
           `\`#WIT-XXXXXX\` — withdrawal\n` +
@@ -597,13 +591,15 @@ async function poll() {
 
       const balMatch = text.match(/^#([A-Z0-9]{4,10})\s+([\d.]+)$/i);
       if (balMatch) {
-        const uid = balMatch[1].toUpperCase();
-        const amt = parseFloat(balMatch[2]);
+        const targetUID = balMatch[1].toUpperCase();
+        const amt       = parseFloat(balMatch[2]);
         if (!amt || amt <= 0) { await tgSend("❌ Invalid amount."); continue; }
-        await tgSend(`⏳ Crediting \`${uid}\` with ${amt} USDT...`);
-        await handleCredit(uid, amt);
+        await tgSend(`⏳ Crediting \`${targetUID}\` with ${amt} USDT...`);
+        await handleCredit(targetUID, amt);
         continue;
       }
+
+      // Forward chat messages to deal page (handled by client poll)
     }
   }
 }
@@ -613,25 +609,21 @@ async function poll() {
 // ════════════════════════════════════════════════════
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end(`PRO P2P Bot v3 ✅\nUptime: ${Math.floor(process.uptime())}s\nIndexed cbIds: ${cbIdIndex.size}`);
+  res.end(`PRO P2P Bot v4 ✅\nUptime: ${Math.floor(process.uptime())}s\n`);
 }).listen(PORT, () => {
   console.log(`Keep-alive server on port ${PORT}`);
 });
 
-buildCbIndex().then(() => {
-  console.log("🤖 PRO P2P Bot v3 started — long-polling Telegram");
-  console.log(`Firebase: ${FB_URL}`);
+console.log("🤖 PRO P2P Bot v4 started — fresh Firebase scan per callback");
+console.log(`Firebase: ${FB_URL}`);
 
-  setInterval(buildCbIndex, 30_000);
-
-  (async () => {
-    while (true) {
-      try {
-        await poll();
-      } catch(e) {
-        console.error("Poll loop error:", e.message);
-        await sleep(3000);
-      }
+(async () => {
+  while (true) {
+    try {
+      await poll();
+    } catch(e) {
+      console.error("Poll loop error:", e.message);
+      await sleep(3000);
     }
-  })();
-});
+  }
+})();
