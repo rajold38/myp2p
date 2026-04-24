@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: p2p-telegram-bot
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT
+        sync: false
+      - key: FIREBASE_DB_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
