@@ -1,28 +1,36 @@
 /**
- * PRO P2P — Telegram Bot v5 (FULL BACKEND)
+ * PRO P2P — bot.js v6
  *
- * NEW IN v5:
- * ✅ Frontend ne TG calls karna band — bot khud Firebase watch karta hai
- * ✅ Bot detects: new deposits, withdrawals, orders, trade-stage changes
- * ✅ Bot forwards user chat → Telegram automatically
- * ✅ Bot forwards admin Telegram reply → Firebase chat automatically
- * ✅ TG_TOKEN ab sirf Render env var mein — frontend mein NOT exposed
+ * HOW IT WORKS WITH index.html:
+ * ─────────────────────────────
+ * index.html writes to Firebase:
+ *   pendingActions/<cbId>  → deposit / withdraw / trade context
+ *   users/<fuid>/pendingReqs/dep|wit  → persisted pending state
+ *   users/<fuid>/chats/<ordId>        → chat + dealStage
+ *   users/<fuid>/orders/<ordId>       → order data
  *
- * DEPLOY ON: Render (Web Service, Node 18+, free tier OK)
- * ENV VARS REQUIRED:
- *   TG_TOKEN     = your bot token
+ * bot.js reads from Firebase every 2s:
+ *   - Watches pendingActions/ for new requests → sends TG buttons
+ *   - Watches callback_queries → APPROVE/REJECT → writes result to
+ *     users/<fuid>/botResults/<key>  ← index.html listens here live
+ *   - Forwards admin TG replies → users/<fuid>/botResults/<key> as chat_message
+ *   - Handles /allstats, #UID AMOUNT credit commands
+ *
+ * DEPLOY ON: Render (Web Service, Node 18+)
+ * ENV VARS:
+ *   TG_TOKEN     = bot token
  *   TG_CHAT      = primary admin chat id
  *   TG_CHAT_LOG  = log chat id
  *   FB_URL       = https://my-p2p-5d11a-default-rtdb.firebaseio.com
- *   FB_SECRET    = (optional) firebase database secret
- *   PORT         = (Render auto-sets)
+ *   FB_SECRET    = firebase database secret (optional)
+ *   PORT         = auto-set by Render
  */
 
 const https = require("https");
 const http  = require("http");
 
-// ── CONFIG (from env, with fallbacks) ────────────────
-const TG_TOKEN    = process.env.TG_TOKEN    || "8665516559:AAGROglGKRrQl7lx4EyjoV7SkG0LHI-GJW0";
+// ── CONFIG ───────────────────────────────────────────
+const TG_TOKEN    = process.env.TG_TOKEN    || "7284611660:AAGb49YDYdH6my_WT5DS8jBhWsGGmeAOPkI";
 const TG_CHAT     = process.env.TG_CHAT     || "8515209984";
 const TG_CHAT_LOG = process.env.TG_CHAT_LOG || "64552009";
 const FB_URL      = process.env.FB_URL      || "https://my-p2p-5d11a-default-rtdb.firebaseio.com";
@@ -30,18 +38,13 @@ const FB_SECRET   = process.env.FB_SECRET   || "";
 const TG_API      = `https://api.telegram.org/bot${TG_TOKEN}`;
 const PORT        = process.env.PORT || 3000;
 
-const FB_POLL_INTERVAL = 2000; // 2 seconds
-
 // ── STATE ────────────────────────────────────────────
 let lastUpdateId      = 0;
 const seenUpdates     = new Set();
 const processingCb    = new Set();
-const seenDeposits    = new Set();   // firebaseUid+hid
-const seenWithdrawals = new Set();
-const seenOrders      = new Set();   // firebaseUid+ordId
-const seenChatStages  = new Map();   // ordId -> last dealStage
-const seenUserMsgs    = new Set();   // ordId+msgId  (avoid duplicate forwards)
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const seenActions     = new Set();   // cbIds already sent to TG
+const seenAdminMsgs   = new Set();   // msgId already forwarded to Firebase
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── HTTP HELPER ──────────────────────────────────────
 function httpReq(url, method = "GET", body = null, timeoutMs = 35_000) {
@@ -55,57 +58,62 @@ function httpReq(url, method = "GET", body = null, timeoutMs = 35_000) {
       headers:  { "Content-Type": "application/json" },
       timeout:  timeoutMs
     };
-    const r = lib.request(opt, (res) => {
+    const r = lib.request(opt, res => {
       let d = "";
       res.on("data", c => d += c);
       res.on("end", () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({}); } });
     });
-    r.on("timeout", () => { r.destroy(); reject(new Error("Request timeout")); });
+    r.on("timeout", () => { r.destroy(); reject(new Error("timeout")); });
     r.on("error", reject);
     if (body) r.write(JSON.stringify(body));
     r.end();
   });
 }
 
-// ── FIREBASE HELPERS ─────────────────────────────────
-const auth = FB_SECRET ? `?auth=${FB_SECRET}` : "";
-async function fbGet(path)        { try { return await httpReq(`${FB_URL}/${path}.json${auth}`, "GET"); } catch(e) { return null; } }
-async function fbSet(path, val)   { try { await httpReq(`${FB_URL}/${path}.json${auth}`, "PUT", val); } catch(e) {} }
-async function fbPatch(path, val) { try { await httpReq(`${FB_URL}/${path}.json${auth}`, "PATCH", val); } catch(e) {} }
-async function fbDelete(path)     { try { await httpReq(`${FB_URL}/${path}.json${auth}`, "DELETE"); } catch(e) {} }
-async function fbPush(path, val)  { try { return await httpReq(`${FB_URL}/${path}.json${auth}`, "POST", val); } catch(e) { return null; } }
+// ── FIREBASE ─────────────────────────────────────────
+const authQ = FB_SECRET ? `?auth=${FB_SECRET}` : "";
+const fbGet    = async p => { try { return await httpReq(`${FB_URL}/${p}.json${authQ}`, "GET"); } catch(e) { return null; } };
+const fbSet    = async (p,v) => { try { await httpReq(`${FB_URL}/${p}.json${authQ}`, "PUT",    v); } catch(e) {} };
+const fbPatch  = async (p,v) => { try { await httpReq(`${FB_URL}/${p}.json${authQ}`, "PATCH",  v); } catch(e) {} };
+const fbDelete = async p     => { try { await httpReq(`${FB_URL}/${p}.json${authQ}`, "DELETE"); } catch(e) {} };
+const fbPush   = async (p,v) => { try { return await httpReq(`${FB_URL}/${p}.json${authQ}`, "POST", v); } catch(e) { return null; } };
 
-// ── TELEGRAM HELPERS ─────────────────────────────────
-async function tgPost(method, body) { try { return await httpReq(`${TG_API}/${method}`, "POST", body, 15_000); } catch(e) { return { ok: false }; } }
-const tgSend     = (text) => tgPost("sendMessage", { chat_id: TG_CHAT,     text, parse_mode: "Markdown" });
-const tgSendLog  = (text) => tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text, parse_mode: "Markdown" });
-const tgSendBoth = (text) => { tgSend(text); tgSendLog(text); };
-const tgAnswer   = (id, text, alert = false) => tgPost("answerCallbackQuery", { callback_query_id: id, text, show_alert: alert });
-const tgEdit     = (msgId, text) => tgPost("editMessageText", { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: "Markdown" });
+// ── TELEGRAM ─────────────────────────────────────────
+const tgPost     = async (m, b) => { try { return await httpReq(`${TG_API}/${m}`, "POST", b, 15_000); } catch(e) { return {ok:false}; } };
+const tgSend     = t => tgPost("sendMessage", { chat_id: TG_CHAT,     text: t, parse_mode: "Markdown" });
+const tgSendLog  = t => tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text: t, parse_mode: "Markdown" });
+const tgSendBoth = t => { tgSend(t); tgSendLog(t); };
+const tgAnswer   = (id, t) => tgPost("answerCallbackQuery", { callback_query_id: id, text: t });
+const tgEditMain = (mid, t) => tgPost("editMessageText", { chat_id: TG_CHAT, message_id: mid, text: t, parse_mode: "Markdown" });
 
 async function tgButtons(text, cbId) {
-  const keyboard = { inline_keyboard: [[
+  const kb = { inline_keyboard: [[
     { text: "✅ APPROVE", callback_data: `approve_${cbId}` },
     { text: "❌ REJECT",  callback_data: `reject_${cbId}`  }
   ]]};
-  const d = await tgPost("sendMessage", { chat_id: TG_CHAT, text, reply_markup: keyboard });
-  await tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text, reply_markup: keyboard });
+  // Send to BOTH chats with buttons
+  const d = await tgPost("sendMessage", { chat_id: TG_CHAT,     text, parse_mode: "Markdown", reply_markup: kb });
+           await tgPost("sendMessage", { chat_id: TG_CHAT_LOG, text, parse_mode: "Markdown", reply_markup: kb });
   return d.ok ? d.result.message_id : null;
 }
 
 // ── UTILS ────────────────────────────────────────────
-function nowIST() { return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }); }
-function genCbId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-}
-function genTxId(prefix) {
-  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let id = "";
-  for (let i = 0; i < 6; i++) id += c[Math.floor(Math.random() * c.length)];
-  return `${prefix}-${id}`;
+const nowIST = () => new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+
+// Safe Firebase key (no . # $ [ ] / )
+const safeKey = s => String(s).replace(/[.#$[\]/]/g, "_");
+
+// Write result to user's botResults — index.html listens to this path
+async function writeResult(firebaseUid, key, payload) {
+  const k = safeKey(key);
+  await fbSet(`users/${firebaseUid}/botResults/${k}`, {
+    ...payload,
+    ts: Date.now(),
+    processed: false
+  });
 }
 
-// ── UPDATE HISTORY STATUS ────────────────────────────
+// Update history entry status by hid
 async function updateHistStatus(firebaseUid, hid, status) {
   const hist = await fbGet(`users/${firebaseUid}/history`);
   if (!hist || typeof hist !== "object") return;
@@ -117,302 +125,289 @@ async function updateHistStatus(firebaseUid, hid, status) {
   }
 }
 
-// ── NOTIFY CLIENT ────────────────────────────────────
-async function notifyClient(firebaseUid, cbId, payload) {
-  const safeKey = cbId.replace(/[.#$\[\]/]/g, "_");
-  await fbSet(`users/${firebaseUid}/adminActions/${safeKey}`, {
-    ...payload, ts: Date.now(), processed: false
-  });
-}
+// ════════════════════════════════════════════════════════
+// POLL pendingActions/ — index.html writes here when user
+// initiates deposit / withdrawal / trade-claim
+// Bot sends TG buttons the FIRST TIME it sees each cbId
+// ════════════════════════════════════════════════════════
+async function pollPendingActions() {
+  const actions = await fbGet("pendingActions");
+  if (!actions || typeof actions !== "object") return;
 
-// ════════════════════════════════════════════════════
-// FIREBASE WATCHER — har 2 sec scan kare
-// ════════════════════════════════════════════════════
-async function pollFirebase() {
-  const users = await fbGet("users");
-  if (!users || typeof users !== "object") return;
+  for (const [cbId, ctx] of Object.entries(actions)) {
+    if (!ctx || ctx.botSent || seenActions.has(cbId)) continue;
 
-  for (const [firebaseUid, userData] of Object.entries(users)) {
-    if (!userData) continue;
-    const userLabel = `${userData.uid || "?"} | ${userData.name || "?"}`;
+    seenActions.add(cbId);
+    const t = nowIST();
 
-    // ─── 1. NEW DEPOSITS ──────────────────────────
-    const dep = userData.pendingReqs?.dep;
-    if (dep && dep.hid && !dep.cbId) {
-      const key = `${firebaseUid}:${dep.hid}`;
-      if (!seenDeposits.has(key)) {
-        seenDeposits.add(key);
-        const cbId = genCbId("dep");
-        const text = `📥 *NEW DEPOSIT REQUEST*\n\n👤 ${userLabel}\n📧 ${userData.email || "—"}\n💰 *${dep.amt} USDT*\n🌐 Network: ${dep.network || "BEP20"}\n🔖 TxID: \`${dep.txid || "—"}\`\n📋 HID: \`${dep.hid}\`\n⏰ ${nowIST()} IST`;
-        const msgId = await tgButtons(text, cbId);
-        await fbPatch(`users/${firebaseUid}/pendingReqs/dep`, { cbId, msgId });
-        console.log(`📥 New DEP ${dep.amt} USDT → ${userData.uid}`);
+    try {
+      let text = "";
+      let msgId = null;
+
+      if (ctx.type === "deposit") {
+        text =
+          `📥 *DEPOSIT REQUEST*\n\n` +
+          `👤 UID: \`${ctx.uid || "?"}\`\n` +
+          `👤 User: *${ctx.userName || "Guest"}*\n` +
+          `📧 Email: \`${ctx.userEmail || "—"}\`\n` +
+          `💰 Amount: *${ctx.amt} USDT*\n` +
+          `🌐 Network: ${ctx.network || "BEP20"}\n` +
+          `📍 Address: \`${ctx.address || "—"}\`\n` +
+          `🔗 TxID: \`${ctx.txid || "—"}\`\n` +
+          `⏰ ${t} IST\n\n` +
+          `✅ APPROVE = credit USDT\n❌ REJECT = decline`;
+        msgId = await tgButtons(text, cbId);
+
+      } else if (ctx.type === "withdraw") {
+        text =
+          `💼 *WITHDRAWAL REQUEST*\n\n` +
+          `👤 UID: \`${ctx.uid || "?"}\`\n` +
+          `👤 User: *${ctx.userName || "Guest"}*\n` +
+          `📧 Email: \`${ctx.userEmail || "—"}\`\n` +
+          `💰 Amount: *${ctx.amt} USDT*\n` +
+          `🌐 Network: ${ctx.network || "BEP20"}\n` +
+          `📤 Address: \`${ctx.address || "—"}\`\n` +
+          `🔗 TxID: \`${ctx.txid || "—"}\`\n` +
+          `⏰ ${t} IST\n\n` +
+          `✅ APPROVE = send funds\n❌ REJECT = refund`;
+        msgId = await tgButtons(text, cbId);
+
+      } else if (ctx.type === "trade") {
+        const isBuy = ctx.orderMode === "BUY";
+        const headline = isBuy
+          ? `💸 *P2P BUY — PAYMENT CLAIMED*`
+          : `🔓 *P2P SELL — USDT RELEASE REQUEST*`;
+        text =
+          `${headline}\n\n` +
+          `👤 UID: \`${ctx.uid || "?"}\`\n` +
+          `👤 User: *${ctx.userName || "Guest"}*\n` +
+          `📧 Email: \`${ctx.userEmail || "—"}\`\n` +
+          `📋 Order: \`#${ctx.orderId}\`\n` +
+          `🏪 Merchant: *${ctx.merchant || "—"}*\n` +
+          (isBuy
+            ? `💵 INR Paid: *₹${Number(ctx.inr).toLocaleString()}*\n` +
+              `🪙 USDT: *${Number(ctx.usdt).toFixed(2)} USDT*\n`
+            : `🪙 USDT: *${Number(ctx.usdt).toFixed(2)} USDT*\n` +
+              `💵 INR: *₹${Number(ctx.inr).toLocaleString()}*\n`
+          ) +
+          `⏰ ${t} IST\n\n` +
+          `✅ APPROVE = TRADE COMPLETE\n` +
+          `❌ REJECT = ${isBuy ? "TRADE CANCELED" : "REFUND USDT"}\n` +
+          `💬 *Reply to this message* to chat with user`;
+        msgId = await tgButtons(text, cbId);
       }
-    }
 
-    // ─── 2. NEW WITHDRAWALS ───────────────────────
-    const wit = userData.pendingReqs?.wit;
-    if (wit && wit.hid && !wit.cbId) {
-      const key = `${firebaseUid}:${wit.hid}`;
-      if (!seenWithdrawals.has(key)) {
-        seenWithdrawals.add(key);
-        const cbId = genCbId("wit");
-        const text = `💼 *NEW WITHDRAWAL REQUEST*\n\n👤 ${userLabel}\n📧 ${userData.email || "—"}\n💸 *${wit.amt} USDT*\n📍 Address: \`${wit.address || "—"}\`\n🌐 Network: ${wit.network || "BEP20"}\n📋 HID: \`${wit.hid}\`\n⏰ ${nowIST()} IST`;
-        const msgId = await tgButtons(text, cbId);
-        await fbPatch(`users/${firebaseUid}/pendingReqs/wit`, { cbId, msgId });
-        console.log(`💼 New WIT ${wit.amt} USDT → ${userData.uid}`);
-      }
-    }
+      // Mark as sent in Firebase so we don't re-send on next poll
+      await fbPatch(`pendingActions/${cbId}`, { botSent: true, msgId: msgId || null });
+      console.log(`📨 Sent TG buttons for ${ctx.type} cbId=${cbId} → uid=${ctx.uid}`);
 
-    // ─── 3. NEW ORDERS / TRADE STAGE CHANGES ──────
-    const orders = userData.orders;
-    const chats  = userData.chats;
-    if (orders && typeof orders === "object") {
-      for (const [ordId, order] of Object.entries(orders)) {
-        if (!order) continue;
-        const ordKey = `${firebaseUid}:${ordId}`;
-
-        // New order announcement
-        if (!seenOrders.has(ordKey)) {
-          seenOrders.add(ordKey);
-          tgSendLog(`🆕 *NEW ORDER PLACED*\n\n👤 ${userLabel}\n📋 \`#${order.id}\`\n💹 *${order.mode}* ${order.usdt?.toFixed(2)} USDT\n💵 ₹${Number(order.inr).toLocaleString()}\n🏪 ${order.merchant || "—"}\n⏰ ${nowIST()} IST`);
-          console.log(`🆕 New order #${order.id} → ${userData.uid}`);
-        }
-
-        // Trade reached pending_verify stage → send approve/reject buttons
-        const cs = chats?.[ordId];
-        if (cs && cs.dealStage === "pending_verify") {
-          // Use actionRequestId as the unique key for this specific action
-          const requestId = cs.actionRequestId || null;
-
-          // Build a unique notification key:
-          // - If we have an actionRequestId, use it (most reliable)
-          // - Otherwise fall back to ordKey + dealStage (legacy)
-          const notifKey = requestId
-            ? `${firebaseUid}:${ordId}:${requestId}`
-            : `${firebaseUid}:${ordId}:pending_verify_legacy`;
-
-          const alreadyNotified = seenChatStages.get(`${firebaseUid}:${ordId}`) === notifKey;
-
-          if (!alreadyNotified) {
-            seenChatStages.set(`${firebaseUid}:${ordId}`, notifKey);
-
-            const cbId = genCbId("trd");
-            const isBuy = order.mode === "BUY";
-            const headline = isBuy
-              ? "💰 BUYER CLAIMS PAID — VERIFY INR"
-              : "🚀 SELLER WANTS TO RELEASE USDT — VERIFY";
-            const actionLine = isBuy
-              ? `Buyer paid ₹${Number(order.inr).toLocaleString()} via UPI. Verify receipt then APPROVE to release ${order.usdt?.toFixed(2)} USDT.`
-              : `Seller says INR is received. Verify and APPROVE to release ${order.usdt?.toFixed(2)} USDT.`;
-            const text =
-              `${headline}\n\n` +
-              `User: ${userLabel}\n` +
-              `Order: #${order.id}\n` +
-              `Mode: ${order.mode}\n` +
-              `USDT: ${order.usdt?.toFixed(2)}\n` +
-              `INR: ₹${Number(order.inr).toLocaleString()}\n` +
-              `Rate: ₹${order.rate}\n` +
-              `Merchant: ${order.merchant || "—"}\n` +
-              (cs.utr ? `UTR: ${cs.utr}\n` : "") +
-              `Time: ${nowIST()} IST\n` +
-              (requestId ? `Request: ${requestId}\n\n` : `\n`) +
-              `${actionLine}`;
-
-            const msgId = await tgButtons(text, cbId);
-            if (msgId) {
-              // Write cbId + lastNotifiedActionRequestId back to Firebase
-              await fbPatch(`users/${firebaseUid}/chats/${ordId}`, {
-                cbId,
-                tgMsgId: msgId,
-                lastNotifiedActionRequestId: notifKey
-              });
-              console.log(`🤝 Trade ${isBuy ? "PAID-claim" : "RELEASE"} #${order.id} → cbId=${cbId}`);
-            } else {
-              // Failed to send — remove from seenChatStages so we retry next poll
-              seenChatStages.delete(`${firebaseUid}:${ordId}`);
-              console.log(`⚠️ Trade button send failed for #${order.id}`);
-            }
-          }
-        }
-
-        // Reset seenChatStages when dealStage is no longer pending_verify
-        // (order completed/cancelled) so next order on same ordId works fresh
-        if (cs && cs.dealStage !== "pending_verify") {
-          seenChatStages.delete(`${firebaseUid}:${ordId}`);
-        }
-      }
-    }
-
-    // ─── 4. FORWARD USER CHAT MESSAGES TO TELEGRAM ──
-    if (chats && typeof chats === "object") {
-      for (const [ordId, cs] of Object.entries(chats)) {
-        if (!cs?.userMsgs) continue;
-        for (const [msgId, msg] of Object.entries(cs.userMsgs)) {
-          if (!msg || msg.forwarded) continue;
-          const fwdKey = `${ordId}:${msgId}`;
-          if (seenUserMsgs.has(fwdKey)) continue;
-          seenUserMsgs.add(fwdKey);
-          const text = `💬 *USER CHAT* — \`#${ordId}\`\n👤 ${userLabel}\n\n${msg.text || "(empty)"}\n\n_Reply with:_ \`/r ${ordId} your message\``;
-          await tgSend(text);
-          await fbPatch(`users/${firebaseUid}/chats/${ordId}/userMsgs/${msgId}`, { forwarded: true });
-        }
-      }
+    } catch(e) {
+      // Remove from seenActions so we retry next poll
+      seenActions.delete(cbId);
+      console.error(`⚠️ pollPendingActions error for ${cbId}:`, e.message);
     }
   }
 }
 
-// ════════════════════════════════════════════════════
-// HANDLE DEPOSIT / WITHDRAWAL / TRADE (same as v4)
-// ════════════════════════════════════════════════════
-async function findCbIdOwner(cbId) {
+// ════════════════════════════════════════════════════════
+// HANDLE APPROVE / REJECT
+// Writes result to users/<fuid>/botResults/<key>
+// index.html's subscribeBotResults() picks this up in real-time
+// ════════════════════════════════════════════════════════
+async function handleApprove(cbId, ctx) {
+  const { type, firebaseUid, hid, amt, orderId, orderMode, usdt, inr, merchant, rate, msgId } = ctx;
+  const t = nowIST();
+
+  if (type === "deposit") {
+    // Credit balance
+    const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
+    const newBal = parseFloat((bal + parseFloat(amt)).toFixed(8));
+    await fbSet(`users/${firebaseUid}/balance`, newBal);
+    await updateHistStatus(firebaseUid, hid, "COMPLETED");
+    // Clean up pendingReqs
+    await fbDelete(`users/${firebaseUid}/pendingReqs/dep`);
+    // Clean up pendingActions
+    await fbDelete(`pendingActions/${cbId}`);
+    // Notify frontend
+    await writeResult(firebaseUid, `dep_${cbId}`, {
+      type: "deposit", action: "approve", cbId, hid, amt: parseFloat(amt), newBalance: newBal
+    });
+    if (msgId) tgEditMain(msgId, `✅ *DEPOSIT APPROVED*\n\nUID: \`${ctx.uid}\`\nAmount: *${amt} USDT*\nNew Balance: *${newBal.toFixed(2)} USDT*\n⏰ ${t} IST`);
+    tgSendLog(`✅ DEP approved +${amt} USDT → ${ctx.uid}`);
+    console.log(`✅ DEP approved ${amt} → ${ctx.uid}`);
+
+  } else if (type === "withdraw") {
+    await updateHistStatus(firebaseUid, hid, "COMPLETED");
+    await fbDelete(`users/${firebaseUid}/pendingReqs/wit`);
+    await fbDelete(`pendingActions/${cbId}`);
+    await writeResult(firebaseUid, `wit_${cbId}`, {
+      type: "withdraw", action: "approve", cbId, hid, amt: parseFloat(amt)
+    });
+    if (msgId) tgEditMain(msgId, `✅ *WITHDRAWAL SENT*\n\nUID: \`${ctx.uid}\`\nAmount: *${amt} USDT*\n⏰ ${t} IST`);
+    tgSendLog(`✅ WIT approved ${amt} USDT → ${ctx.uid}`);
+    console.log(`✅ WIT approved ${amt} → ${ctx.uid}`);
+
+  } else if (type === "trade") {
+    const txId = `0x${[...Array(64)].map(()=>"0123456789abcdef"[Math.floor(Math.random()*16)]).join("")}`;
+    // Credit balance for BUY
+    if (orderMode === "BUY") {
+      const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
+      await fbSet(`users/${firebaseUid}/balance`, parseFloat((bal + parseFloat(usdt)).toFixed(8)));
+    }
+    // Add to history
+    await fbPush(`users/${firebaseUid}/history`, {
+      hid: `h_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
+      type: orderMode, amt: parseFloat(usdt), status: "COMPLETED",
+      uid: ctx.uid, date: t, isoDate: new Date().toISOString(), ts: Date.now(),
+      merchant, rate, inr, txid: txId, network: "BEP20"
+    });
+    // Remove order + chat
+    await fbDelete(`users/${firebaseUid}/orders/${orderId}`);
+    await fbDelete(`users/${firebaseUid}/chats/${orderId}`);
+    await fbDelete(`pendingActions/${cbId}`);
+    // Notify frontend
+    await writeResult(firebaseUid, `trd_${cbId}`, {
+      type: "trade", action: "approve", cbId, orderId: String(orderId), orderMode, usdt: parseFloat(usdt)
+    });
+    if (msgId) tgEditMain(msgId, `✅ *TRADE COMPLETE*\n\nUID: \`${ctx.uid}\`\nOrder: \`#${orderId}\`\nUSDT: *${Number(usdt).toFixed(2)}*\n⏰ ${t} IST`);
+    tgSendLog(`✅ TRADE done #${orderId} → ${ctx.uid}`);
+    console.log(`✅ TRADE approved #${orderId} → ${ctx.uid}`);
+  }
+}
+
+async function handleReject(cbId, ctx) {
+  const { type, firebaseUid, hid, amt, orderId, orderMode, usdt, msgId } = ctx;
+  const t = nowIST();
+
+  if (type === "deposit") {
+    await updateHistStatus(firebaseUid, hid, "REJECTED");
+    await fbDelete(`users/${firebaseUid}/pendingReqs/dep`);
+    await fbDelete(`pendingActions/${cbId}`);
+    await writeResult(firebaseUid, `dep_${cbId}`, {
+      type: "deposit", action: "reject", cbId, hid, amt: parseFloat(amt)
+    });
+    if (msgId) tgEditMain(msgId, `❌ *DEPOSIT REJECTED*\n\nUID: \`${ctx.uid}\`\nAmount: *${amt} USDT*\n⏰ ${t} IST`);
+    console.log(`❌ DEP rejected ${amt} → ${ctx.uid}`);
+
+  } else if (type === "withdraw") {
+    // Refund balance
+    const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
+    const newBal = parseFloat((bal + parseFloat(amt)).toFixed(8));
+    await fbSet(`users/${firebaseUid}/balance`, newBal);
+    await updateHistStatus(firebaseUid, hid, "REJECTED");
+    await fbDelete(`users/${firebaseUid}/pendingReqs/wit`);
+    await fbDelete(`pendingActions/${cbId}`);
+    await writeResult(firebaseUid, `wit_${cbId}`, {
+      type: "withdraw", action: "reject", cbId, hid, amt: parseFloat(amt), newBalance: newBal
+    });
+    if (msgId) tgEditMain(msgId, `❌ *WITHDRAWAL REJECTED*\n\nUID: \`${ctx.uid}\`\nAmount: *${amt} USDT*\nFunds returned ✅\n⏰ ${t} IST`);
+    console.log(`❌ WIT rejected ${amt} → ${ctx.uid} — refunded`);
+
+  } else if (type === "trade") {
+    const t2 = nowIST();
+    // Refund USDT for SELL
+    if (orderMode === "SELL") {
+      const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
+      await fbSet(`users/${firebaseUid}/balance`, parseFloat((bal + parseFloat(usdt)).toFixed(8)));
+    }
+    // Cancel history entry
+    await fbPush(`users/${firebaseUid}/history`, {
+      hid: `h_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
+      type: orderMode + "_CANCEL", amt: parseFloat(usdt), status: "CANCELLED",
+      uid: ctx.uid, date: t2, isoDate: new Date().toISOString(), ts: Date.now(),
+      merchant: ctx.merchant, rate: ctx.rate, inr: ctx.inr
+    });
+    await fbDelete(`users/${firebaseUid}/orders/${orderId}`);
+    await fbDelete(`users/${firebaseUid}/chats/${orderId}`);
+    await fbDelete(`pendingActions/${cbId}`);
+    await writeResult(firebaseUid, `trd_${cbId}`, {
+      type: "trade", action: "reject", cbId, orderId: String(orderId), orderMode, usdt: parseFloat(usdt)
+    });
+    if (msgId) tgEditMain(msgId, `❌ *TRADE REJECTED*\n\nUID: \`${ctx.uid}\`\nOrder: \`#${orderId}\`\n⏰ ${t} IST`);
+    console.log(`❌ TRADE rejected #${orderId} → ${ctx.uid}`);
+  }
+}
+
+// Find context by cbId — checks pendingActions first, then users
+async function findCtxByCbId(cbId) {
+  // Primary: pendingActions (index.html writes here)
+  const ctx = await fbGet(`pendingActions/${cbId}`);
+  if (ctx && ctx.firebaseUid && ctx.type) return ctx;
+
+  // Fallback: scan users (for old-style or re-opened sessions)
   const users = await fbGet("users");
-  if (!users) return null;
+  if (!users || typeof users !== "object") return null;
+
   for (const [firebaseUid, userData] of Object.entries(users)) {
     if (!userData) continue;
-
-    // Check deposit
+    // Deposit
     const dep = userData.pendingReqs?.dep;
-    if (dep?.cbId === cbId) return { firebaseUid, type: "dep", data: dep };
-
-    // Check withdrawal
+    if (dep?.cbId === cbId) return { ...dep, type: "deposit", firebaseUid };
+    // Withdrawal
     const wit = userData.pendingReqs?.wit;
-    if (wit?.cbId === cbId) return { firebaseUid, type: "wit", data: wit };
-
-    // Check trade chats — search ALL chat entries, not just current
-    const chats = userData.chats;
-    if (chats) {
-      for (const [ordId, cs] of Object.entries(chats)) {
-        if (!cs) continue;
-        if (cs.cbId === cbId) {
-          return { firebaseUid, type: "trade", ordId, data: cs };
-        }
+    if (wit?.cbId === cbId) return { ...wit, type: "withdraw", firebaseUid };
+    // Trade chats
+    const chats = userData.chats || {};
+    for (const [ordId, cs] of Object.entries(chats)) {
+      if (!cs) continue;
+      if (cs.cbId === cbId) {
+        const order = userData.orders?.[ordId] || {};
+        return {
+          type: "trade", firebaseUid,
+          cbId, orderId: ordId, orderMode: order.mode,
+          usdt: order.usdt, inr: order.inr,
+          merchant: order.merchant, rate: order.rate,
+          uid: userData.uid, msgId: cs.tgMsgId
+        };
       }
     }
   }
   return null;
 }
 
-async function handleDeposit(firebaseUid, dep, action) {
-  const t = nowIST();
-  const userData = await fbGet(`users/${firebaseUid}`);
-  if (!userData) return;
-  if (action === "approve") {
-    const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
-    const newBal = parseFloat((bal + dep.amt).toFixed(8));
-    await fbSet(`users/${firebaseUid}/balance`, newBal);
-    await updateHistStatus(firebaseUid, dep.hid, "COMPLETED");
-    await fbDelete(`users/${firebaseUid}/pendingReqs/dep`);
-    await notifyClient(firebaseUid, dep.cbId, { action: "approve", type: "dep", amt: dep.amt, newBalance: newBal });
-    if (dep.msgId) tgEdit(dep.msgId, `✅ *DEPOSIT APPROVED*\n\n👤 \`${userData.uid}\` | *${userData.name}*\n💰 *+${dep.amt} USDT*\n💼 New Bal: *${newBal.toFixed(2)}*\n⏰ ${t} IST`);
-    tgSendBoth(`✅ DEP credited ${dep.amt} → ${userData.uid}`);
-  } else {
-    await updateHistStatus(firebaseUid, dep.hid, "REJECTED");
-    await fbDelete(`users/${firebaseUid}/pendingReqs/dep`);
-    await notifyClient(firebaseUid, dep.cbId, { action: "reject", type: "dep", amt: dep.amt });
-    if (dep.msgId) tgEdit(dep.msgId, `❌ *DEPOSIT REJECTED*\n\n👤 \`${userData.uid}\`\n💰 ${dep.amt} USDT\n⏰ ${t} IST`);
-  }
-}
+// ════════════════════════════════════════════════════════
+// FORWARD ADMIN TG REPLIES → Firebase botResults
+// When admin types in the bot chat referencing an order ID or replies
+// to a trade message, forward it as a chat_message to the user
+// ════════════════════════════════════════════════════════
+async function forwardAdminReply(msgText, replyToMsgId) {
+  if (!replyToMsgId && !msgText) return;
 
-async function handleWithdrawal(firebaseUid, wit, action) {
-  const t = nowIST();
-  const userData = await fbGet(`users/${firebaseUid}`);
-  if (!userData) return;
-  if (action === "approve") {
-    await updateHistStatus(firebaseUid, wit.hid, "COMPLETED");
-    await fbDelete(`users/${firebaseUid}/pendingReqs/wit`);
-    await notifyClient(firebaseUid, wit.cbId, { action: "approve", type: "wit", amt: wit.amt });
-    if (wit.msgId) tgEdit(wit.msgId, `✅ *WITHDRAWAL SENT*\n\n👤 \`${userData.uid}\`\n💸 ${wit.amt} USDT\n⏰ ${t} IST`);
-    tgSendBoth(`✅ WIT sent ${wit.amt} → ${userData.uid}`);
-  } else {
-    const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
-    const newBal = parseFloat((bal + wit.amt).toFixed(8));
-    await fbSet(`users/${firebaseUid}/balance`, newBal);
-    await updateHistStatus(firebaseUid, wit.hid, "REJECTED");
-    await fbDelete(`users/${firebaseUid}/pendingReqs/wit`);
-    await notifyClient(firebaseUid, wit.cbId, { action: "reject", type: "wit", amt: wit.amt, newBalance: newBal });
-    if (wit.msgId) tgEdit(wit.msgId, `❌ *WITHDRAWAL REFUNDED*\n\n👤 \`${userData.uid}\`\n💰 ${wit.amt} USDT\n⏰ ${t} IST`);
-  }
-}
-
-async function handleTrade(firebaseUid, ordId, chatState, action) {
-  const t = nowIST();
-  const userData = await fbGet(`users/${firebaseUid}`);
-  if (!userData) return;
-  const order = await fbGet(`users/${firebaseUid}/orders/${ordId}`);
-  if (!order) { await tgSend(`⚠️ Order \`#${ordId}\` not found.`); return; }
-
-  if (action === "approve") {
-    const txId = genTxId("TRD");
-    if (order.mode === "BUY") {
-      const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
-      await fbSet(`users/${firebaseUid}/balance`, parseFloat((bal + order.usdt).toFixed(8)));
-    }
-    await fbPush(`users/${firebaseUid}/history`, {
-      hid: `h_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
-      type: order.mode, amt: order.usdt, status: "COMPLETED",
-      uid: userData.uid, date: t, isoDate: new Date().toISOString(), ts: Date.now(),
-      merchant: order.merchant, rate: order.rate, inr: order.inr, txid: txId, network: "BEP20"
-    });
-    await fbDelete(`users/${firebaseUid}/orders/${ordId}`);
-    await fbDelete(`users/${firebaseUid}/chats/${ordId}`);
-    await notifyClient(firebaseUid, chatState.cbId, { action: "approve", type: "trade", ordId, usdt: order.usdt, mode: order.mode, txId });
-    if (chatState.tgMsgId) tgEdit(chatState.tgMsgId, `✅ *TRADE COMPLETE*\n\n👤 \`${userData.uid}\`\n📋 \`#${order.id}\`\n🪙 ${order.usdt.toFixed(2)} USDT\n💵 ₹${Number(order.inr).toLocaleString()}\n🔖 \`${txId}\`\n⏰ ${t} IST`);
-    tgSendBoth(`✅ TRADE done #${order.id} → ${userData.uid}`);
-  } else {
-    if (order.mode === "SELL") {
-      const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
-      await fbSet(`users/${firebaseUid}/balance`, parseFloat((bal + order.usdt).toFixed(8)));
-    }
-    await fbPush(`users/${firebaseUid}/history`, {
-      hid: `h_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
-      type: order.mode + "_CANCEL", amt: order.usdt, status: "CANCELLED",
-      uid: userData.uid, date: t, isoDate: new Date().toISOString(), ts: Date.now(),
-      merchant: order.merchant, rate: order.rate, inr: order.inr
-    });
-    await fbDelete(`users/${firebaseUid}/orders/${ordId}`);
-    await fbDelete(`users/${firebaseUid}/chats/${ordId}`);
-    await notifyClient(firebaseUid, chatState.cbId, { action: "reject", type: "trade", ordId, usdt: order.usdt, mode: order.mode });
-    if (chatState.tgMsgId) tgEdit(chatState.tgMsgId, `❌ *TRADE REJECTED*\n\n👤 \`${userData.uid}\`\n📋 \`#${order.id}\`\n⏰ ${t} IST`);
-  }
-}
-
-async function processCallback(cbId, action) {
-  const entry = await findCbIdOwner(cbId);
-  if (!entry) return false;
-  const { firebaseUid, type, ordId, data } = entry;
-  if (type === "dep") { await handleDeposit(firebaseUid, data, action); return true; }
-  if (type === "wit") { await handleWithdrawal(firebaseUid, data, action); return true; }
-  if (type === "trade") {
-    const fresh = await fbGet(`users/${firebaseUid}/chats/${ordId}`);
-    if (!fresh) return false;
-    await handleTrade(firebaseUid, ordId, fresh, action);
-    return true;
-  }
-  return false;
-}
-
-// ════════════════════════════════════════════════════
-// ADMIN REPLY → FIREBASE CHAT
-// Format: /r <ordId> <message>
-// ════════════════════════════════════════════════════
-async function handleAdminReply(ordId, replyText) {
   const users = await fbGet("users");
-  if (!users) return false;
+  if (!users || typeof users !== "object") return;
+
   for (const [firebaseUid, userData] of Object.entries(users)) {
-    if (!userData?.chats?.[ordId]) continue;
-    const msgRef = await fbPush(`users/${firebaseUid}/chats/${ordId}/adminMsgs`, {
-      from: "admin", text: replyText, ts: Date.now(), date: nowIST()
-    });
-    await tgSend(`✅ Reply sent to \`#${ordId}\` (${userData.uid})`);
-    return true;
+    if (!userData?.chats) continue;
+    for (const [ordId, cs] of Object.entries(userData.chats)) {
+      if (!cs) continue;
+      const matches =
+        (replyToMsgId && cs.tgMsgId && Number(replyToMsgId) === Number(cs.tgMsgId)) ||
+        msgText.includes(String(ordId)) ||
+        msgText.includes(String(userData.uid || ""));
+
+      if (matches) {
+        const msgKey = `chat_${Date.now()}_${Math.random().toString(36).slice(2,5)}`;
+        const seen = `${ordId}:${msgKey}`;
+        if (seenAdminMsgs.has(seen)) continue;
+        seenAdminMsgs.add(seen);
+
+        await writeResult(firebaseUid, msgKey, {
+          type: "chat_message",
+          orderId: String(ordId),
+          senderName: "Admin",
+          text: msgText,
+          tgMsgId: null
+        });
+        console.log(`💬 Admin reply forwarded → order #${ordId} uid=${userData.uid}`);
+        return; // Stop after first match
+      }
+    }
   }
-  return false;
 }
 
-// ════════════════════════════════════════════════════
-// ADMIN COMMANDS (credit / stats / lookup) — from v4
-// ════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
+// ADMIN COMMANDS
+// ════════════════════════════════════════════════════════
 async function handleCredit(targetUID, addAmt) {
   const users = await fbGet("users");
   if (!users) { await tgSend("❌ DB empty."); return; }
@@ -421,14 +416,20 @@ async function handleCredit(targetUID, addAmt) {
     const bal = parseFloat((await fbGet(`users/${firebaseUid}/balance`)) || 0);
     const newBal = parseFloat((bal + addAmt).toFixed(8));
     await fbSet(`users/${firebaseUid}/balance`, newBal);
+    const hid = `h_admin_${Date.now()}_${Math.random().toString(36).slice(2,5)}`;
     await fbPush(`users/${firebaseUid}/history`, {
-      hid: `h_admin_${Date.now()}`, type: "P2PPRO_CREDIT", amt: addAmt, status: "COMPLETED",
+      hid, type: "P2PPRO_CREDIT", amt: addAmt, status: "COMPLETED",
       uid: u.uid, date: nowIST(), isoDate: new Date().toISOString(), ts: Date.now(),
       sender: "P2PPRO", note: `P2PPRO sended you ${addAmt} USDT`,
       network: "INTERNAL", txid: `p2ppro_${Date.now()}`
     });
-    await notifyClient(firebaseUid, `credit_${Date.now()}`, { action: "credit", type: "credit", amt: addAmt, newBalance: newBal });
-    await tgSendBoth(`✅ *CREDITED*\n👤 \`${targetUID}\` | *${u.name}*\n➕ +${addAmt} USDT → ${newBal.toFixed(2)}`);
+    // Notify frontend live
+    await writeResult(firebaseUid, `credit_${Date.now()}`, {
+      type: "credit", action: "credit", amt: addAmt, newBalance: newBal,
+      note: `P2PPRO sended you ${addAmt} USDT`
+    });
+    await tgSendBoth(`✅ *CREDITED*\n\n👤 UID: \`${targetUID}\`\n👤 User: *${u.name || "—"}*\n📧 ${u.email || "—"}\n➕ *+${addAmt} USDT*\n💰 New: *${newBal.toFixed(2)} USDT*`);
+    console.log(`💳 Credit +${addAmt} → ${targetUID}`);
     return;
   }
   await tgSend(`❌ UID \`${targetUID}\` not found.`);
@@ -437,20 +438,31 @@ async function handleCredit(targetUID, addAmt) {
 async function handleStats() {
   const users = await fbGet("users");
   if (!users) { await tgSend("❌ No data."); return; }
-  let n = 0, bal = 0, pd = 0, pw = 0, ao = 0;
+  let n = 0, totalBal = 0, depPending = 0, witPending = 0, activeOrders = 0;
   for (const [, u] of Object.entries(users)) {
     if (!u) continue;
-    n++; bal += parseFloat(u.balance || 0);
-    if (u.pendingReqs?.dep) pd++;
-    if (u.pendingReqs?.wit) pw++;
-    if (u.orders) ao += Object.keys(u.orders).length;
+    n++; totalBal += parseFloat(u.balance || 0);
+    if (u.pendingReqs?.dep) depPending++;
+    if (u.pendingReqs?.wit) witPending++;
+    if (u.orders) activeOrders += Object.keys(u.orders).length;
   }
-  await tgSend(`📊 *STATS*\n👥 ${n} users\n💰 ${bal.toFixed(2)} USDT total\n📥 ${pd} deps | 💼 ${pw} wits\n🤝 ${ao} active orders\n⏰ ${nowIST()}`);
+  const pendingActs = await fbGet("pendingActions");
+  const pendingCnt = pendingActs ? Object.keys(pendingActs).length : 0;
+  await tgSend(
+    `📊 *PRO P2P STATS*\n\n` +
+    `👥 Users: *${n}*\n` +
+    `💰 Total Balance: *${totalBal.toFixed(2)} USDT*\n` +
+    `📥 Pending Deposits: *${depPending}*\n` +
+    `💼 Pending Withdrawals: *${witPending}*\n` +
+    `🤝 Active Orders: *${activeOrders}*\n` +
+    `⏳ Pending Actions: *${pendingCnt}*\n` +
+    `⏰ ${nowIST()} IST`
+  );
 }
 
-// ════════════════════════════════════════════════════
-// TELEGRAM POLLER
-// ════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
+// TELEGRAM POLL
+// ════════════════════════════════════════════════════════
 async function pollTelegram() {
   const data = await httpReq(
     `${TG_API}/getUpdates?offset=${lastUpdateId + 1}&timeout=25&allowed_updates=["message","callback_query"]`,
@@ -463,88 +475,132 @@ async function pollTelegram() {
     lastUpdateId = Math.max(lastUpdateId, uid);
     if (seenUpdates.has(uid)) continue;
     seenUpdates.add(uid);
-    if (seenUpdates.size > 1000) {
+    // Trim seenUpdates to avoid memory leak
+    if (seenUpdates.size > 2000) {
       const arr = [...seenUpdates].sort((a,b) => a-b);
-      arr.slice(0, 500).forEach(x => seenUpdates.delete(x));
+      arr.slice(0, 1000).forEach(x => seenUpdates.delete(x));
     }
 
-    // Callback (approve/reject)
+    // ── CALLBACK QUERY (approve/reject buttons) ──
     if (update.callback_query) {
       const cb = update.callback_query;
       const d  = cb.data || "";
       const chatId = String(cb.message?.chat?.id || "");
+      // Accept from BOTH admin chats
       if (chatId !== String(TG_CHAT) && chatId !== String(TG_CHAT_LOG)) continue;
+
       const am = d.match(/^approve_(.+)$/);
       const rm = d.match(/^reject_(.+)$/);
       if (!am && !rm) continue;
-      const cbId = am ? am[1] : rm[1];
+
+      const cbId   = am ? am[1] : rm[1];
       const action = am ? "approve" : "reject";
-      if (processingCb.has(cbId)) { await tgAnswer(cb.id, "⏳ Already processing..."); continue; }
+
+      if (processingCb.has(cbId)) {
+        await tgAnswer(cb.id, "⏳ Already processing...");
+        continue;
+      }
       processingCb.add(cbId);
-      await tgAnswer(cb.id, action === "approve" ? "✅ Approving..." : "❌ Rejecting...");
+      await tgAnswer(cb.id, action === "approve" ? "✅ Processing approval..." : "❌ Processing rejection...");
+
       try {
-        const found = await processCallback(cbId, action);
-        if (!found) await tgSend(`⚠️ cbId not found: \`${cbId}\``);
-      } catch(e) { await tgSend(`❌ Error: ${e.message}`); }
-      finally { processingCb.delete(cbId); }
+        const ctx = await findCtxByCbId(cbId);
+        if (!ctx) {
+          await tgSend(`⚠️ Request not found for cbId: \`${cbId}\`\nMay already be processed.`);
+        } else if (action === "approve") {
+          await handleApprove(cbId, ctx);
+        } else {
+          await handleReject(cbId, ctx);
+        }
+      } catch(e) {
+        console.error(`❌ CB error ${cbId}:`, e.message);
+        await tgSend(`❌ Error processing \`${cbId}\`: ${e.message}`);
+      } finally {
+        processingCb.delete(cbId);
+      }
       continue;
     }
 
-    // Text messages
+    // ── TEXT MESSAGES ──
     if (update.message) {
-      const text = (update.message.text || "").trim();
-      const chatId = String(update.message.chat.id);
+      const msg    = update.message;
+      const text   = (msg.text || "").trim();
+      const chatId = String(msg.chat.id);
       if (chatId !== String(TG_CHAT) && chatId !== String(TG_CHAT_LOG)) continue;
+      if (!text) continue;
 
-      // Admin reply: /r <ordId> <message>
-      const replyMatch = text.match(/^\/r\s+(\S+)\s+([\s\S]+)$/i);
-      if (replyMatch) {
-        const ok = await handleAdminReply(replyMatch[1], replyMatch[2]);
-        if (!ok) await tgSend(`❌ Order \`#${replyMatch[1]}\` not found.`);
-        continue;
-      }
-
+      // /help or /start
       if (text === "/help" || text === "/start") {
-        await tgSend(`📖 *PRO P2P Bot v5*\n\n✅ Auto-detects new orders/deposits\n✅ Auto-forwards user chat\n\n*Commands:*\n\`/r <ordId> <msg>\` — reply to user chat\n\`#UID AMOUNT\` — credit user\n\`/allstats\` — stats`);
+        await tgSend(
+          `📖 *PRO P2P Bot v6*\n\n` +
+          `✅ Auto-processes approve/reject\n` +
+          `✅ Works even when site is closed\n` +
+          `✅ Supports multiple simultaneous orders\n\n` +
+          `*Commands:*\n` +
+          `\`#UID AMOUNT\` — credit user balance\n` +
+          `\`/allstats\` — view platform stats\n\n` +
+          `*Reply to any trade message* to chat with the user directly.`
+        );
         continue;
       }
-      if (text === "/allstats") { await handleStats(); continue; }
 
+      // /allstats
+      if (text === "/allstats") {
+        await handleStats();
+        continue;
+      }
+
+      // #UID AMOUNT — credit command
       const balMatch = text.match(/^#([A-Z0-9]{4,10})\s+([\d.]+)$/i);
       if (balMatch) {
         const amt = parseFloat(balMatch[2]);
-        if (!amt || amt <= 0) { await tgSend("❌ Invalid amount."); continue; }
+        if (!amt || amt <= 0) { await tgSend("❌ Invalid amount.\n\nUsage: `#UID AMOUNT`"); continue; }
         await handleCredit(balMatch[1].toUpperCase(), amt);
         continue;
       }
+
+      // Bot/command messages — skip
+      if (text.startsWith("/") || msg.from?.is_bot) continue;
+
+      // Any other admin reply — try to forward to relevant trade chat
+      const replyToMsgId = msg.reply_to_message?.message_id || null;
+      await forwardAdminReply(text, replyToMsgId);
     }
   }
 }
 
-// ════════════════════════════════════════════════════
-// START
-// ════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
+// MAIN LOOPS
+// ════════════════════════════════════════════════════════
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end(`PRO P2P Bot v5 ✅\nUptime: ${Math.floor(process.uptime())}s\nFirebase polling: every ${FB_POLL_INTERVAL}ms\n`);
-}).listen(PORT, () => console.log(`Keep-alive on :${PORT}`));
+  res.end(
+    `PRO P2P Bot v6 ✅\n` +
+    `Uptime: ${Math.floor(process.uptime())}s\n` +
+    `TG polling: active\n` +
+    `Firebase polling: every 2000ms\n`
+  );
+}).listen(PORT, () => console.log(`🌐 Health check on :${PORT}`));
 
-console.log("🤖 PRO P2P Bot v5 — Full Backend Mode");
-console.log(`📡 Telegram polling + Firebase polling (every ${FB_POLL_INTERVAL}ms)`);
+console.log("🤖 PRO P2P Bot v6 — Starting");
+console.log(`📡 TG_CHAT=${TG_CHAT} | TG_CHAT_LOG=${TG_CHAT_LOG}`);
+console.log(`🔥 Firebase: ${FB_URL}`);
 
-// Telegram poll loop
+// Telegram long-poll loop
 (async () => {
+  console.log("📨 Telegram poller started");
   while (true) {
     try { await pollTelegram(); }
     catch(e) { console.error("TG poll error:", e.message); await sleep(3000); }
   }
 })();
 
-// Firebase poll loop
+// Firebase pendingActions watcher loop (every 2s)
 (async () => {
+  console.log("🔥 Firebase pendingActions watcher started");
   while (true) {
-    try { await pollFirebase(); }
+    try { await pollPendingActions(); }
     catch(e) { console.error("FB poll error:", e.message); }
-    await sleep(FB_POLL_INTERVAL);
+    await sleep(2000);
   }
 })();
