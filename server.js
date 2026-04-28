@@ -99,11 +99,27 @@ async function tgAnswer(cbQueryId, text) {
 const sentByCbId = new Map(); // cbId -> { firebaseUid, type, msgId }
 
 async function findUserByUID(uid) {
-  const snap = await db.ref('users').orderByChild('uid').equalTo(uid).once('value');
-  if (!snap.exists()) return null;
-  const val = snap.val();
-  const firebaseUid = Object.keys(val)[0];
-  return { firebaseUid, user: val[firebaseUid] };
+  try {
+    // Try indexed query first (fast — requires .indexOn: ["uid"] in Firebase rules)
+    const snap = await db.ref('users').orderByChild('uid').equalTo(uid).once('value');
+    if (snap.exists()) {
+      const val = snap.val();
+      const firebaseUid = Object.keys(val)[0];
+      return { firebaseUid, user: val[firebaseUid] };
+    }
+    return null;
+  } catch (e) {
+    // Fallback: scan all users (works without index, slower)
+    console.warn('⚠️ orderByChild failed, falling back to full scan:', e.message);
+    const allSnap = await db.ref('users').once('value');
+    let result = null;
+    allSnap.forEach(child => {
+      if (child.val()?.uid?.toUpperCase() === uid.toUpperCase()) {
+        result = { firebaseUid: child.key, user: child.val() };
+      }
+    });
+    return result;
+  }
 }
 
 function fmtMsg(type, user, req) {
@@ -161,12 +177,23 @@ db.ref('users').on('child_changed', async (snap) => {
   if (pending.dep) await maybeSendButtons(firebaseUid, 'dep', pending.dep).catch(e => console.error('dep err', e));
   if (pending.wit) await maybeSendButtons(firebaseUid, 'wit', pending.wit).catch(e => console.error('wit err', e));
 });
+
+// child_added: sirf naye/fresh requests handle karo — bot restart pe purani skip karo
+const BOT_START_TIME = Date.now();
 db.ref('users').on('child_added', async (snap) => {
   const firebaseUid = snap.key;
   const data = snap.val() || {};
   const pending = data.pendingReq || {};
-  if (pending.dep) await maybeSendButtons(firebaseUid, 'dep', pending.dep).catch(e => console.error('dep err', e));
-  if (pending.wit) await maybeSendButtons(firebaseUid, 'wit', pending.wit).catch(e => console.error('wit err', e));
+
+  // Skip requests jo bot start se 10 sec pehle ki hain (startup flood prevention)
+  const CUTOFF = BOT_START_TIME - 10_000;
+
+  if (pending.dep && (pending.dep.ts || 0) > CUTOFF) {
+    await maybeSendButtons(firebaseUid, 'dep', pending.dep).catch(e => console.error('dep err', e));
+  }
+  if (pending.wit && (pending.wit.ts || 0) > CUTOFF) {
+    await maybeSendButtons(firebaseUid, 'wit', pending.wit).catch(e => console.error('wit err', e));
+  }
 });
 
 // ─── APPROVE / REJECT HANDLERS ──────────────────────────────────────
