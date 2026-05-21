@@ -203,8 +203,10 @@ async function tgFetch(endpoint, body) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    return await r.json();
-  } catch (e) { log('TG', `fetch err ${endpoint}: ${e.message}`); return { ok: false }; }
+    const data = await r.json();
+    if (!data.ok) log('TG', `${endpoint} failed: ${data.description || JSON.stringify(data)}`);
+    return data;
+  } catch (e) { log('TG', `fetch err ${endpoint}: ${e.message}`); return { ok: false, error: e.message }; }
 }
 const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'Markdown', ...extra });
 const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
@@ -895,6 +897,14 @@ function pushRecentUpdate(upd) {
   if (RECENT_UPDATES.length > RECENT_UPDATES_MAX) RECENT_UPDATES.shift();
 }
 
+function makeProxyUpdate(kind, result) {
+  if (!result) return null;
+  const nowId = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+  if (kind === 'message') return { update_id: nowId, message: result };
+  if (kind === 'callback_query') return { update_id: nowId, callback_query: result };
+  return null;
+}
+
 // ════════════════════════════════════════════════════════════════════
 // EXPRESS — serves frontend + health check + self-ping
 // ════════════════════════════════════════════════════════════════════
@@ -905,7 +915,8 @@ app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+  res.setHeader('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -944,6 +955,10 @@ app.post('/api/tg/:method', async (req, res) => {
   if (m === 'sendMessage' || m === 'editMessageText') body.chat_id = TG_CHAT;
   try {
     const r = await tgFetch(m, body);
+    if (r.ok && m === 'sendMessage' && body.reply_markup?.inline_keyboard) {
+      log('P2P', `proxied button msgId=${r.result?.message_id || '—'} text="${String(body.text || '').slice(0, 45)}"`);
+    }
+    if (r.ok && m === 'editMessageText') log('P2P', `proxied edit msgId=${body.message_id || '—'}`);
     res.json(r);
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -964,6 +979,10 @@ if (RENDER_URL) {
 // BOOT
 // ════════════════════════════════════════════════════════════════════
 (async () => {
+  if (BACKEND_DISABLED) {
+    log('INIT', `⚠️ Bot not started because env vars are missing: ${MISSING.join(', ')}`);
+    return;
+  }
   await claimInstanceLock();
   lastUpdateId = await loadLastUpdateId();
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
