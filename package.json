@@ -1,0 +1,19 @@
+{
+  "name": "p2p-trading-app",
+  "version": "4.0.0",
+  "description": "PRO P2P + Trading Terminal — unified backend (multi-coin balances, atomic history, Telegram admin bot)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "firebase-admin": "^13.10.0",
+    "node-fetch": "^3.3.2"
+  }
+}
