@@ -419,7 +419,10 @@ async function handleCallback(cb) {
   const data = cb.data || '';
 
   let m;
-  if ((m = data.match(/^(approve|reject)_(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2]);
+  if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3]);
+  // Trade/P2P callbacks (cbId starts with trade_) are handled by the iframe
+  // via the buffered /api/tg/getUpdates feed — leave them alone here.
+  if (/^(approve|reject)_trade_/.test(data)) return; // no tg-answer, iframe will
   if ((m = data.match(/^userdetail_(.+)$/)))       return sendUserDetailCard(cb, m[1]);
   if ((m = data.match(/^(ban|unban)_(.+)$/)))      return handleBanCb(cb, m[1], m[2]);
   if ((m = data.match(/^history_(.+)$/)))          { await tgAnswer(cb.id, 'Loading…'); return sendUserHistory(m[1], 15); }
@@ -865,6 +868,7 @@ async function pollUpdates() {
     for (const upd of (data.result || [])) {
       lastUpdateId = upd.update_id;
       await saveLastUpdateId(lastUpdateId).catch(()=>{});
+      pushRecentUpdate(upd);
       try { await handleUpdate(upd); } catch (e) { log('ERR', `handleUpdate: ${e.message}`); }
     }
   } catch (e) { log('POLL', `err ${e.message}`); }
@@ -878,15 +882,71 @@ async function pollLoop() {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// RECENT UPDATES BUFFER — exposed via /api/tg/getUpdates so the frontend
+// iframe (which can't poll Telegram directly because we own the single
+// poll lock) still receives callback_query + message events for P2P
+// trade approve/reject and admin chat replies.
+// ════════════════════════════════════════════════════════════════════
+const RECENT_UPDATES = [];
+const RECENT_UPDATES_MAX = 500;
+function pushRecentUpdate(upd) {
+  if (!upd || typeof upd.update_id !== 'number') return;
+  RECENT_UPDATES.push({ ...upd, _ts: Date.now() });
+  if (RECENT_UPDATES.length > RECENT_UPDATES_MAX) RECENT_UPDATES.shift();
+}
+
+// ════════════════════════════════════════════════════════════════════
 // EXPRESS — serves frontend + health check + self-ping
 // ════════════════════════════════════════════════════════════════════
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+
+// CORS — allow the Vercel-hosted frontend (or any origin) to reach the proxy
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health', (_req, res) => res.json({
   ok: true, instance: INSTANCE_ID, uptimeMs: Date.now() - BOT_START_TIME, ts: nowIST(),
 }));
+
+// ─── TELEGRAM PROXY — used by the P2P iframe ────────────────────────
+// The iframe can't talk to Telegram directly (we hold the single poll lock
+// and the bot token is server-only). These endpoints mimic the small subset
+// of the Bot API the iframe uses.
+app.get('/api/tg/config', (_req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+  res.json({ ok: true, chat_id: String(TG_CHAT) });
+});
+
+// Telegram-shaped getUpdates: returns buffered updates with update_id > offset.
+app.get('/api/tg/getUpdates', (req, res) => {
+  const offset = Number(req.query.offset || 0);
+  const result = RECENT_UPDATES
+    .filter(u => u.update_id >= offset)
+    .map(({ _ts, ...rest }) => rest);
+  res.json({ ok: true, result });
+});
+
+const TG_PROXY_METHODS = new Set(['sendMessage', 'editMessageText', 'answerCallbackQuery']);
+app.post('/api/tg/:method', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+  const m = req.params.method;
+  if (!TG_PROXY_METHODS.has(m)) return res.status(403).json({ ok: false, error: 'method_not_allowed' });
+  const body = { ...(req.body || {}) };
+  // Force chat_id to the configured admin chat — never trust the client.
+  if (m === 'sendMessage' || m === 'editMessageText') body.chat_id = TG_CHAT;
+  try {
+    const r = await tgFetch(m, body);
+    res.json(r);
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
 
 app.get('/*splat', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
