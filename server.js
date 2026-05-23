@@ -24,6 +24,7 @@
 import express from 'express';
 import admin from 'firebase-admin';
 import fetch from 'node-fetch';
+import nodemailer from 'nodemailer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -961,6 +962,77 @@ app.post('/api/tg/:method', async (req, res) => {
     if (r.ok && m === 'editMessageText') log('P2P', `proxied edit msgId=${body.message_id || '—'}`);
     res.json(r);
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+
+// ─── SPACEMAIL SMTP ─────────────────────────────────────────────────
+const SMTP_HOST = process.env.SMTP_HOST || 'mail.spacemail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 465;
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const FROM_NAME = process.env.SMTP_FROM_NAME || 'BIEXC';
+
+let mailer = null;
+if (SMTP_USER && SMTP_PASS) {
+  mailer = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465, // true for 465 (SSL), false for 587 (TLS)
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+  mailer.verify()
+    .then(() => log('MAIL', `📧 Spacemail SMTP ready (${SMTP_USER})`))
+    .catch(e => log('MAIL', `⚠️  SMTP verify failed: ${e.message}`));
+} else {
+  log('MAIL', '⚠️  SMTP_USER / SMTP_PASS missing — emails disabled');
+}
+
+function mailHtml(subject, message, amount, status, uid) {
+  const safe = (s) => String(s ?? '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+  const color = status === 'COMPLETED' ? '#10b981'
+              : (status === 'REJECTED' || status === 'CANCELLED') ? '#ef4444'
+              : '#f0b90b';
+  return `<!doctype html><html><body style="margin:0;background:#0b0e11;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#eaecef;">
+  <div style="max-width:560px;margin:0 auto;padding:24px;">
+    <div style="text-align:center;padding:16px 0 24px;">
+      <div style="font-size:24px;font-weight:800;color:#f0b90b;letter-spacing:1px;">BIEXC</div>
+      <div style="font-size:12px;color:#848e9c;margin-top:4px;">PRO P2P Terminal</div>
+    </div>
+    <div style="background:#181a20;border-radius:12px;padding:24px;border:1px solid #2b3139;">
+      <h2 style="margin:0 0 16px;color:${color};font-size:18px;">${safe(subject)}</h2>
+      <div style="color:#b7bdc6;line-height:1.6;font-size:14px;">${safe(message)}</div>
+      ${amount ? `<div style="margin-top:20px;padding:12px;background:#0b0e11;border-radius:8px;border-left:3px solid ${color};">
+        <div style="font-size:11px;color:#848e9c;text-transform:uppercase;letter-spacing:.5px;">Amount</div>
+        <div style="font-size:18px;font-weight:700;color:#fff;margin-top:4px;">${safe(amount)}</div>
+      </div>` : ''}
+      ${uid ? `<div style="margin-top:12px;font-size:11px;color:#5e6673;">UID: ${safe(uid)}</div>` : ''}
+    </div>
+    <div style="text-align:center;font-size:11px;color:#5e6673;padding:20px 0;">
+      Need help? <a href="https://t.me/biexc10" style="color:#f0b90b;text-decoration:none;">t.me/biexc10</a><br>
+      © BIEXC. This is an automated message — do not reply.
+    </div>
+  </div></body></html>`;
+}
+
+app.post('/api/send-mail', async (req, res) => {
+  try {
+    if (!mailer) return res.status(503).json({ ok: false, error: 'SMTP not configured' });
+    const { to_email, to_name, subject, message, amount, status, uid } = req.body || {};
+    if (!to_email || !subject) return res.status(400).json({ ok: false, error: 'to_email & subject required' });
+
+    await mailer.sendMail({
+      from: `"${FROM_NAME}" <${SMTP_USER}>`,
+      to: String(to_email).slice(0, 200),
+      subject: String(subject).slice(0, 200),
+      html: mailHtml(subject, message || '', amount || '', status || '', uid || ''),
+      text: `${subject}\n\n${message || ''}\n\n${amount ? 'Amount: ' + amount : ''}\n\nBIEXC — t.me/biexc10`
+    });
+    log('MAIL', `sent → ${to_email} | ${String(subject).slice(0, 60)}`);
+    res.json({ ok: true });
+  } catch (e) {
+    log('MAIL', `send error: ${e.message}`);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get('/*splat', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
