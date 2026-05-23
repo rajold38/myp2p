@@ -1181,30 +1181,95 @@ BIEXC — t.me/biexc10`
 }
 
 function mailHtml(subject, message, amount, status, uid) {
-  const safe = (s) => String(s ?? '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-  const color = status === 'COMPLETED' ? '#10b981'
-              : (status === 'REJECTED' || status === 'CANCELLED') ? '#ef4444'
-              : '#f0b90b';
-  return `<!doctype html><html><body style="margin:0;background:#0b0e11;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#eaecef;">
-  <div style="max-width:560px;margin:0 auto;padding:24px;">
-    <div style="text-align:center;padding:16px 0 24px;">
-      <div style="font-size:24px;font-weight:800;color:#f0b90b;letter-spacing:1px;">BIEXC</div>
-      <div style="font-size:12px;color:#848e9c;margin-top:4px;">PRO P2P Terminal</div>
-    </div>
-    <div style="background:#181a20;border-radius:12px;padding:24px;border:1px solid #2b3139;">
-      <h2 style="margin:0 0 16px;color:${color};font-size:18px;">${safe(subject)}</h2>
-      <div style="color:#b7bdc6;line-height:1.6;font-size:14px;">${safe(message)}</div>
-      ${amount ? `<div style="margin-top:20px;padding:12px;background:#0b0e11;border-radius:8px;border-left:3px solid ${color};">
-        <div style="font-size:11px;color:#848e9c;text-transform:uppercase;letter-spacing:.5px;">Amount</div>
-        <div style="font-size:18px;font-weight:700;color:#fff;margin-top:4px;">${safe(amount)}</div>
-      </div>` : ''}
-      ${uid ? `<div style="margin-top:12px;font-size:11px;color:#5e6673;">UID: ${safe(uid)}</div>` : ''}
-    </div>
-    <div style="text-align:center;font-size:11px;color:#5e6673;padding:20px 0;">
-      Need help? <a href="https://t.me/biexc10" style="color:#f0b90b;text-decoration:none;">t.me/biexc10</a><br>
-      © BIEXC. This is an automated message — do not reply.
-    </div>
-  </div></body></html>`;
+  const safe = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+  const isOk = status === 'COMPLETED';
+  const isBad = status === 'REJECTED' || status === 'CANCELLED';
+  const accent = isOk ? '#0ecb81' : isBad ? '#f6465d' : '#f0b90b';
+  const accentSoft = isOk ? 'rgba(14,203,129,.12)' : isBad ? 'rgba(246,70,93,.12)' : 'rgba(240,185,11,.12)';
+  const icon = isOk ? '✓' : isBad ? '✕' : '!';
+  const badgeText = isOk ? 'APPROVED' : isBad ? 'REJECTED' : 'PENDING';
+  const headline = isOk ? 'Transaction Successful'
+                 : isBad ? 'Transaction Declined'
+                 : 'Transaction Update';
+  const txnId = 'TX' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random()*9999).toString(36).toUpperCase();
+  const dateStr = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${safe(subject)}</title></head>
+<body style="margin:0;padding:0;background:#0b0e11;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#eaecef;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0e11;padding:32px 12px;">
+  <tr><td align="center">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#181a20;border-radius:16px;overflow:hidden;border:1px solid #2b3139;box-shadow:0 20px 60px rgba(0,0,0,.5);">
+
+      <!-- HEADER -->
+      <tr><td style="background:linear-gradient(135deg,#f0b90b 0%,#f8d12f 50%,#f0b90b 100%);padding:28px 32px;text-align:center;">
+        <div style="display:inline-block;background:#0b0e11;padding:10px 22px;border-radius:30px;border:2px solid rgba(0,0,0,.15);">
+          <span style="font-size:22px;font-weight:900;color:#f0b90b;letter-spacing:3px;">⚡ BIEXC</span>
+        </div>
+        <div style="margin-top:10px;font-size:11px;color:rgba(0,0,0,.7);letter-spacing:2px;font-weight:700;">PRO P2P TRADING TERMINAL</div>
+      </td></tr>
+
+      <!-- STATUS ICON -->
+      <tr><td style="padding:36px 32px 8px;text-align:center;">
+        <div style="display:inline-block;width:76px;height:76px;line-height:72px;border-radius:50%;background:${accentSoft};border:2px solid ${accent};font-size:38px;color:${accent};font-weight:900;">${icon}</div>
+        <div style="margin-top:18px;font-size:22px;font-weight:700;color:#eaecef;">${headline}</div>
+        <div style="margin-top:8px;display:inline-block;padding:5px 14px;border-radius:20px;background:${accentSoft};color:${accent};font-size:11px;font-weight:800;letter-spacing:1.5px;">${badgeText}</div>
+      </td></tr>
+
+      <!-- AMOUNT CARD -->
+      ${amount ? `<tr><td style="padding:24px 32px 8px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:linear-gradient(135deg,#0b0e11 0%,#161a20 100%);border-radius:12px;border-left:4px solid ${accent};padding:20px 22px;">
+          <tr><td>
+            <div style="font-size:11px;color:#848e9c;letter-spacing:1.5px;font-weight:600;text-transform:uppercase;">Amount</div>
+            <div style="margin-top:6px;font-size:30px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${safe(amount)}</div>
+          </td></tr>
+        </table>
+      </td></tr>` : ''}
+
+      <!-- MESSAGE -->
+      <tr><td style="padding:20px 32px 8px;">
+        <div style="background:#0b0e11;border-radius:12px;padding:20px 22px;border:1px solid #2b3139;color:#b7bdc6;font-size:14px;line-height:1.7;">
+          ${safe(message)}
+        </div>
+      </td></tr>
+
+      <!-- DETAILS -->
+      <tr><td style="padding:20px 32px 8px;">
+        <div style="font-size:11px;color:#848e9c;letter-spacing:1.5px;font-weight:700;text-transform:uppercase;margin-bottom:10px;">Transaction Details</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0e11;border-radius:12px;border:1px solid #2b3139;">
+          ${uid ? `<tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">User ID</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#eaecef;font-size:13px;font-family:'SF Mono',Menlo,monospace;font-weight:600;">${safe(uid)}</td></tr>` : ''}
+          <tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">Transaction ID</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#eaecef;font-size:12px;font-family:'SF Mono',Menlo,monospace;">${txnId}</td></tr>
+          <tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">Status</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:${accent};font-size:13px;font-weight:700;">${badgeText}</td></tr>
+          <tr><td style="padding:12px 18px;color:#848e9c;font-size:13px;">Date & Time (IST)</td><td align="right" style="padding:12px 18px;color:#eaecef;font-size:13px;">${dateStr}</td></tr>
+        </table>
+      </td></tr>
+
+      <!-- SECURITY -->
+      <tr><td style="padding:20px 32px 8px;">
+        <div style="background:rgba(240,185,11,.06);border:1px solid rgba(240,185,11,.25);border-radius:10px;padding:14px 16px;color:#f0b90b;font-size:12px;line-height:1.6;">
+          🔒 <strong>Security Notice:</strong> Never share your password, OTP, or 2FA codes with anyone. BIEXC will never ask for them.
+        </div>
+      </td></tr>
+
+      <!-- CTA -->
+      <tr><td style="padding:24px 32px 8px;text-align:center;">
+        <a href="https://t.me/biexc10" style="display:inline-block;background:linear-gradient(135deg,#f0b90b,#f8d12f);color:#0b0e11;text-decoration:none;font-weight:800;font-size:14px;padding:13px 36px;border-radius:10px;letter-spacing:.5px;">Contact Support →</a>
+      </td></tr>
+
+      <!-- FOOTER -->
+      <tr><td style="padding:28px 32px 24px;text-align:center;border-top:1px solid #2b3139;margin-top:20px;">
+        <div style="font-size:18px;font-weight:800;color:#f0b90b;letter-spacing:2px;">BIEXC</div>
+        <div style="margin-top:6px;font-size:11px;color:#5e6673;letter-spacing:1px;">PRO P2P TRADING TERMINAL</div>
+        <div style="margin-top:14px;font-size:11px;color:#5e6673;line-height:1.7;">
+          Need help? <a href="https://t.me/biexc10" style="color:#f0b90b;text-decoration:none;font-weight:600;">t.me/biexc10</a><br>
+          © ${new Date().getFullYear()} BIEXC. All rights reserved.<br>
+          <span style="color:#3a4048;">This is an automated message — please do not reply.</span>
+        </div>
+      </td></tr>
+
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
 }
 
 app.get('/api/mail-status', (_req, res) => {
