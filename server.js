@@ -373,7 +373,7 @@ async function handleApprove(fuid, type, req, cbId) {
   await updateHistoryStatus(fuid, claimed.hid, 'COMPLETED');
   await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
   const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
-  queueResolutionEmail({ type, action: 'approve', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal });
+  queueResolutionEmail({ type, action: 'approve', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
   log('APPROVE', `UID=${user.uid} ${type.toUpperCase()} ${amt} ${coin} | ${result?.oldBal} → ${result?.newBal}`);
   return { ...result, user, coin, amt };
 }
@@ -396,7 +396,7 @@ async function handleReject(fuid, type, req, cbId) {
   await updateHistoryStatus(fuid, claimed.hid, 'REJECTED');
   await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
   const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
-  queueResolutionEmail({ type, action: 'reject', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal });
+  queueResolutionEmail({ type, action: 'reject', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
   log('REJECT', `UID=${user.uid} ${type.toUpperCase()} ${amt} ${coin} ${type==='wit'?'refunded':''} | ${result?.oldBal} → ${result?.newBal}`);
   return { ...result, user, coin, amt };
 }
@@ -1102,47 +1102,29 @@ function queueResolutionEmail(ctx) {
 }
 
 
-function buildResolutionEmail({ type, action, amt, coin, oldBal, newBal }) {
+function buildResolutionEmail(ctx) {
+  const { type, action, amt, coin, oldBal, newBal, txid, network, address, hid, uid } = ctx;
   const label = type === 'dep' ? 'Deposit' : 'Withdrawal';
   const amount = `${r8(amt)} ${coin}`;
   const completed = action === 'approve';
-  const status = completed ? 'COMPLETED' : 'REJECTED';
+  const status = completed ? 'COMPLETED' : 'CANCELLED';
   let subject;
   let message;
 
   if (type === 'dep' && completed) {
-    subject = `✅ Deposit of ${amount} Approved`;
-    message = `Your deposit of ${amount} has been verified and credited to your Spot Wallet.
-
-New Balance: ${r8(newBal)} ${coin}
-
-Thank you for using BIEXC.`;
+    subject = `Deposit Completed — ${amount}`;
+    message = `Your deposit has been verified on-chain and credited to your Spot Wallet. Funds are available for trading immediately.`;
   } else if (type === 'dep') {
-    subject = `❌ Deposit of ${amount} Rejected`;
-    message = `Your deposit request of ${amount} was rejected by admin.
-
-If you believe this is an error, please contact support at t.me/biexc10.`;
+    subject = `Deposit Cancelled — ${amount}`;
+    message = `Your deposit request could not be processed and has been cancelled. No funds have been credited. If you believe this is an error, please contact our support team.`;
   } else if (completed) {
-    subject = `✅ Withdrawal of ${amount} Sent`;
-    message = `Your withdrawal of ${amount} has been approved and processed.
-
-Thank you for using BIEXC.`;
+    subject = `Withdrawal Completed — ${amount}`;
+    message = `Your withdrawal has been broadcast to the network and is on its way to the destination address. Confirmation time depends on network congestion.`;
   } else {
-    subject = `❌ Withdrawal of ${amount} Rejected`;
-    message = `Your withdrawal request of ${amount} was rejected.
-
-Your funds have been returned to your Spot Wallet.
-New Balance: ${r8(newBal)} ${coin}
-
-Contact support at t.me/biexc10 if you need help.`;
+    subject = `Withdrawal Cancelled — ${amount}`;
+    message = `Your withdrawal request has been cancelled and the held funds have been returned to your Spot Wallet.`;
   }
-
-  if (oldBal !== undefined && newBal !== undefined) {
-    message += `
-
-Balance: ${r8(oldBal)} → ${r8(newBal)} ${coin}`;
-  }
-  return { subject, message, amount, status };
+  return { subject, message, amount, status, label, oldBal, newBal, coin, txid, network, address, hid, uid, type, action };
 }
 
 async function sendResolutionEmail(ctx) {
@@ -1162,7 +1144,7 @@ async function sendResolutionEmail(ctx) {
     const info = await sendMailAny({
       to,
       subject: mail.subject,
-      html: mailHtml(mail.subject, mail.message, mail.amount, mail.status, uid),
+      html: mailHtml({ ...mail, uid }),
       text: `${mail.subject}
 
 ${mail.message}
@@ -1180,96 +1162,165 @@ BIEXC — t.me/biexc10`
   }
 }
 
-function mailHtml(subject, message, amount, status, uid) {
-  const safe = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-  const isOk = status === 'COMPLETED';
-  const isBad = status === 'REJECTED' || status === 'CANCELLED';
-  const accent = isOk ? '#0ecb81' : isBad ? '#f6465d' : '#f0b90b';
-  const accentSoft = isOk ? 'rgba(14,203,129,.12)' : isBad ? 'rgba(246,70,93,.12)' : 'rgba(240,185,11,.12)';
-  const icon = isOk ? '✓' : isBad ? '✕' : '!';
-  const badgeText = isOk ? 'APPROVED' : isBad ? 'REJECTED' : 'PENDING';
-  const headline = isOk ? 'Transaction Successful'
-                 : isBad ? 'Transaction Declined'
-                 : 'Transaction Update';
-  const txnId = 'TX' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random()*9999).toString(36).toUpperCase();
-  const dateStr = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+function mailHtml(opts) {
+  const o = opts || {};
+  const subject = o.subject || '';
+  const message = o.message || '';
+  const amount  = o.amount  || '';
+  const status  = o.status  || '';
+  const uid     = o.uid     || '';
+  const label   = o.label   || '';
+  const coin    = o.coin    || '';
+  const network = o.network || '';
+  const address = o.address || '';
+  const txid    = o.txid    || o.txnId || '';
+  const hid     = o.hid     || '';
+  const type    = o.type    || '';
+  const oldBal  = o.oldBal;
+  const newBal  = o.newBal;
 
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${safe(subject)}</title></head>
-<body style="margin:0;padding:0;background:#0b0e11;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#eaecef;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0e11;padding:32px 12px;">
-  <tr><td align="center">
-    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#181a20;border-radius:16px;overflow:hidden;border:1px solid #2b3139;box-shadow:0 20px 60px rgba(0,0,0,.5);">
+  const esc = (v) => String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const nl2br = (v) => esc(v).replace(/\n/g, '<br>');
 
-      <!-- HEADER -->
-      <tr><td style="background:linear-gradient(135deg,#f0b90b 0%,#f8d12f 50%,#f0b90b 100%);padding:28px 32px;text-align:center;">
-        <div style="display:inline-block;background:#0b0e11;padding:10px 22px;border-radius:30px;border:2px solid rgba(0,0,0,.15);">
-          <span style="font-size:22px;font-weight:900;color:#f0b90b;letter-spacing:3px;">⚡ BIEXC</span>
-        </div>
-        <div style="margin-top:10px;font-size:11px;color:rgba(0,0,0,.7);letter-spacing:2px;font-weight:700;">PRO P2P TRADING TERMINAL</div>
-      </td></tr>
+  const isOk  = status === 'COMPLETED';
+  const isBad = status === 'CANCELLED' || status === 'REJECTED';
+  const accent   = isOk ? '#0ECB81' : isBad ? '#F6465D' : '#F0B90B';
+  const accentBg = isOk ? 'rgba(14,203,129,.10)' : isBad ? 'rgba(246,70,93,.10)' : 'rgba(240,185,11,.10)';
+  const badge    = isOk ? 'COMPLETED' : isBad ? 'CANCELLED' : (status || 'PENDING');
+  const verb     = isOk ? 'Completed' : isBad ? 'Cancelled' : 'Update';
+  const headline = label ? (label + ' ' + verb) : (subject || 'Transaction Update');
+  const sign     = type === 'dep' ? '+' : '−';
+  const direction = type === 'dep' ? 'Incoming' : 'Outgoing';
 
-      <!-- STATUS ICON -->
-      <tr><td style="padding:36px 32px 8px;text-align:center;">
-        <div style="display:inline-block;width:76px;height:76px;line-height:72px;border-radius:50%;background:${accentSoft};border:2px solid ${accent};font-size:38px;color:${accent};font-weight:900;">${icon}</div>
-        <div style="margin-top:18px;font-size:22px;font-weight:700;color:#eaecef;">${headline}</div>
-        <div style="margin-top:8px;display:inline-block;padding:5px 14px;border-radius:20px;background:${accentSoft};color:${accent};font-size:11px;font-weight:800;letter-spacing:1.5px;">${badgeText}</div>
-      </td></tr>
+  const now = new Date();
+  const istStr = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+  const utcStr = now.toISOString().replace('T',' ').slice(0,16) + ' UTC';
+  const refNo  = 'BIEXC-' + (hid ? String(hid).slice(-8).toUpperCase() : (txid ? String(txid).slice(-8).toUpperCase() : Math.random().toString(36).slice(2,10).toUpperCase()));
 
-      <!-- AMOUNT CARD -->
-      ${amount ? `<tr><td style="padding:24px 32px 8px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:linear-gradient(135deg,#0b0e11 0%,#161a20 100%);border-radius:12px;border-left:4px solid ${accent};padding:20px 22px;">
-          <tr><td>
-            <div style="font-size:11px;color:#848e9c;letter-spacing:1.5px;font-weight:600;text-transform:uppercase;">Amount</div>
-            <div style="margin-top:6px;font-size:30px;font-weight:800;color:#ffffff;letter-spacing:-0.5px;">${safe(amount)}</div>
-          </td></tr>
-        </table>
-      </td></tr>` : ''}
+  const det = (k, v, mono) => '<tr><td class="det-k" style="padding:11px 0;color:#8B95A7;font-size:12px;line-height:1.4;width:38%;vertical-align:top;letter-spacing:.2px;">' + esc(k) + '</td><td class="det-v" style="padding:11px 0;color:#EAECEF;font-size:13px;line-height:1.4;text-align:right;font-weight:600;' + (mono ? "font-family:'SF Mono',Menlo,Consolas,monospace;letter-spacing:-.2px;" : '') + 'word-break:break-all;">' + v + '</td></tr>';
 
-      <!-- MESSAGE -->
-      <tr><td style="padding:20px 32px 8px;">
-        <div style="background:#0b0e11;border-radius:12px;padding:20px 22px;border:1px solid #2b3139;color:#b7bdc6;font-size:14px;line-height:1.7;">
-          ${safe(message)}
-        </div>
-      </td></tr>
+  const sec = (t) => '<tr><td colspan="2" style="padding:18px 0 6px;border-top:1px solid #1c222b;"><div style="font-size:10px;color:#5E6673;letter-spacing:2.5px;font-weight:700;text-transform:uppercase;">' + esc(t) + '</div></td></tr>';
 
-      <!-- DETAILS -->
-      <tr><td style="padding:20px 32px 8px;">
-        <div style="font-size:11px;color:#848e9c;letter-spacing:1.5px;font-weight:700;text-transform:uppercase;margin-bottom:10px;">Transaction Details</div>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0b0e11;border-radius:12px;border:1px solid #2b3139;">
-          ${uid ? `<tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">User ID</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#eaecef;font-size:13px;font-family:'SF Mono',Menlo,monospace;font-weight:600;">${safe(uid)}</td></tr>` : ''}
-          <tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">Transaction ID</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#eaecef;font-size:12px;font-family:'SF Mono',Menlo,monospace;">${txnId}</td></tr>
-          <tr><td style="padding:12px 18px;border-bottom:1px solid #2b3139;color:#848e9c;font-size:13px;">Status</td><td align="right" style="padding:12px 18px;border-bottom:1px solid #2b3139;color:${accent};font-size:13px;font-weight:700;">${badgeText}</td></tr>
-          <tr><td style="padding:12px 18px;color:#848e9c;font-size:13px;">Date & Time (IST)</td><td align="right" style="padding:12px 18px;color:#eaecef;font-size:13px;">${dateStr}</td></tr>
-        </table>
-      </td></tr>
+  const node = (n, txt, active) => '<td align="center" width="33.33%" style="padding:0 4px;"><div style="width:28px;height:28px;line-height:28px;margin:0 auto;border-radius:50%;background:' + (active?accent:'#1c222b') + ';color:' + (active?'#0a0d12':'#5E6673') + ';font-size:12px;font-weight:800;border:2px solid ' + (active?accent:'#1c222b') + ';">' + n + '</div><div style="margin-top:8px;font-size:10px;letter-spacing:1.2px;color:' + (active?'#EAECEF':'#5E6673') + ';text-transform:uppercase;font-weight:600;">' + esc(txt) + '</div></td>';
 
-      <!-- SECURITY -->
-      <tr><td style="padding:20px 32px 8px;">
-        <div style="background:rgba(240,185,11,.06);border:1px solid rgba(240,185,11,.25);border-radius:10px;padding:14px 16px;color:#f0b90b;font-size:12px;line-height:1.6;">
-          🔒 <strong>Security Notice:</strong> Never share your password, OTP, or 2FA codes with anyone. BIEXC will never ask for them.
-        </div>
-      </td></tr>
+  const logo = '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr><td align="center" style="width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 30%, #2a2a2a 0%, #0a0a0a 75%);border:2px solid #F0B90B;box-shadow:0 0 0 4px rgba(240,185,11,.06), 0 6px 18px rgba(240,185,11,.18);font:800 20px/64px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#F0B90B;letter-spacing:1.5px;text-align:center;">BN</td></tr></table>';
 
-      <!-- CTA -->
-      <tr><td style="padding:24px 32px 8px;text-align:center;">
-        <a href="https://t.me/biexc10" style="display:inline-block;background:linear-gradient(135deg,#f0b90b,#f8d12f);color:#0b0e11;text-decoration:none;font-weight:800;font-size:14px;padding:13px 36px;border-radius:10px;letter-spacing:.5px;">Contact Support →</a>
-      </td></tr>
+  const stage3Active = isOk;
+  const stage2Label = type === 'wit' ? 'Broadcast' : 'Verified';
+  const stage3Label = isBad ? 'Cancelled' : (type === 'wit' ? 'Sent' : 'Credited');
 
-      <!-- FOOTER -->
-      <tr><td style="padding:28px 32px 24px;text-align:center;border-top:1px solid #2b3139;margin-top:20px;">
-        <div style="font-size:18px;font-weight:800;color:#f0b90b;letter-spacing:2px;">BIEXC</div>
-        <div style="margin-top:6px;font-size:11px;color:#5e6673;letter-spacing:1px;">PRO P2P TRADING TERMINAL</div>
-        <div style="margin-top:14px;font-size:11px;color:#5e6673;line-height:1.7;">
-          Need help? <a href="https://t.me/biexc10" style="color:#f0b90b;text-decoration:none;font-weight:600;">t.me/biexc10</a><br>
-          © ${new Date().getFullYear()} BIEXC. All rights reserved.<br>
-          <span style="color:#3a4048;">This is an automated message — please do not reply.</span>
-        </div>
-      </td></tr>
+  const addrBlock = address ? '<tr><td style="padding:14px 16px;background:#06080b;border:1px solid #1c222b;border-radius:10px;"><div style="font-size:10px;color:#5E6673;letter-spacing:2px;font-weight:700;text-transform:uppercase;margin-bottom:6px;">' + (type==='wit'?'Destination Address':'Sender Address') + '</div><div style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;color:#EAECEF;word-break:break-all;line-height:1.5;">' + esc(address) + '</div></td></tr><tr><td style="height:10px;line-height:10px;font-size:0;">&nbsp;</td></tr>' : '';
 
-    </table>
-  </td></tr>
-</table>
-</body></html>`;
+  const txidBlock = txid ? '<tr><td style="padding:14px 16px;background:#06080b;border:1px solid #1c222b;border-radius:10px;"><div style="font-size:10px;color:#5E6673;letter-spacing:2px;font-weight:700;text-transform:uppercase;margin-bottom:6px;">Transaction Hash</div><div style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;color:#EAECEF;word-break:break-all;line-height:1.5;">' + esc(txid) + '</div></td></tr><tr><td style="height:10px;line-height:10px;font-size:0;">&nbsp;</td></tr>' : '';
+
+  const balDelta = (oldBal !== undefined && newBal !== undefined) ? (Number(newBal) - Number(oldBal)) : null;
+  const deltaStr = balDelta === null ? '' : '<span style="color:' + (balDelta>=0?'#0ECB81':'#F6465D') + ';">' + (balDelta>=0?'+':'') + r8(balDelta) + ' ' + esc(coin) + '</span>';
+
+  const stepperFill = stage3Active ? 100 : (isBad ? 100 : 66);
+
+  let html = '';
+  html += '<!doctype html><html lang="en"><head>';
+  html += '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+  html += '<meta name="color-scheme" content="dark only"><meta name="supported-color-schemes" content="dark only">';
+  html += '<title>' + esc(subject) + '</title>';
+  html += '<style>@media (max-width:520px){.wrap{padding:14px 6px !important;}.card{padding:22px 14px !important;border-radius:14px !important;}.hero-amt{font-size:22px !important;letter-spacing:-.4px !important;}.h1{font-size:20px !important;}.det-k{width:44% !important;font-size:11px !important;}.det-v{font-size:12px !important;}.stage-lbl{font-size:9px !important;}}a{color:#F0B90B;text-decoration:none;}</style>';
+  html += '</head><body style="margin:0;padding:0;background:#06080b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,\'Helvetica Neue\',Arial,sans-serif;color:#EAECEF;-webkit-font-smoothing:antialiased;">';
+  html += '<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#06080b;">' + esc(headline) + ' · ' + esc(amount) + ' · Ref ' + refNo + '</div>';
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#06080b;"><tr><td align="center" class="wrap" style="padding:30px 16px;">';
+  html += '<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;">';
+
+  // Brand
+  html += '<tr><td align="center" style="padding:4px 0 22px;">' + logo;
+  html += '<div style="margin-top:12px;font-size:18px;font-weight:800;color:#F0B90B;letter-spacing:4px;">BIEXC</div>';
+  html += '<div style="margin-top:3px;font-size:10px;color:#5E6673;letter-spacing:2.5px;text-transform:uppercase;font-weight:600;">Pro Trading Terminal</div></td></tr>';
+
+  // Card
+  html += '<tr><td class="card" style="background:linear-gradient(180deg,#10151d 0%,#0c1117 100%);border:1px solid #1c222b;border-radius:16px;padding:32px 30px;">';
+
+  // Ribbon
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:22px;"><tr>';
+  html += '<td align="left" style="vertical-align:middle;"><span style="display:inline-block;background:' + accentBg + ';color:' + accent + ';padding:5px 12px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:1.8px;border:1px solid ' + accent + ';">● ' + badge + '</span></td>';
+  html += '<td align="right" style="vertical-align:middle;"><span style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:11px;color:#5E6673;letter-spacing:.5px;">Ref · ' + refNo + '</span></td>';
+  html += '</tr></table>';
+
+  // Headline
+  html += '<h1 class="h1" style="margin:0 0 8px;font-size:23px;font-weight:700;color:#FFFFFF;letter-spacing:-.3px;line-height:1.25;">' + esc(headline) + '</h1>';
+  html += '<p style="margin:0 0 26px;font-size:13.5px;line-height:1.6;color:#B7BDC6;">' + nl2br(message) + '</p>';
+
+  // Amount hero
+  if (amount) {
+    html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 24px;"><tr><td style="background:#06080b;border:1px solid #1c222b;border-left:3px solid ' + accent + ';border-radius:12px;padding:22px 22px;">';
+    html += '<div style="font-size:10px;color:#5E6673;letter-spacing:2.2px;text-transform:uppercase;font-weight:700;">' + esc(direction) + ' ' + esc(label) + '</div>';
+    html += '<div class="hero-amt" style="margin-top:8px;font-size:34px;font-weight:700;color:#FFFFFF;letter-spacing:-.8px;font-family:\'SF Mono\',Menlo,Consolas,monospace;line-height:1.1;">';
+    html += '<span style="color:' + accent + ';">' + sign + '</span> ' + esc(amount);
+    if (network) html += ' <span style="font-size:13px;color:#5E6673;font-weight:600;letter-spacing:1px;text-transform:uppercase;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">· ' + esc(network) + '</span>';
+    html += '</div></td></tr></table>';
+  }
+
+  // Stepper
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 22px;"><tr><td>';
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>';
+  html += node('1','Requested',true);
+  html += node('2',stage2Label,true);
+  html += node('3',stage3Label,stage3Active || isBad);
+  html += '</tr><tr><td colspan="3" style="padding:10px 14px 0;">';
+  html += '<div style="height:2px;background:linear-gradient(to right, ' + accent + ' 0%, ' + accent + ' ' + stepperFill + '%, #1c222b ' + stepperFill + '%, #1c222b 100%);border-radius:2px;"></div>';
+  html += '</td></tr></table></td></tr></table>';
+
+  // Address & TXID blocks
+  if (address || txid) {
+    html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">';
+    html += addrBlock + txidBlock;
+    html += '</table>';
+  }
+
+  // Details
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">';
+  html += sec('Transaction');
+  if (label) html += det('Type', esc(direction) + ' ' + esc(label));
+  if (coin) html += det('Asset', esc(coin));
+  if (network) html += det('Network', esc(network));
+  if (amount) html += det('Amount', '<span style="color:' + accent + ';">' + sign + '</span> ' + esc(amount), true);
+
+  if (oldBal !== undefined && newBal !== undefined) {
+    html += sec('Wallet Balance');
+    html += det('Before', r8(oldBal) + ' ' + esc(coin), true);
+    html += det('After',  r8(newBal) + ' ' + esc(coin), true);
+    if (balDelta !== null) html += det('Net Change', deltaStr, true);
+  }
+
+  html += sec('System');
+  if (uid) html += det('Account UID', esc(uid), true);
+  html += det('Reference', refNo, true);
+  html += det('Status', '<span style="color:' + accent + ';">● ' + badge + '</span>');
+  html += det('Time (IST)', esc(istStr));
+  html += det('Time (UTC)', esc(utcStr));
+  html += '</table>';
+
+  // Security
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:26px;"><tr><td style="background:rgba(240,185,11,.04);border:1px solid rgba(240,185,11,.20);border-radius:10px;padding:14px 16px;">';
+  html += '<div style="font-size:12px;color:#B7BDC6;line-height:1.6;"><span style="color:#F0B90B;font-weight:700;">🔒 Security · </span>BIEXC will never ask for your password, 2FA code, recovery phrase, or private keys. All transactions are final and recorded on-chain.</div>';
+  html += '</td></tr></table>';
+
+  // CTAs
+  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 0;"><tr><td align="center" style="padding:0 4px 8px;">';
+  html += '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr>';
+  html += '<td style="background:linear-gradient(135deg,#F0B90B 0%,#F8D12F 100%);border-radius:10px;"><a href="https://t.me/biexc10" style="display:inline-block;padding:13px 24px;font-size:12.5px;font-weight:800;color:#0a0d12;text-decoration:none;letter-spacing:.4px;">Contact Support →</a></td>';
+  html += '<td style="width:10px;font-size:0;line-height:0;">&nbsp;</td>';
+  html += '<td style="background:transparent;border:1px solid #2b3139;border-radius:10px;"><a href="https://t.me/biexc10" style="display:inline-block;padding:12px 22px;font-size:12.5px;font-weight:700;color:#EAECEF;text-decoration:none;letter-spacing:.4px;">View History</a></td>';
+  html += '</tr></table></td></tr></table>';
+
+  html += '</td></tr>';
+
+  // Footer
+  html += '<tr><td align="center" style="padding:24px 16px 8px;"><div style="font-size:11px;color:#5E6673;line-height:1.8;">';
+  html += 'This is an automated transaction notification — please do not reply.<br>';
+  html += 'Need help? <a href="https://t.me/biexc10">t.me/biexc10</a> · Telegram: <a href="https://t.me/biexc10">@biexc10</a><br>';
+  html += '© ' + now.getFullYear() + ' BIEXC · Pro Trading Terminal · All rights reserved.';
+  html += '</div></td></tr>';
+
+  html += '</table></td></tr></table></body></html>';
+  return html;
 }
 
 app.get('/api/mail-status', (_req, res) => {
@@ -1297,7 +1348,7 @@ app.post('/api/test-mail', async (req, res) => {
     const info = await sendMailAny({
       to,
       subject: 'BIEXC test mail',
-      html: mailHtml('BIEXC test mail', 'Mail service is working now.', '', 'COMPLETED', 'TEST'),
+      html: mailHtml({ subject: 'BIEXC test mail', message: 'Mail service is working now.', amount: '0 USDT', status: 'COMPLETED', uid: 'TEST', label: 'Deposit', coin: 'USDT', type: 'dep', action: 'approve' }),
       text: `BIEXC test mail\n\nMail service is working now.`
     });
     log('MAIL', `✅ test sent → ${to} msg=${info.messageId || 'ok'}`);
@@ -1317,7 +1368,7 @@ app.post('/api/send-mail', async (req, res) => {
     await sendMailAny({
       to: to_email,
       subject,
-      html: mailHtml(subject, message || '', amount || '', status || '', uid || ''),
+      html: mailHtml({ subject, message: message || '', amount: amount || '', status: status || '', uid: uid || '', label: '', coin: '' }),
       text: `${subject}
 
 ${message || ''}
