@@ -447,6 +447,18 @@ async function handleCallback(cb) {
     await tgSend(`✏️ Reply with:\n\`/${kind} ${m[2]} <amount> [COIN]\``);
     return;
   }
+  if ((m = data.match(/^bcdel_(.+)$/))) {
+    await tgAnswer(cb.id, '🗑 Deleting…');
+    await handleBroadDelete(m[1]);
+    await tgSend(`✅ Broadcast deleted — removed from all user notifications.`);
+    return;
+  }
+  if (data === 'bcclearall') {
+    await tgAnswer(cb.id, '🧹 Clearing all…');
+    await handleBroadClearAll();
+    await tgSend(`✅ *ALL broadcasts cleared* — wiped from every user's notifications.`);
+    return;
+  }
   await tgAnswer(cb.id, '?');
 }
 
@@ -527,6 +539,9 @@ const HELP_TEXT = [
   '━━━━━━━━━━━━━━━━━━━',
   '`/stats` — Platform stats',
   '`/broadcast MSG` — Announcement to all',
+  '`/broad` — List all broadcasts with delete buttons',
+  '`/broaddel <key>` — Delete one broadcast (global)',
+  '`/broadclear` — Wipe ALL broadcasts (global)',
   '`/ping` · `/help`',
   '',
   '⚡ Quick: `#UID AMT` (USDT credit)',
@@ -827,6 +842,36 @@ async function handleBroadcast(message) {
   await tgSend(`✅ *BROADCAST SENT*\n\nReach: *${count} users*\n💬 "${message}"`);
 }
 
+// ── /broad — list all broadcasts with delete buttons ───────────────
+async function handleBroadList() {
+  const snap = await db.ref('broadcast').once('value');
+  if (!snap.exists()) { await tgSend('📭 No broadcasts yet.'); return; }
+  const items = [];
+  snap.forEach(c => { items.push({ key: c.key, ...c.val() }); });
+  items.sort((a,b) => (b.ts||0) - (a.ts||0));
+  const top = items.slice(0, 20);
+  const lines = [`📢 *BROADCASTS* (${items.length} total, showing ${top.length})`, ''];
+  const keyboard = [];
+  top.forEach((b, i) => {
+    const when = b.date || new Date(b.ts||0).toLocaleString('en-IN');
+    const txt = (b.text || '').slice(0, 80);
+    lines.push(`*${i+1}.* _${when}_\n💬 ${txt}`);
+    keyboard.push([{ text: `🗑 Delete #${i+1}`, callback_data: `bcdel_${b.key}` }]);
+  });
+  keyboard.push([{ text: '🧹 Clear ALL broadcasts', callback_data: 'bcclearall' }]);
+  await tgSend(lines.join('\n\n'), { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function handleBroadDelete(key) {
+  await db.ref(`broadcast/${key}`).remove();
+  log('BROADCAST', `deleted ${key}`);
+}
+
+async function handleBroadClearAll() {
+  await db.ref('broadcast').remove();
+  log('BROADCAST', 'cleared all');
+}
+
 // ════════════════════════════════════════════════════════════════════
 // UPDATE / MESSAGE HANDLER
 // ════════════════════════════════════════════════════════════════════
@@ -862,6 +907,9 @@ async function handleUpdate(upd) {
   if ((m = text.match(/^\/closeorder\s+(\S+)$/i)))          return handleCloseOrder(m[1]);
   if ((m = text.match(/^\/closep2p\s+([A-Z0-9]{2,15})$/i))) return closeAllP2PForUser(m[1].toUpperCase());
   if ((m = text.match(/^\/broadcast\s+([\s\S]+)$/i)))       return handleBroadcast(m[1].trim());
+  if (text === '/broad' || text === '/broadlist')           return handleBroadList();
+  if (text === '/broadclear')                               return handleBroadClearAll().then(() => tgSend('✅ All broadcasts cleared.'));
+  if ((m = text.match(/^\/broaddel\s+(\S+)$/i)))            return handleBroadDelete(m[1]).then(() => tgSend(`✅ Deleted broadcast \`${m[1]}\``));
   if ((m = text.match(/^#([A-Z0-9]{2,15})\s+([\d.]+)$/i)))  return adminCreditDebit(m[1].toUpperCase(), parseFloat(m[2]), '+', 'ADMIN_CREDIT', 'USDT');
 }
 
