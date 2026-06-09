@@ -184,6 +184,73 @@ async function findUserByUID(uid) {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// KYC — block user with un-closeable notice until admin approves
+// ════════════════════════════════════════════════════════════════════
+const kycSentFor = new Set(); // fuid+ts already forwarded to TG
+
+async function requireKycForUid(uid) {
+  const found = await findUserByUID(uid);
+  if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
+  await db.ref(`users/${found.fuid}`).update({
+    kycRequired: true,
+    kycStatus: 'REQUIRED',
+    kycRequestedAt: Date.now(),
+  });
+  log('KYC', `required for UID=${uid}`);
+  await tgSend(`📝 *KYC REQUIRED*\n\n👤 \`${uid}\`\n📛 ${found.user.name || '—'}\n\nUser will see an un-closeable notice on next app load.`);
+}
+
+async function maybeForwardKycSubmission(fuid, user) {
+  const sub = user?.kycSubmission;
+  if (!sub || typeof sub !== 'object') return;
+  if (sub.status !== 'PENDING') return;
+  const key = `${fuid}_${sub.ts || 0}`;
+  if (kycSentFor.has(key)) return;
+  kycSentFor.add(key);
+  const uid = user.uid || fuid.slice(0,8);
+  const text = [
+    '📝 *KYC SUBMISSION — REVIEW*', '',
+    `👤 UID: \`${uid}\``,
+    `📛 Name: *${sub.name || '—'}*`,
+    `🆔 Aadhar: \`${sub.aadhar || '—'}\``,
+    `📱 Mobile: ${sub.mobile || '—'}`,
+    `📧 Email: ${sub.email || '—'}`,
+    `🏠 Address: ${sub.address || '—'}`,
+    `🕒 ${sub.ts ? new Date(sub.ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''}`,
+  ].join('\n');
+  await tgSend(text, { reply_markup: { inline_keyboard: [[
+    { text: '✅ Approve KYC', callback_data: `kycapprove_${uid}` },
+    { text: '❌ Reject KYC',  callback_data: `kycreject_${uid}` },
+  ]] } });
+  log('KYC', `submission forwarded UID=${uid}`);
+}
+
+async function handleKycDecision(cb, action, uid) {
+  await tgAnswer(cb.id, action === 'approve' ? '✅ Approving…' : '❌ Rejecting…');
+  const found = await findUserByUID(uid);
+  if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
+  if (action === 'approve') {
+    await db.ref(`users/${found.fuid}`).update({
+      kycStatus: 'APPROVED',
+      kycRequired: false,
+      kycApprovedAt: Date.now(),
+    });
+    await db.ref(`users/${found.fuid}/kycSubmission/status`).set('APPROVED').catch(()=>{});
+    await tgSend(`✅ *KYC APPROVED*\n\n👤 \`${uid}\`\n📛 ${found.user.name || '—'}`);
+  } else {
+    await db.ref(`users/${found.fuid}`).update({
+      kycStatus: 'REJECTED',
+      kycRejectedAt: Date.now(),
+    });
+    await db.ref(`users/${found.fuid}/kycSubmission/status`).set('REJECTED').catch(()=>{});
+    // clear sent marker so a fresh submission re-notifies admin
+    for (const k of Array.from(kycSentFor)) if (k.startsWith(found.fuid+'_')) kycSentFor.delete(k);
+    await tgSend(`❌ *KYC REJECTED*\n\n👤 \`${uid}\`\n(Notice remains visible to user.)`);
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
 // SINGLE-INSTANCE GUARD + PERSISTENT OFFSET
 // ════════════════════════════════════════════════════════════════════
 async function claimInstanceLock() {
@@ -326,12 +393,16 @@ if (db) {
     const v = snap.val() || {};
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v);
+    await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
+
   });
   db.ref('users').on('child_added', async (snap) => {
     if (!(await amIActive())) return;
     const v = snap.val() || {};
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v, BOT_START_TIME - 10_000);
+    await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
+
   });
 }
 
@@ -459,7 +530,9 @@ async function handleCallback(cb) {
     await tgSend(`✅ *ALL broadcasts cleared* — wiped from every user's notifications.`);
     return;
   }
+  if ((m = data.match(/^kyc(approve|reject)_(.+)$/))) return handleKycDecision(cb, m[1], m[2]);
   await tgAnswer(cb.id, '?');
+
 }
 
 async function handleApproveRejectCb(cb, action, cbId) {
@@ -890,7 +963,9 @@ async function handleUpdate(upd) {
   if (text === '/stats')  return handleStats();
 
   let m;
+  if ((m = text.match(/^\/(?:kyc|uid)\s+([A-Z0-9]{2,15})$/i)))             return requireKycForUid(m[1].toUpperCase());
   if ((m = text.match(/^\/user\s+([A-Z0-9]{2,15})$/i)))                   return sendUserDetailCard({ id: 'cmd' }, m[1].toUpperCase());
+
   if ((m = text.match(/^\/history\s+([A-Z0-9]{2,15})$/i)))                return sendUserHistory(m[1].toUpperCase(), 15);
   if ((m = text.match(/^\/balances\s+([A-Z0-9]{2,15})$/i)))               return handleBalances(m[1].toUpperCase());
   if ((m = text.match(/^\/credit\s+([A-Z0-9]{2,15})\s+([\d.]+)(?:\s+([A-Z]{2,8}))?$/i)))
