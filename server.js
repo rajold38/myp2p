@@ -1052,6 +1052,12 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
+  // BIEXC support relay: if admin replied to a support card, forward to user.
+  if (msg.reply_to_message) {
+    const relayed = await handleSupportAdminReply(msg);
+    if (relayed) return;
+  }
+
   if (text === '/start' || text === '/help') return tgSend(HELP_TEXT);
   if (text === '/ping')   return tgSend(`🟢 Bot online — ${nowIST()} IST\nUptime: ${Math.floor((Date.now()-BOT_START_TIME)/60000)}m\nInstance: \`${INSTANCE_ID}\``);
   if (text === '/users')  return handleUsersList();
@@ -1201,6 +1207,255 @@ app.post('/api/tg/:method', requireInternalSecret, rateLimit({ capacity: 20, ref
     res.json(r);
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
+
+
+
+// ════════════════════════════════════════════════════════════════════
+// BIEXC SUPPORT CHAT  (AI bot + Live agent via Telegram relay)
+// ────────────────────────────────────────────────────────────────────
+// Flow:
+//   1. User opens in-app chat → talks to AI (Google Gemini, free tier).
+//   2. AI handles deposits / withdraw / P2P / spot / futures / KYC FAQs.
+//   3. User can escalate → a card is posted to TG_CHAT with a
+//      "Reply" button. Admin replies to that message in Telegram and
+//      the reply is relayed back to the user (polled at /api/support/poll).
+//
+//   Requires env var:  GEMINI_API_KEY  (get free key at aistudio.google.com)
+//   Falls back to canned answers if GEMINI_API_KEY is missing.
+// ════════════════════════════════════════════════════════════════════
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL   = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+const BIEXC_SYSTEM_PROMPT = `You are "BIEXC Bot", the friendly 24/7 AI support assistant for the BIEXC crypto exchange app. Match the helpful tone of Binance/Bybit support bots.
+
+ABOUT BIEXC:
+- India-focused USDT/INR P2P exchange with instant UPI.
+- Features: No-KYC P2P trading, Spot trading (1000+ pairs), USDT-margined Futures up to 100×, Deposit/Withdraw (BTC, ETH, USDT on TRC20/ERC20/BEP20/TON), Convert, Referrals.
+- Verified merchants, escrow-protected P2P, 24×7 customer care.
+
+WHAT YOU CAN HELP WITH:
+1. DEPOSITS — crypto deposits usually credit within minutes after on-chain confirmations. Tell users to: (a) verify the TxID on the blockchain explorer, (b) confirm they used the correct network (TRC20 vs ERC20 vs BEP20), (c) wait up to 60 min, (d) contact live support with UID + TxID if not credited.
+2. WITHDRAWALS — show that withdrawals are reviewed by admin; funds are debited on request, returned to Spot Wallet if rejected. Standard min withdraw, network fees vary.
+3. P2P TRADING — explain USDT escrow, paying merchant via UPI, marking "Paid", merchant releases USDT. Disputes go to live support.
+4. SPOT — market & limit orders, base/quote pairs, fees ~0.1%.
+5. FUTURES — USDT-margined perpetuals, leverage up to 100×, isolated/cross margin, liquidation = full margin loss, TP/SL supported.
+6. KYC / UID — UID is the user's BIEXC ID. KYC may be requested for high-volume P2P or withdrawal.
+7. SECURITY — 2FA via email OTP, never share passwords/OTP, beware of phishing telegrams.
+8. REFERRALS — share referral link/code; earn commission on referee trades.
+9. ACCOUNT — change password, login issues, ban appeals → live support.
+
+RULES:
+- Reply in the SAME language the user wrote in (English / Hindi / Hinglish).
+- Keep answers short (≤ 4 short paragraphs / bullets). Use plain text — no markdown headers, no asterisks for bold.
+- Never invent prices, balances or transaction IDs.
+- For balance / order / dispute / refund / ban / "where is my money" issues, suggest connecting to a Live Agent at the end of your reply.
+- If user says "human", "agent", "live", "representative", or seems frustrated → tell them to tap "Connect to Live Support" below.
+- Do NOT mention "Bybit" or "Binance" — you are BIEXC Bot.`;
+
+const SUPPORT_FAQ_FALLBACK = [
+  [/(deposit|credit).*not|not.*credit|missing/i,
+   "Deposits usually credit within minutes after the required on-chain confirmations.\n\n• Verify the TxID on the blockchain explorer.\n• Make sure the network you sent on matches the network selected in the app (TRC20 / ERC20 / BEP20 / TON).\n• Wait up to 60 minutes.\n\nIf it's still not credited, tap 'Connect to Live Support' below and share your UID + TxID."],
+  [/withdraw/i,
+   "Withdrawals are reviewed by our admin team. Funds are debited from your Spot Wallet on request and instantly returned if the request is rejected. Status updates appear in your History.\n\nFor a stuck or rejected withdrawal, please escalate to a live agent with your UID."],
+  [/p2p|merchant|upi|escrow/i,
+   "On BIEXC P2P, USDT is locked in escrow. Pay the merchant via UPI, mark the order as 'Paid', and the merchant releases USDT to your Spot Wallet. Always confirm the merchant's UPI ID before paying.\n\nFor disputes (paid but not released, wrong amount), tap 'Connect to Live Support'."],
+  [/(futures|perp|leverage|liquidation)/i,
+   "BIEXC offers USDT-margined perpetual futures with leverage up to 100×. You can set TP/SL on every position. If your margin runs out, the position is liquidated and you lose your margin.\n\nNeed help with a specific trade? Connect to a live agent."],
+  [/spot|market order|limit order|trade/i,
+   "On Spot you can place Market or Limit orders across 1000+ pairs with ~0.1% fee. Buy uses your USDT, Sell uses the base coin balance."],
+  [/kyc|verify|verification/i,
+   "KYC is optional for normal P2P but may be requested for high-volume trades or withdrawals. You can submit KYC from Profile → Verification."],
+  [/(2fa|password|login|hack|otp|security)/i,
+   "For account security: enable 2FA, never share your password/OTP, and only log in via the official BIEXC app/site. If you suspect unauthorized access, change your password and connect to live support immediately."],
+  [/referral|invite|commission/i,
+   "Share your referral link from Profile → Referrals. You earn a commission whenever your referees trade on BIEXC."],
+  [/(human|agent|live|representative|manager)/i,
+   "Sure! Tap 'Connect to Live Support' below and I'll connect you to a human agent."],
+];
+
+async function geminiReply(historyArr, userText){
+  if (!GEMINI_API_KEY) return null;
+  try{
+    const contents = [];
+    for(const h of (historyArr||[])){
+      if(!h || !h.text) continue;
+      contents.push({
+        role: h.role === 'user' ? 'user' : 'model',
+        parts: [{ text: String(h.text).slice(0, 1200) }]
+      });
+    }
+    contents.push({ role:'user', parts:[{ text: String(userText).slice(0, 2000) }] });
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const r = await fetch(url, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        systemInstruction: { role:'system', parts:[{text: BIEXC_SYSTEM_PROMPT}] },
+        contents,
+        generationConfig: { temperature: 0.6, maxOutputTokens: 600 }
+      })
+    });
+    const d = await r.json();
+    if(!r.ok){ log('AI', `gemini http ${r.status}: ${JSON.stringify(d).slice(0,200)}`); return null; }
+    const txt = d?.candidates?.[0]?.content?.parts?.map(p=>p.text).join('').trim();
+    return txt || null;
+  }catch(e){ log('AI', `gemini err: ${e.message}`); return null; }
+}
+
+function faqFallback(userText){
+  for(const [re, ans] of SUPPORT_FAQ_FALLBACK){
+    if(re.test(userText)) return ans;
+  }
+  return "I'm here to help with deposits, withdrawals, P2P, spot/futures, KYC, security and account issues. Could you rephrase your question? Or tap 'Connect to Live Support' for a human agent.";
+}
+
+// ─── Support session store (Firebase) ───────────────────────────────
+// support/{sessionId} = { user:{uid,email,name}, status:'bot'|'live'|'closed',
+//                         tgMsgId:int, createdTs, updatedTs }
+// support/{sessionId}/msgs/{auto} = { role:'agent', text, ts }
+
+function supRef(sessionId, sub){
+  return db.ref(`support/${sessionId}${sub?'/'+sub:''}`);
+}
+
+async function supEnsureSession(sessionId, user){
+  if(!db) return;
+  const ref = supRef(sessionId);
+  const snap = await ref.once('value');
+  if(!snap.exists()){
+    await ref.set({
+      user: user || {},
+      status: 'bot',
+      createdTs: Date.now(),
+      updatedTs: Date.now()
+    });
+  }
+}
+
+async function supFindByTgMsgId(msgId){
+  if(!db || !msgId) return null;
+  const snap = await db.ref('support').orderByChild('tgMsgId').equalTo(Number(msgId)).once('value');
+  if(!snap.exists()) return null;
+  const v = snap.val();
+  const sid = Object.keys(v)[0];
+  return { sid, ...v[sid] };
+}
+
+// ─── HTTP endpoints (public — no internal-secret) ────────────────────
+app.post('/api/support/session', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok: true, degraded: true });
+  try{
+    const { sessionId, user } = req.body || {};
+    if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
+    await supEnsureSession(sessionId, user||{});
+    res.json({ ok:true });
+  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/api/support/ai', async (req, res) => {
+  try{
+    const { sessionId, text, history, user } = req.body || {};
+    if(!text) return res.status(400).json({ ok:false, error:'text required' });
+    if(sessionId && !BACKEND_DISABLED) await supEnsureSession(sessionId, user||{});
+    let reply = await geminiReply(history, text);
+    if(!reply) reply = faqFallback(text);
+    const escalate = /\b(human|agent|live|representative|manager|complaint)\b/i.test(text);
+    res.json({ ok:true, reply, escalate });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e.message, reply: faqFallback(req.body?.text||'') });
+  }
+});
+
+app.post('/api/support/escalate', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
+  try{
+    const { sessionId, user, transcript } = req.body || {};
+    if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
+    await supEnsureSession(sessionId, user||{});
+    const u = user || {};
+    const head = `🆘 *LIVE SUPPORT REQUEST*\n` +
+      `• Name : ${u.name||'Guest'}\n` +
+      `• UID  : \`${u.uid||'—'}\`\n` +
+      `• Email: ${u.email||'—'}\n` +
+      `• Sess : \`${sessionId}\`\n\n` +
+      `*Recent chat:*\n${(transcript||'').slice(-1800)}\n\n` +
+      `_Reply to this message in Telegram — your reply will be sent to the user._`;
+    const r = await tgFetch('sendMessage', {
+      chat_id: TG_CHAT, text: head, parse_mode: 'Markdown'
+    });
+    if(!r.ok) return res.status(500).json({ ok:false, error:'tg send failed' });
+    const tgMsgId = r.result.message_id;
+    await supRef(sessionId).update({ status:'live', tgMsgId, updatedTs: Date.now() });
+    res.json({ ok:true, tgMsgId });
+  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/api/support/user-msg', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
+  try{
+    const { sessionId, text, user } = req.body || {};
+    if(!sessionId || !text) return res.status(400).json({ ok:false, error:'bad input' });
+    const snap = await supRef(sessionId).once('value');
+    const sess = snap.val();
+    if(!sess || !sess.tgMsgId) return res.status(400).json({ ok:false, error:'no live session' });
+    const u = user || sess.user || {};
+    await tgFetch('sendMessage', {
+      chat_id: TG_CHAT,
+      reply_to_message_id: sess.tgMsgId,
+      text: `👤 *${u.name||'User'}* (\`${u.uid||'—'}\` · \`${sessionId.slice(0,10)}\`):\n${text}`,
+      parse_mode: 'Markdown'
+    });
+    await supRef(sessionId).update({ updatedTs: Date.now() });
+    res.json({ ok:true });
+  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.get('/api/support/poll', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok:true, messages:[] });
+  try{
+    const sessionId = String(req.query.sessionId||'');
+    const since = Number(req.query.since||0);
+    if(!sessionId) return res.json({ ok:false, messages:[] });
+    const snap = await supRef(sessionId).once('value');
+    const sess = snap.val();
+    if(!sess) return res.json({ ok:true, messages:[], closed:true });
+    const msgsSnap = await supRef(sessionId, 'msgs').orderByChild('ts').startAfter(since).once('value');
+    const out = [];
+    msgsSnap.forEach(c => { const v=c.val(); if(v && v.text) out.push({ text:v.text, ts:v.ts }); });
+    res.json({ ok:true, messages: out, closed: sess.status === 'closed' });
+  }catch(e){ res.status(500).json({ ok:false, error:e.message, messages:[] }); }
+});
+
+app.post('/api/support/end', async (req, res) => {
+  try{
+    const { sessionId } = req.body || {};
+    if(sessionId && db) await supRef(sessionId).update({ status:'closed', updatedTs:Date.now() });
+    res.json({ ok:true });
+  }catch(e){ res.json({ ok:false, error:e.message }); }
+});
+
+// ─── Telegram → user relay (admin replies to the support card) ─────
+async function handleSupportAdminReply(msg){
+  try{
+    if(!msg || !msg.reply_to_message) return false;
+    const replyTo = msg.reply_to_message.message_id;
+    const sess = await supFindByTgMsgId(replyTo);
+    if(!sess) return false;
+    const text = (msg.text || msg.caption || '').trim();
+    if(!text) return false;
+    // /close command
+    if(/^\/close\b/i.test(text)){
+      await supRef(sess.sid).update({ status:'closed', updatedTs:Date.now() });
+      await supRef(sess.sid, 'msgs').push({ role:'agent', text:'Session closed by agent.', ts: Date.now() });
+      await tgSend(`✅ Closed support session \`${sess.sid}\``);
+      return true;
+    }
+    await supRef(sess.sid, 'msgs').push({ role:'agent', text, ts: Date.now() });
+    await supRef(sess.sid).update({ updatedTs: Date.now(), status:'live' });
+    return true;
+  }catch(e){ log('SUPPORT', `relay err: ${e.message}`); return false; }
+}
 
 
 // ─── SPACEMAIL SMTP ─────────────────────────────────────────────────
