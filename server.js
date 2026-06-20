@@ -38,14 +38,12 @@ const TG_CHAT          = process.env.TG_CHAT;
 const FIREBASE_DB_URL  = process.env.FIREBASE_DB_URL;
 const FIREBASE_SA_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
 const RENDER_URL       = process.env.RENDER_EXTERNAL_URL || '';
-const IFRAME_API_SECRET = process.env.IFRAME_API_SECRET || '';
 
 const MISSING = [];
 if (!TG_TOKEN)         MISSING.push('TG_TOKEN');
 if (!TG_CHAT)          MISSING.push('TG_CHAT');
 if (!FIREBASE_DB_URL)  MISSING.push('FIREBASE_DB_URL');
 if (!FIREBASE_SA_JSON) MISSING.push('FIREBASE_SERVICE_ACCOUNT');
-if (!IFRAME_API_SECRET) console.warn('[BOOT] ⚠️ IFRAME_API_SECRET is not set — /api/tg/* and /api/send-mail are running UNAUTHENTICATED (fail-open for local dev). Set IFRAME_API_SECRET in production!');
 const BACKEND_DISABLED = MISSING.length > 0;
 if (BACKEND_DISABLED) {
   console.warn(`⚠️  Backend disabled — missing env vars: ${MISSING.join(', ')}`);
@@ -307,36 +305,6 @@ const sentByCbId = new Map();        // cbId -> { fuid, type, msgId, hid, amt, c
 const locallySentCbIds = new Set();   // in-process dedup
 const processedCbIds = new Map();     // tg cb.id -> ts (for retry dedup)
 
-// ─── Internal-secret middleware + tiny in-memory rate limiter ──────
-function requireInternalSecret(req, res, next) {
-  if (!IFRAME_API_SECRET) return next(); // fail-open only if not configured (local dev)
-  if (req.headers['x-internal-secret'] !== IFRAME_API_SECRET) {
-    return res.status(403).json({ ok: false, error: 'forbidden' });
-  }
-  next();
-}
-
-const _rateBuckets = new Map(); // ip -> { tokens, ts }
-function rateLimit({ capacity = 20, refillPerSec = 20/60 } = {}) {
-  return (req, res, next) => {
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
-    const now = Date.now();
-    let b = _rateBuckets.get(ip);
-    if (!b) { b = { tokens: capacity, ts: now }; _rateBuckets.set(ip, b); }
-    const elapsed = (now - b.ts) / 1000;
-    b.tokens = Math.min(capacity, b.tokens + elapsed * refillPerSec);
-    b.ts = now;
-    if (b.tokens < 1) return res.status(429).json({ ok: false, error: 'rate_limited' });
-    b.tokens -= 1;
-    if (_rateBuckets.size > 2000) {
-      const cutoff = now - 5 * 60_000;
-      for (const [k, v] of _rateBuckets) if (v.ts < cutoff) _rateBuckets.delete(k);
-    }
-    next();
-  };
-}
-
-
 function rememberCb(id) {
   processedCbIds.set(id, Date.now());
   if (processedCbIds.size > 500) {
@@ -536,7 +504,6 @@ async function handleCallback(cb) {
   const data = cb.data || '';
 
   let m;
-  if ((m = data.match(/^resend_(.+)$/)))           return handleResendCb(cb, m[1]);
   if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3]);
   // Trade/P2P callbacks (cbId starts with trade_) are handled by the iframe
   // via the buffered /api/tg/getUpdates feed — leave them alone here.
@@ -769,7 +736,6 @@ async function handleStats() {
 async function handleTrades() {
   const snap = await db.ref('users').once('value');
   const lines = ['📊 *ALL PENDING / ONGOING TRADES*\n'];
-  const resendBtns = []; // collect cbIds with missing msgId
   let count = 0;
   snap.forEach(child => {
     const u = child.val(); if (!u) return;
@@ -779,9 +745,7 @@ async function handleTrades() {
       for (const [cbId, r] of Object.entries(map)) {
         if (!r || typeof r !== 'object' || cbId === 'botLock') continue;
         const label = type === 'dep' ? '📥 DEP' : '📤 WIT';
-        const noMsg = !(r.botMsgId || r.msgId);
-        lines.push(`${label} | \`${u.uid || child.key}\` | *${r.amt} ${r.coin||'USDT'}* | cbId: \`${cbId}\`${noMsg ? ' ⚠️ no-notification' : ''}`);
-        if (noMsg) resendBtns.push({ text: `🔁 Resend ${label} ${u.uid || child.key}`.slice(0, 64), callback_data: `resend_${cbId}` });
+        lines.push(`${label} | \`${u.uid || child.key}\` | *${r.amt} ${r.coin||'USDT'}* | cbId: \`${cbId}\``);
         count++;
       }
     }
@@ -799,71 +763,11 @@ async function handleTrades() {
     if ((chunk + line + '\n').length > 4000) { await tgSend(chunk); chunk = ''; }
     chunk += line + '\n';
   }
-  if (chunk) {
-    const opts = resendBtns.length ? { reply_markup: { inline_keyboard: resendBtns.map(b => [b]) } } : {};
-    await tgSend(chunk, opts);
-  }
+  if (chunk) await tgSend(chunk);
 }
-
-// Resend a pending-request Telegram notification (used when the original
-// tgSendButtons failed and the user-side ended up with msgId=null).
-async function handleResendCb(cb, cbId) {
-  await tgAnswer(cb.id, '🔁 Resending…');
-  // Find which user/type owns this cbId — try in-memory index first.
-  let fuid = sentByCbId.get(cbId)?.fuid;
-  let type = sentByCbId.get(cbId)?.type;
-  if (!fuid) {
-    const snap = await db.ref('users').once('value');
-    snap.forEach(child => {
-      const reqs = child.val()?.pendingReqs || {};
-      for (const t of ['dep', 'wit']) {
-        if (reqs[t] && reqs[t][cbId]) { fuid = child.key; type = t; }
-      }
-    });
-  }
-  if (!fuid) { await tgSend(`❌ cbId \`${cbId}\` not found.`); return; }
-  const reqSnap = await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).once('value');
-  const req = reqSnap.val();
-  if (!req) { await tgSend(`❌ Request \`${cbId}\` no longer pending.`); return; }
-  // Clear msgId so maybeSendButtons will re-send.
-  await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).update({ botMsgId: null, msgId: null, _sending: null, _sendingTs: null });
-  locallySentCbIds.delete(cbId);
-  sentByCbId.delete(cbId);
-  await maybeSendButtons(fuid, type, { ...req, botMsgId: null, msgId: null }, cbId);
-  await tgSend(`✅ Notification resent for \`${cbId}\`.`);
-}
-
-
 
 async function handleCancel(targetId) {
   let found = false;
-
-  // Fast path: sentByCbId already maps cbId -> { fuid, type, ... } for every
-  // request we've forwarded buttons for. Avoids an O(n) full-users scan.
-  const idx = sentByCbId.get(targetId);
-  if (idx) {
-    const { fuid, type } = idx;
-    const reqSnap = await db.ref(`users/${fuid}/pendingReqs/${type}/${targetId}`).once('value');
-    const req = reqSnap.val();
-    if (req) {
-      const claimed = await claimPendingReq(fuid, type, targetId, 'cancel');
-      if (!claimed) { await tgSend(`⚠️ Trade \`${targetId}\` already resolved.`); return; }
-      const coin = (req.coin || 'USDT').toUpperCase();
-      if (type === 'wit' && req.amt) await mutateBalance(fuid, coin, +parseFloat(req.amt));
-      await updateHistoryStatus(fuid, req.hid, 'CANCELLED');
-      await db.ref(`users/${fuid}/pendingReqs/${type}/${targetId}`).remove();
-      if (req.botMsgId) {
-        await tgEdit(req.botMsgId, `🚫 *${type==='dep'?'DEPOSIT':'WITHDRAWAL'} CANCELLED BY ADMIN*\n\nAmount: *${req.amt} ${coin}*${type==='wit'?'\n🔴 Funds refunded':''}`).catch(()=>{});
-      }
-      sentByCbId.delete(targetId);
-      const userSnap = await db.ref(`users/${fuid}`).once('value');
-      const u = userSnap.val() || {};
-      await tgSend(`✅ *CANCELLED*\n\n👤 \`${u.uid || fuid}\`\nType: ${type.toUpperCase()}\nAmt: *${req.amt} ${coin}*`);
-      return;
-    }
-  }
-
-  // Fallback: cold-start / restart cases where the in-memory index is empty.
   const snap = await db.ref('users').once('value');
   const all = snap.val() || {};
   for (const [fuid, u] of Object.entries(all)) {
@@ -1185,7 +1089,7 @@ app.get('/api/tg/getUpdates', (req, res) => {
 });
 
 const TG_PROXY_METHODS = new Set(['sendMessage', 'editMessageText', 'answerCallbackQuery']);
-app.post('/api/tg/:method', requireInternalSecret, rateLimit({ capacity: 20, refillPerSec: 20/60 }), async (req, res) => {
+app.post('/api/tg/:method', async (req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
   const m = req.params.method;
   if (!TG_PROXY_METHODS.has(m)) return res.status(403).json({ ok: false, error: 'method_not_allowed' });
@@ -1559,7 +1463,7 @@ app.get('/api/mail-status', (_req, res) => {
   });
 });
 
-app.post('/api/test-mail', requireInternalSecret, async (req, res) => {
+app.post('/api/test-mail', async (req, res) => {
   try {
     if (!RESEND_API_KEY && !mailer) return res.status(503).json({ ok: false, error: 'mail not configured: add RESEND_API_KEY' });
     const to = String(req.body?.to_email || req.query?.to || SMTP_USER || '').trim();
@@ -1579,9 +1483,7 @@ app.post('/api/test-mail', requireInternalSecret, async (req, res) => {
   }
 });
 
-// DEPRECATED open mail endpoint — now gated by IFRAME_API_SECRET.
-// Prefer /api/notify-user (type + uid; server looks up real email) for new callers.
-app.post('/api/send-mail', requireInternalSecret, async (req, res) => {
+app.post('/api/send-mail', async (req, res) => {
   try {
     if (!RESEND_API_KEY && !mailer) return res.status(503).json({ ok: false, error: 'mail not configured' });
     const { to_email, to_name, subject, message, amount, status, uid } = req.body || {};
@@ -1602,41 +1504,6 @@ BIEXC — t.me/biexc10`
     res.json({ ok: true });
   } catch (e) {
     log('MAIL', `send error: ${e.message}`);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Narrower transactional-email endpoint: client sends only { type, uid }, server
-// resolves the user's real email from Firebase. Prevents the open-relay risk of
-// the legacy /api/send-mail which trusted to_email from the client.
-const NOTIFY_TEMPLATES = {
-  deposit_approved:    { subject: '✅ Deposit Approved',    message: 'Your deposit has been verified and credited to your wallet.' },
-  deposit_rejected:    { subject: '❌ Deposit Rejected',    message: 'Your deposit request was rejected by admin. Contact support if you believe this is an error.' },
-  withdrawal_approved: { subject: '✅ Withdrawal Approved', message: 'Your withdrawal has been processed and broadcast to the network.' },
-  withdrawal_rejected: { subject: '❌ Withdrawal Rejected', message: 'Your withdrawal was rejected and the funds have been refunded to your wallet.' },
-};
-app.post('/api/notify-user', requireInternalSecret, async (req, res) => {
-  try {
-    if (BACKEND_DISABLED) return res.status(503).json({ ok: false, error: 'backend_disabled' });
-    if (!RESEND_API_KEY && !mailer) return res.status(503).json({ ok: false, error: 'mail not configured' });
-    const { type, uid, amount, coin } = req.body || {};
-    const tpl = NOTIFY_TEMPLATES[type];
-    if (!tpl) return res.status(400).json({ ok: false, error: 'invalid type' });
-    if (!uid)  return res.status(400).json({ ok: false, error: 'uid required' });
-    // Resolve real email server-side — never trust client-supplied addresses.
-    const found = await findUserByUID(String(uid));
-    if (!found || !found.user?.email) return res.status(404).json({ ok: false, error: 'user_or_email_not_found' });
-    const to = found.user.email;
-    await sendMailAny({
-      to,
-      subject: tpl.subject,
-      html: mailHtml({ subject: tpl.subject, message: tpl.message, amount: amount || '', status: '', uid: String(uid), label: '', coin: coin || '' }),
-      text: `${tpl.subject}\n\n${tpl.message}\n\n${amount ? 'Amount: ' + amount + (coin ? ' ' + coin : '') : ''}\n\nBIEXC — t.me/biexc10`
-    });
-    log('MAIL', `notify ${type} → ${to} (UID ${uid})`);
-    res.json({ ok: true });
-  } catch (e) {
-    log('MAIL', `notify error: ${e.message}`);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
