@@ -1263,6 +1263,12 @@ RULES:
 - Do NOT mention "Bybit" or "Binance" — you are BIEXC Bot.`;
 
 const SUPPORT_FAQ_FALLBACK = [
+  [/^\s*(hi+|hy+|hey+|hello+|helo+|yo|hola|namaste|salam|assalam|good\s*(morning|afternoon|evening|night))[\s!.,]*$/i,
+   "Hi there! 👋 Welcome to BIEXC support. How can I help you today — deposits, withdrawals, P2P, spot/futures, KYC or account/security?"],
+  [/^\s*(thanks|thank\s*you|thx|ty|shukriya|dhanyavad)[\s!.,]*$/i,
+   "You're welcome! 🙌 Anything else I can help you with?"],
+  [/^\s*(ok|okay|k|hmm+|cool|nice|great|good)[\s!.,]*$/i,
+   "Got it 👍 Let me know if you need help with deposits, withdrawals, P2P, trading, KYC or your account."],
   [/(deposit|credit).*not|not.*credit|missing/i,
    "Deposits usually credit within minutes after the required on-chain confirmations.\n\n• Verify the TxID on the blockchain explorer.\n• Make sure the network you sent on matches the network selected in the app (TRC20 / ERC20 / BEP20 / TON).\n• Wait up to 60 minutes.\n\nKeep your UID + TxID ready so the issue can be checked faster if needed."],
   [/withdraw/i,
@@ -1279,7 +1285,7 @@ const SUPPORT_FAQ_FALLBACK = [
    "For account security: enable 2FA, never share your password/OTP, and only log in via the official BIEXC app/site. If you suspect unauthorized access, change your password immediately and keep your UID ready."],
   [/referral|invite|commission/i,
    "Share your referral link from Profile → Referrals. You earn a commission whenever your referees trade on BIEXC."],
-  [/(human|agent|live|representative|manager)/i,
+  [/(human|agent|live|chat|representative|manager|support|admin|insaan|aadmi)/i,
    "Sure! Tap 'Connect to Live Support' below and I'll connect you to a human agent."],
 ];
 
@@ -1346,7 +1352,10 @@ function faqFallback(userText){
 }
 
 function wantsLiveSupport(text){
-  return /\b(live\s*support|live\s*chat|human|agent|representative|manager|customer\s*support|support\s*agent|cs|complaint)\b|\b(insaan|aadmi|admin|operator|support se|agent se|baat kar|bat kar|call karo)\b/i.test(String(text||''));
+  const t = String(text||'').trim().toLowerCase();
+  if (!t) return false;
+  if (/^(live|chat|human|agent|admin|support|cs|operator|insaan|aadmi)[\s!.,?]*$/i.test(t)) return true;
+  return /\b(live\s*support|live\s*chat|live\s*agent|human|agent|representative|manager|customer\s*support|support\s*agent|talk\s*to\s*(support|agent|human)|connect.*(agent|support|human)|complaint)\b|\b(insaan|aadmi|admin|operator|support se|agent se|baat kar|bat kar|call karo)\b/i.test(t);
 }
 
 // ─── Support session store (Firebase) ───────────────────────────────
@@ -1410,20 +1419,20 @@ app.post('/api/support/ai', async (req, res) => {
 app.post('/api/support/escalate', async (req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
   try{
-    const { sessionId, user, transcript } = req.body || {};
+    const { sessionId, user } = req.body || {};
     if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
     const u = user || {};
     if(!u.uid && !u.email){
       return res.status(400).json({ ok:false, error:'user.uid or user.email required for escalation' });
     }
     await supEnsureSession(sessionId, u);
-    const head = `🆘 LIVE SUPPORT REQUEST\n` +
-      `• Name : ${u.name||'Guest'}\n` +
-      `• UID  : ${u.uid||u.userUID||'—'}\n` +
-      `• Email: ${u.email||'—'}\n` +
-      `• Sess : ${sessionId}\n\n` +
-      `Recent chat:\n${String(transcript||'').slice(-1800)}\n\n` +
-      `Tap Join Chat first. User will see waiting until an agent joins.`;
+    const head =
+      `🆘 LIVE SUPPORT REQUEST\n\n` +
+      `👤 Name  : ${u.name||'Guest'}\n` +
+      `🆔 UID   : ${u.uid||u.userUID||'—'}\n` +
+      `📧 Email : ${u.email||'—'}\n` +
+      `🕒 ${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST\n\n` +
+      `Tap 💬 Join Chat to connect. User is waiting…`;
     const r = await tgFetch('sendMessage', {
       chat_id: TG_CHAT, text: head,
       reply_markup: { inline_keyboard: [[
