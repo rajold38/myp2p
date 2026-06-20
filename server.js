@@ -1308,15 +1308,37 @@ async function geminiReply(historyArr, userText){
   const apiKey = GEMINI_API_KEY || (await getGeminiKey());
   if (!apiKey) { log('AI', '⚠️  GEMINI_API_KEY not found — using FAQ fallback'); return null; }
   try{
-    const contents = [];
+    // Build contents: drop sys/system, map bot->model, drop leading non-user,
+    // collapse consecutive same-role turns (Gemini rejects them).
+    const raw = [];
     for(const h of (historyArr||[])){
       if(!h || !h.text) continue;
-      contents.push({
-        role: h.role === 'user' ? 'user' : 'model',
-        parts: [{ text: String(h.text).slice(0, 1200) }]
-      });
+      const role = h.role;
+      if (role === 'sys' || role === 'system') continue;
+      const gRole = role === 'user' ? 'user' : 'model';
+      raw.push({ role: gRole, parts: [{ text: String(h.text).slice(0, 1200) }] });
     }
-    contents.push({ role:'user', parts:[{ text: String(userText).slice(0, 2000) }] });
+    // Drop leading model turns (Gemini requires first = user)
+    while (raw.length && raw[0].role !== 'user') raw.shift();
+    // Collapse consecutive same-role
+    const contents = [];
+    for (const c of raw){
+      const last = contents[contents.length-1];
+      if (last && last.role === c.role){
+        last.parts[0].text = (last.parts[0].text + '\n' + c.parts[0].text).slice(0, 2400);
+      } else {
+        contents.push(c);
+      }
+    }
+    // Always append current user turn
+    const userTurn = { role:'user', parts:[{ text: String(userText).slice(0, 2000) }] };
+    const tail = contents[contents.length-1];
+    if (tail && tail.role === 'user'){
+      tail.parts[0].text = (tail.parts[0].text + '\n' + userTurn.parts[0].text).slice(0, 2400);
+    } else {
+      contents.push(userTurn);
+    }
+
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const r = await fetch(url, {
       method:'POST',
@@ -1330,101 +1352,28 @@ async function geminiReply(historyArr, userText){
     });
     const d = await r.json();
     if(!r.ok){
-      const errMsg = d?.error?.message || JSON.stringify(d).slice(0,200);
-      if (r.status === 429)               log('AI', `⚠️  Gemini quota exceeded: ${errMsg}`);
+      const errMsg = d?.error?.message || JSON.stringify(d).slice(0,300);
+      if (r.status === 429)                    log('AI', `⚠️  Gemini quota exceeded: ${errMsg}`);
       else if (r.status===401||r.status===403) log('AI', `❌ Gemini auth failed: ${errMsg}`);
-      else                                 log('AI', `gemini http ${r.status}: ${errMsg}`);
+      else                                     log('AI', `gemini http ${r.status}: ${errMsg}`);
       return null;
     }
-    const txt = d?.candidates?.[0]?.content?.parts?.map(p=>p.text).join('').trim();
-    if (!txt) { log('AI', 'empty gemini response'); return null; }
+    const cand = d?.candidates?.[0];
+    if (cand?.finishReason === 'SAFETY')  { log('AI', 'blocked by safety'); return null; }
+    const txt = cand?.content?.parts?.map(p=>p.text).filter(Boolean).join('').trim();
+    if (!txt) { log('AI', 'empty gemini response: '+JSON.stringify(d).slice(0,200)); return null; }
     log('AI', `✅ gemini reply (${txt.length} chars)`);
     return txt;
   }catch(e){ log('AI', `❌ gemini err: ${e.message}`); return null; }
 }
 
-function faqFallback(userText){
-  if(wantsLiveSupport(userText)) return "Sure! Tap 'Connect to Live Support' below and I'll connect you to a human agent.";
-  for(const [re, ans] of SUPPORT_FAQ_FALLBACK){
-    if(re.test(userText)) return ans;
-  }
-  return "I'm here to help with deposits, withdrawals, P2P, spot/futures, KYC, security and account issues. Could you rephrase your question with your UID, order ID or TxID if you have one?";
-}
-
-function wantsLiveSupport(text){
-  const t = String(text||'').trim().toLowerCase();
-  if (!t) return false;
-  if (/^(live|chat|human|agent|admin|support|cs|operator|insaan|aadmi)[\s!.,?]*$/i.test(t)) return true;
-  return /\b(live\s*support|live\s*chat|live\s*agent|human|agent|representative|manager|customer\s*support|support\s*agent|talk\s*to\s*(support|agent|human)|connect.*(agent|support|human)|complaint)\b|\b(insaan|aadmi|admin|operator|support se|agent se|baat kar|bat kar|call karo)\b/i.test(t);
-}
-
-// ─── Support session store (Firebase) ───────────────────────────────
-// support/{sessionId} = { user:{uid,email,name}, status:'bot'|'live'|'closed',
-//                         tgMsgId:int, createdTs, updatedTs }
-// support/{sessionId}/msgs/{auto} = { role:'agent', text, ts }
-
-function supRef(sessionId, sub){
-  return db.ref(`support/${sessionId}${sub?'/'+sub:''}`);
-}
-
-async function supEnsureSession(sessionId, user){
-  if(!db) return;
-  const ref = supRef(sessionId);
-  const tx = await ref.transaction(cur => {
-    if (cur !== null) return; // already exists — abort
-    return {
-      user: user || {},
-      status: 'bot',
-      createdTs: Date.now(),
-      updatedTs: Date.now()
-    };
-  });
-  return tx.committed;
-}
-
-async function supFindByTgMsgId(msgId){
-  if(!db || !msgId) return null;
-  const snap = await db.ref('support').orderByChild('tgMsgId').equalTo(Number(msgId)).once('value');
-  if(!snap.exists()) return null;
-  const v = snap.val();
-  const sid = Object.keys(v)[0];
-  return { sid, ...v[sid] };
-}
-
-// ─── HTTP endpoints (public — no internal-secret) ────────────────────
-app.post('/api/support/session', async (req, res) => {
-  if (BACKEND_DISABLED) return res.json({ ok: true, degraded: true });
-  try{
-    const { sessionId, user } = req.body || {};
-    if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
-    await supEnsureSession(sessionId, user||{});
-    res.json({ ok:true });
-  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/api/support/ai', async (req, res) => {
-  try{
-    const { sessionId, text, history, user } = req.body || {};
-    if(!text) return res.status(400).json({ ok:false, error:'text required' });
-    if(sessionId && !BACKEND_DISABLED) await supEnsureSession(sessionId, user||{});
-    let reply = await geminiReply(history, text);
-    if(!reply) reply = faqFallback(text);
-    const escalate = wantsLiveSupport(text);
-    res.json({ ok:true, reply, escalate });
-  }catch(e){
-    res.status(500).json({ ok:false, error:e.message, reply: faqFallback(req.body?.text||'') });
-  }
-});
-
+// ── /api/support/escalate — always create session, save tgMsgId ─────
 app.post('/api/support/escalate', async (req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
   try{
     const { sessionId, user } = req.body || {};
     if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
     const u = user || {};
-    if(!u.uid && !u.email){
-      return res.status(400).json({ ok:false, error:'user.uid or user.email required for escalation' });
-    }
     await supEnsureSession(sessionId, u);
     const head =
       `🆘 LIVE SUPPORT REQUEST\n\n` +
@@ -1432,21 +1381,29 @@ app.post('/api/support/escalate', async (req, res) => {
       `🆔 UID   : ${u.uid||u.userUID||'—'}\n` +
       `📧 Email : ${u.email||'—'}\n` +
       `🕒 ${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST\n\n` +
-      `Tap 💬 Join Chat to connect. User is waiting…`;
+      `Reply to this message to chat with the user. /close to end.`;
     const r = await tgFetch('sendMessage', {
       chat_id: TG_CHAT, text: head,
       reply_markup: { inline_keyboard: [[
         { text: '💬 Join Chat', callback_data: `support_join_${sessionId}` },
-        { text: '🔚 Close', callback_data: `support_close_${sessionId}` }
+        { text: '🔚 Close',     callback_data: `support_close_${sessionId}` }
       ]] }
     });
-    if(!r.ok) return res.status(500).json({ ok:false, error:'tg send failed' });
+    if(!r || !r.ok) {
+      log('SUPPORT', `escalate tg send failed: ${JSON.stringify(r).slice(0,200)}`);
+      return res.status(500).json({ ok:false, error:'tg send failed' });
+    }
     const tgMsgId = r.result.message_id;
     await supRef(sessionId).update({ status:'waiting', tgMsgId, agentSeenTs:0, updatedTs: Date.now() });
+    log('SUPPORT', `escalated session=${sessionId.slice(0,10)} tgMsgId=${tgMsgId}`);
     res.json({ ok:true, tgMsgId });
-  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+  }catch(e){
+    log('SUPPORT', `escalate err: ${e.message}`);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
+// ── /api/support/user-msg — queue + relay (don't 400 on missing tgMsgId) ──
 app.post('/api/support/user-msg', rateLimit({ capacity: 10, refillPerSec: 2 }), async (req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
   try{
@@ -1454,19 +1411,25 @@ app.post('/api/support/user-msg', rateLimit({ capacity: 10, refillPerSec: 2 }), 
     if(!sessionId || !text) return res.status(400).json({ ok:false, error:'bad input' });
     const snap = await supRef(sessionId).once('value');
     const sess = snap.val();
-    if(!sess || !sess.tgMsgId) return res.status(400).json({ ok:false, error:'no live session' });
+    if(!sess) return res.status(404).json({ ok:false, error:'session_not_found' });
     const u = user || sess.user || {};
-    await tgFetch('sendMessage', {
-      chat_id: TG_CHAT,
-      reply_to_message_id: sess.tgMsgId,
-      text: `👤 *${u.name||'User'}* (\`${u.uid||'—'}\` · \`${sessionId.slice(0,10)}\`):\n${text}`,
-      parse_mode: undefined
-    });
+    // Persist the user msg (so admin sees full history if they scroll Firebase too)
+    await supRef(sessionId, 'msgs').push({ role:'user', text, ts: Date.now() }).catch(()=>{});
+    if (sess.tgMsgId){
+      await tgFetch('sendMessage', {
+        chat_id: TG_CHAT,
+        reply_to_message_id: sess.tgMsgId,
+        text: `👤 ${u.name||'User'} (${u.uid||'—'} · ${sessionId.slice(0,10)}):\n${text}`
+      });
+    } else {
+      log('SUPPORT', `user-msg before escalate, sid=${sessionId.slice(0,10)}`);
+    }
     await supRef(sessionId).update({ updatedTs: Date.now() });
     res.json({ ok:true });
-  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
+  }catch(e){ log('SUPPORT', `user-msg err: ${e.message}`); res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// ── /api/support/poll — robust to missing index, ts ties ────────────
 app.get('/api/support/poll', async (req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok:true, messages:[] });
   try{
@@ -1477,7 +1440,6 @@ app.get('/api/support/poll', async (req, res) => {
     const sess = snap.val();
     if(!sess) return res.json({ ok:true, messages:[], closed:true, reason:'session_not_found' });
 
-    // Auto-close stale sessions (30 min no updates)
     const now = Date.now();
     const staleMs = 30 * 60 * 1000;
     if (sess.updatedTs && (now - sess.updatedTs) > staleMs && sess.status !== 'closed'){
@@ -1485,9 +1447,21 @@ app.get('/api/support/poll', async (req, res) => {
       return res.json({ ok:true, messages:[], closed:true, reason:'timeout' });
     }
 
-    const msgsSnap = await supRef(sessionId, 'msgs').orderByChild('ts').startAfter(since).limitToFirst(100).once('value');
+    // Read all msgs and filter in-process — safest with/without index.
     const out = [];
-    msgsSnap.forEach(c => { const v=c.val(); if(v && v.text) out.push({ role:v.role || 'agent', text:v.text, ts:v.ts }); });
+    try{
+      const msgsSnap = await supRef(sessionId, 'msgs').once('value');
+      msgsSnap.forEach(c => {
+        const v = c.val();
+        if (!v || !v.text) return;
+        // Only return agent/system messages newer than `since` (skip user echoes)
+        if (v.role === 'user') return;
+        const ts = Number(v.ts || 0);
+        if (ts > since) out.push({ role: v.role || 'agent', text: v.text, ts });
+      });
+      out.sort((a,b)=> a.ts - b.ts);
+    }catch(e){ log('SUPPORT', `poll msgs err: ${e.message}`); }
+
     res.json({
       ok:true,
       messages: out,
@@ -1502,31 +1476,24 @@ app.get('/api/support/poll', async (req, res) => {
   }catch(e){ res.status(500).json({ ok:false, error:e.message, messages:[] }); }
 });
 
-app.post('/api/support/end', async (req, res) => {
-  try{
-    const { sessionId } = req.body || {};
-    if(sessionId && db) await supRef(sessionId).update({ status:'closed', updatedTs:Date.now() });
-    res.json({ ok:true });
-  }catch(e){ res.json({ ok:false, error:e.message }); }
-});
-
-// ─── Telegram → user relay (admin replies to the support card) ─────
+// ── handleSupportCallback — bump updatedTs so client poll picks status ──
 async function handleSupportCallback(cb, action, sessionId){
   try{
     await tgAnswer(cb.id, action === 'join' ? 'Joined' : 'Closed');
     const snap = await supRef(sessionId).once('value');
     const sess = snap.val();
-    if(!sess) return tgSend(`Support session not found: ${sessionId}`);
+    if(!sess) { await tgSend(`Support session not found: ${sessionId}`); return; }
     const ts = Date.now();
     if(action === 'join'){
-      await supRef(sessionId).update({ status:'joined', agentSeenTs:ts, updatedTs:ts });
+      await supRef(sessionId).update({ status:'joined', agentSeenTs:ts, agentJoinedTs:ts, updatedTs:ts });
       await supRef(sessionId, 'msgs').push({ role:'system', text:'✅ Agent joined the chat.', ts });
       return;
     }
-    await supRef(sessionId).update({ status:'closed', updatedTs:ts });
+    await supRef(sessionId).update({ status:'closed', updatedTs:ts, closedReason:'agent' });
     await supRef(sessionId, 'msgs').push({ role:'system', text:'Session closed by agent.', ts });
   }catch(e){ log('SUPPORT', `callback err: ${e.message}`); }
 }
+
 
 async function handleSupportAdminReply(msg){
   try{
