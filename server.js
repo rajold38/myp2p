@@ -273,33 +273,25 @@ async function saveLastUpdateId(id) {
 // ════════════════════════════════════════════════════════════════════
 // TELEGRAM HELPERS
 // ════════════════════════════════════════════════════════════════════
-async function tgFetch(endpoint, body = {}) {
+async function tgFetch(endpoint, body) {
   try {
-    const payload = { ...body };
-    if (payload.parse_mode && /V2$/i.test(String(payload.parse_mode))) {
-      if (payload.text) payload.text = sanitizeMd(payload.text);
-      if (payload.caption) payload.caption = sanitizeMd(payload.caption).slice(0, 1000);
-    } else {
-      if (payload.text) payload.text = String(payload.text).slice(0, 3800);
-      if (payload.caption) payload.caption = String(payload.caption).slice(0, 1000);
-    }
     const r = await fetch(`${TG_API}/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(body)
     });
     const data = await r.json();
     if (!data.ok) log('TG', `${endpoint} failed: ${data.description || JSON.stringify(data)}`);
     return data;
   } catch (e) { log('TG', `fetch err ${endpoint}: ${e.message}`); return { ok: false, error: e.message }; }
 }
-const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'MarkdownV2', ...extra });
-const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'MarkdownV2', ...extra });
+const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'Markdown', ...extra });
+const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
 const tgAnswer = (cbId, text) => tgFetch('answerCallbackQuery', { callback_query_id: cbId, text });
 
 async function tgSendButtons(text, cbId) {
   const r = await tgFetch('sendMessage', {
-    chat_id: TG_CHAT, text, parse_mode: 'MarkdownV2',
+    chat_id: TG_CHAT, text, parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [[
       { text: '✅ APPROVE', callback_data: `approve_${cbId}` },
       { text: '❌ REJECT',  callback_data: `reject_${cbId}` }
@@ -571,7 +563,6 @@ async function handleCallback(cb) {
     await tgSend(`✅ *ALL broadcasts cleared* — wiped from every user's notifications.`);
     return;
   }
-  if ((m = data.match(/^support_(join|close)_(.+)$/))) return handleSupportCallback(cb, m[1], m[2]);
   if ((m = data.match(/^kyc(approve|reject)_(.+)$/))) return handleKycDecision(cb, m[1], m[2]);
   await tgAnswer(cb.id, '?');
 
@@ -1061,12 +1052,6 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
-  // BIEXC support relay: if admin replied to a support card, forward to user.
-  if (msg.reply_to_message) {
-    const relayed = await handleSupportAdminReply(msg);
-    if (relayed) return;
-  }
-
   if (text === '/start' || text === '/help') return tgSend(HELP_TEXT);
   if (text === '/ping')   return tgSend(`🟢 Bot online — ${nowIST()} IST\nUptime: ${Math.floor((Date.now()-BOT_START_TIME)/60000)}m\nInstance: \`${INSTANCE_ID}\``);
   if (text === '/users')  return handleUsersList();
@@ -1216,311 +1201,6 @@ app.post('/api/tg/:method', requireInternalSecret, rateLimit({ capacity: 20, ref
     res.json(r);
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
-
-
-
-// ════════════════════════════════════════════════════════════════════
-// BIEXC SUPPORT CHAT  (AI bot + Live agent via Telegram relay)
-// ────────────────────────────────────────────────────────────────────
-// Flow:
-//   1. User opens in-app chat → talks to AI (Google Gemini, free tier).
-//   2. AI handles deposits / withdraw / P2P / spot / futures / KYC FAQs.
-//   3. User can escalate → a card is posted to TG_CHAT with a
-//      "Reply" button. Admin replies to that message in Telegram and
-//      the reply is relayed back to the user (polled at /api/support/poll).
-//
-//   Requires env var:  GEMINI_API_KEY  (get free key at aistudio.google.com)
-//   Falls back to canned answers if GEMINI_API_KEY is missing.
-// ════════════════════════════════════════════════════════════════════
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL   = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
-
-const BIEXC_SYSTEM_PROMPT = `You are "BIEXC Bot", the friendly 24/7 AI support assistant for the BIEXC crypto exchange app. Match the helpful tone of Binance/Bybit support bots.
-
-ABOUT BIEXC:
-- India-focused USDT/INR P2P exchange with instant UPI.
-- Features: No-KYC P2P trading, Spot trading (1000+ pairs), USDT-margined Futures up to 100×, Deposit/Withdraw (BTC, ETH, USDT on TRC20/ERC20/BEP20/TON), Convert, Referrals.
-- Verified merchants, escrow-protected P2P, 24×7 customer care.
-
-WHAT YOU CAN HELP WITH:
-1. DEPOSITS — crypto deposits usually credit within minutes after on-chain confirmations. Tell users to: (a) verify the TxID on the blockchain explorer, (b) confirm they used the correct network (TRC20 vs ERC20 vs BEP20), (c) wait up to 60 min, (d) keep UID + TxID ready if the user explicitly asks for support.
-2. WITHDRAWALS — show that withdrawals are reviewed by admin; funds are debited on request, returned to Spot Wallet if rejected. Standard min withdraw, network fees vary.
-3. P2P TRADING — explain USDT escrow, paying merchant via UPI, marking "Paid", merchant releases USDT. For disputes, ask for order ID and payment proof first.
-4. SPOT — market & limit orders, base/quote pairs, fees ~0.1%.
-5. FUTURES — USDT-margined perpetuals, leverage up to 100×, isolated/cross margin, liquidation = full margin loss, TP/SL supported.
-6. KYC / UID — UID is the user's BIEXC ID. KYC may be requested for high-volume P2P or withdrawal.
-7. SECURITY — 2FA via email OTP, never share passwords/OTP, beware of phishing telegrams.
-8. REFERRALS — share referral link/code; earn commission on referee trades.
-9. ACCOUNT — change password, login issues and ban appeals. Ask for the relevant details and try to help first.
-
-RULES:
-- Reply in the SAME language the user wrote in (English / Hindi / Hinglish).
-- Keep answers short (≤ 4 short paragraphs / bullets). Use plain text — no markdown headers, no asterisks for bold.
-- Never invent prices, balances or transaction IDs.
-- Do NOT proactively offer live support.
-- Only mention Live Support if the user explicitly asks for live support, live chat, human, agent, representative, manager, customer support, CS, admin, insaan/aadmi, or says they want to talk to support.
-- Do NOT mention "Bybit" or "Binance" — you are BIEXC Bot.`;
-
-const SUPPORT_FAQ_FALLBACK = [
-  [/^\s*(hi+|hy+|hey+|hello+|helo+|yo|hola|namaste|salam|assalam|good\s*(morning|afternoon|evening|night))[\s!.,]*$/i,
-   "Hi there! 👋 Welcome to BIEXC support. How can I help you today — deposits, withdrawals, P2P, spot/futures, KYC or account/security?"],
-  [/^\s*(thanks|thank\s*you|thx|ty|shukriya|dhanyavad)[\s!.,]*$/i,
-   "You're welcome! 🙌 Anything else I can help you with?"],
-  [/^\s*(ok|okay|k|hmm+|cool|nice|great|good)[\s!.,]*$/i,
-   "Got it 👍 Let me know if you need help with deposits, withdrawals, P2P, trading, KYC or your account."],
-  [/(deposit|credit).*not|not.*credit|missing/i,
-   "Deposits usually credit within minutes after the required on-chain confirmations.\n\n• Verify the TxID on the blockchain explorer.\n• Make sure the network you sent on matches the network selected in the app (TRC20 / ERC20 / BEP20 / TON).\n• Wait up to 60 minutes.\n\nKeep your UID + TxID ready so the issue can be checked faster if needed."],
-  [/withdraw/i,
-   "Withdrawals are reviewed by our admin team. Funds are debited from your Spot Wallet on request and instantly returned if the request is rejected. Status updates appear in your History.\n\nPlease keep your UID and withdrawal details ready."],
-  [/p2p|merchant|upi|escrow/i,
-   "On BIEXC P2P, USDT is locked in escrow. Pay the merchant via UPI, mark the order as 'Paid', and the merchant releases USDT to your Spot Wallet. Always confirm the merchant's UPI ID before paying.\n\nIf paid but not released, keep order ID and payment proof ready."],
-  [/(futures|perp|leverage|liquidation)/i,
-   "BIEXC offers USDT-margined perpetual futures with leverage up to 100×. You can set TP/SL on every position. If your margin runs out, the position is liquidated and you lose your margin."],
-  [/spot|market order|limit order|trade/i,
-   "On Spot you can place Market or Limit orders across 1000+ pairs with ~0.1% fee. Buy uses your USDT, Sell uses the base coin balance."],
-  [/kyc|verify|verification/i,
-   "KYC is optional for normal P2P but may be requested for high-volume trades or withdrawals. You can submit KYC from Profile → Verification."],
-  [/(2fa|password|login|hack|otp|security)/i,
-   "For account security: enable 2FA, never share your password/OTP, and only log in via the official BIEXC app/site. If you suspect unauthorized access, change your password immediately and keep your UID ready."],
-  [/referral|invite|commission/i,
-   "Share your referral link from Profile → Referrals. You earn a commission whenever your referees trade on BIEXC."],
-  [/(human|agent|live|chat|representative|manager|support|admin|insaan|aadmi)/i,
-   "Sure! Tap 'Connect to Live Support' below and I'll connect you to a human agent."],
-];
-
-function sanitizeMd(text){
-  return String(text || '').replace(/[`*_\[\]()~>#\-+=|{}.!]/g, '\\$&').slice(0, 3800);
-}
-
-async function getGeminiKey(){
-  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-  if (db) {
-    try {
-      const snap = await db.ref('config/geminiKey').once('value');
-      if (snap.val()) return snap.val();
-    } catch (e) {}
-  }
-  return null;
-}
-
-async function geminiReply(historyArr, userText){
-  const apiKey = GEMINI_API_KEY || (await getGeminiKey());
-  if (!apiKey) { log('AI', '⚠️  GEMINI_API_KEY not found — using FAQ fallback'); return null; }
-  try{
-    // Build contents: drop sys/system, map bot->model, drop leading non-user,
-    // collapse consecutive same-role turns (Gemini rejects them).
-    const raw = [];
-    for(const h of (historyArr||[])){
-      if(!h || !h.text) continue;
-      const role = h.role;
-      if (role === 'sys' || role === 'system') continue;
-      const gRole = role === 'user' ? 'user' : 'model';
-      raw.push({ role: gRole, parts: [{ text: String(h.text).slice(0, 1200) }] });
-    }
-    // Drop leading model turns (Gemini requires first = user)
-    while (raw.length && raw[0].role !== 'user') raw.shift();
-    // Collapse consecutive same-role
-    const contents = [];
-    for (const c of raw){
-      const last = contents[contents.length-1];
-      if (last && last.role === c.role){
-        last.parts[0].text = (last.parts[0].text + '\n' + c.parts[0].text).slice(0, 2400);
-      } else {
-        contents.push(c);
-      }
-    }
-    // Always append current user turn
-    const userTurn = { role:'user', parts:[{ text: String(userText).slice(0, 2000) }] };
-    const tail = contents[contents.length-1];
-    if (tail && tail.role === 'user'){
-      tail.parts[0].text = (tail.parts[0].text + '\n' + userTurn.parts[0].text).slice(0, 2400);
-    } else {
-      contents.push(userTurn);
-    }
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const r = await fetch(url, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        systemInstruction: { role:'user', parts:[{text: BIEXC_SYSTEM_PROMPT}] },
-        contents,
-        generationConfig: { temperature: 0.6, maxOutputTokens: 600, topP: 0.95, topK: 40 },
-        safetySettings: [{ category:'HARM_CATEGORY_HARASSMENT', threshold:'BLOCK_MEDIUM_AND_ABOVE' }]
-      })
-    });
-    const d = await r.json();
-    if(!r.ok){
-      const errMsg = d?.error?.message || JSON.stringify(d).slice(0,300);
-      if (r.status === 429)                    log('AI', `⚠️  Gemini quota exceeded: ${errMsg}`);
-      else if (r.status===401||r.status===403) log('AI', `❌ Gemini auth failed: ${errMsg}`);
-      else                                     log('AI', `gemini http ${r.status}: ${errMsg}`);
-      return null;
-    }
-    const cand = d?.candidates?.[0];
-    if (cand?.finishReason === 'SAFETY')  { log('AI', 'blocked by safety'); return null; }
-    const txt = cand?.content?.parts?.map(p=>p.text).filter(Boolean).join('').trim();
-    if (!txt) { log('AI', 'empty gemini response: '+JSON.stringify(d).slice(0,200)); return null; }
-    log('AI', `✅ gemini reply (${txt.length} chars)`);
-    return txt;
-  }catch(e){ log('AI', `❌ gemini err: ${e.message}`); return null; }
-}
-
-// ── /api/support/escalate — always create session, save tgMsgId ─────
-app.post('/api/support/escalate', async (req, res) => {
-  if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
-  try{
-    const { sessionId, user } = req.body || {};
-    if(!sessionId) return res.status(400).json({ ok:false, error:'sessionId required' });
-    const u = user || {};
-    await supEnsureSession(sessionId, u);
-    const head =
-      `🆘 LIVE SUPPORT REQUEST\n\n` +
-      `👤 Name  : ${u.name||'Guest'}\n` +
-      `🆔 UID   : ${u.uid||u.userUID||'—'}\n` +
-      `📧 Email : ${u.email||'—'}\n` +
-      `🕒 ${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST\n\n` +
-      `Reply to this message to chat with the user. /close to end.`;
-    const r = await tgFetch('sendMessage', {
-      chat_id: TG_CHAT, text: head,
-      reply_markup: { inline_keyboard: [[
-        { text: '💬 Join Chat', callback_data: `support_join_${sessionId}` },
-        { text: '🔚 Close',     callback_data: `support_close_${sessionId}` }
-      ]] }
-    });
-    if(!r || !r.ok) {
-      log('SUPPORT', `escalate tg send failed: ${JSON.stringify(r).slice(0,200)}`);
-      return res.status(500).json({ ok:false, error:'tg send failed' });
-    }
-    const tgMsgId = r.result.message_id;
-    await supRef(sessionId).update({ status:'waiting', tgMsgId, agentSeenTs:0, updatedTs: Date.now() });
-    log('SUPPORT', `escalated session=${sessionId.slice(0,10)} tgMsgId=${tgMsgId}`);
-    res.json({ ok:true, tgMsgId });
-  }catch(e){
-    log('SUPPORT', `escalate err: ${e.message}`);
-    res.status(500).json({ ok:false, error:e.message });
-  }
-});
-
-// ── /api/support/user-msg — queue + relay (don't 400 on missing tgMsgId) ──
-app.post('/api/support/user-msg', rateLimit({ capacity: 10, refillPerSec: 2 }), async (req, res) => {
-  if (BACKEND_DISABLED) return res.json({ ok:false, error:'backend_disabled' });
-  try{
-    const { sessionId, text, user } = req.body || {};
-    if(!sessionId || !text) return res.status(400).json({ ok:false, error:'bad input' });
-    const snap = await supRef(sessionId).once('value');
-    const sess = snap.val();
-    if(!sess) return res.status(404).json({ ok:false, error:'session_not_found' });
-    const u = user || sess.user || {};
-    // Persist the user msg (so admin sees full history if they scroll Firebase too)
-    await supRef(sessionId, 'msgs').push({ role:'user', text, ts: Date.now() }).catch(()=>{});
-    if (sess.tgMsgId){
-      await tgFetch('sendMessage', {
-        chat_id: TG_CHAT,
-        reply_to_message_id: sess.tgMsgId,
-        text: `👤 ${u.name||'User'} (${u.uid||'—'} · ${sessionId.slice(0,10)}):\n${text}`
-      });
-    } else {
-      log('SUPPORT', `user-msg before escalate, sid=${sessionId.slice(0,10)}`);
-    }
-    await supRef(sessionId).update({ updatedTs: Date.now() });
-    res.json({ ok:true });
-  }catch(e){ log('SUPPORT', `user-msg err: ${e.message}`); res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── /api/support/poll — robust to missing index, ts ties ────────────
-app.get('/api/support/poll', async (req, res) => {
-  if (BACKEND_DISABLED) return res.json({ ok:true, messages:[] });
-  try{
-    const sessionId = String(req.query.sessionId||'');
-    const since = Number(req.query.since||0);
-    if(!sessionId) return res.json({ ok:false, messages:[] });
-    const snap = await supRef(sessionId).once('value');
-    const sess = snap.val();
-    if(!sess) return res.json({ ok:true, messages:[], closed:true, reason:'session_not_found' });
-
-    const now = Date.now();
-    const staleMs = 30 * 60 * 1000;
-    if (sess.updatedTs && (now - sess.updatedTs) > staleMs && sess.status !== 'closed'){
-      await supRef(sessionId).update({ status:'closed', updatedTs:now, closedReason:'timeout' });
-      return res.json({ ok:true, messages:[], closed:true, reason:'timeout' });
-    }
-
-    // Read all msgs and filter in-process — safest with/without index.
-    const out = [];
-    try{
-      const msgsSnap = await supRef(sessionId, 'msgs').once('value');
-      msgsSnap.forEach(c => {
-        const v = c.val();
-        if (!v || !v.text) return;
-        // Only return agent/system messages newer than `since` (skip user echoes)
-        if (v.role === 'user') return;
-        const ts = Number(v.ts || 0);
-        if (ts > since) out.push({ role: v.role || 'agent', text: v.text, ts });
-      });
-      out.sort((a,b)=> a.ts - b.ts);
-    }catch(e){ log('SUPPORT', `poll msgs err: ${e.message}`); }
-
-    res.json({
-      ok:true,
-      messages: out,
-      status: sess.status || 'waiting',
-      joined: sess.status === 'joined',
-      agentSeenTs: sess.agentSeenTs || 0,
-      agentJoinedTs: sess.agentJoinedTs || 0,
-      createdTs: sess.createdTs,
-      closedReason: sess.closedReason || null,
-      closed: sess.status === 'closed'
-    });
-  }catch(e){ res.status(500).json({ ok:false, error:e.message, messages:[] }); }
-});
-
-// ── handleSupportCallback — bump updatedTs so client poll picks status ──
-async function handleSupportCallback(cb, action, sessionId){
-  try{
-    await tgAnswer(cb.id, action === 'join' ? 'Joined' : 'Closed');
-    const snap = await supRef(sessionId).once('value');
-    const sess = snap.val();
-    if(!sess) { await tgSend(`Support session not found: ${sessionId}`); return; }
-    const ts = Date.now();
-    if(action === 'join'){
-      await supRef(sessionId).update({ status:'joined', agentSeenTs:ts, agentJoinedTs:ts, updatedTs:ts });
-      await supRef(sessionId, 'msgs').push({ role:'system', text:'✅ Agent joined the chat.', ts });
-      return;
-    }
-    await supRef(sessionId).update({ status:'closed', updatedTs:ts, closedReason:'agent' });
-    await supRef(sessionId, 'msgs').push({ role:'system', text:'Session closed by agent.', ts });
-  }catch(e){ log('SUPPORT', `callback err: ${e.message}`); }
-}
-
-
-async function handleSupportAdminReply(msg){
-  try{
-    if(!msg || !msg.reply_to_message) return false;
-    const replyTo = msg.reply_to_message.message_id;
-    const sess = await supFindByTgMsgId(replyTo);
-    if(!sess) return false;
-    const text = (msg.text || msg.caption || '').trim();
-    if(!text) return false;
-    // /close command
-    if(/^\/close\b/i.test(text)){
-      await supRef(sess.sid).update({ status:'closed', updatedTs:Date.now() });
-      await supRef(sess.sid, 'msgs').push({ role:'agent', text:'Session closed by agent.', ts: Date.now() });
-      await tgSend(`✅ Closed support session \`${sess.sid}\``);
-      return true;
-    }
-    const ts = Date.now();
-    if(sess.status !== 'joined'){
-      await supRef(sess.sid).update({ status:'joined', agentSeenTs:ts, agentJoinedTs:ts, updatedTs:ts });
-      await supRef(sess.sid, 'msgs').push({ role:'system', text:'✅ Agent joined the chat.', ts });
-    }
-    await supRef(sess.sid, 'msgs').push({ role:'agent', text, ts: Date.now() });
-    await supRef(sess.sid).update({ updatedTs: Date.now(), agentSeenTs: Date.now() });
-    log('SUPPORT', `agent reply to ${sess.sid.slice(0,10)}`);
-    return true;
-  }catch(e){ log('SUPPORT', `relay err: ${e.message}`); return false; }
-}
 
 
 // ─── SPACEMAIL SMTP ─────────────────────────────────────────────────
@@ -1988,33 +1668,6 @@ if (RENDER_URL) {
   lastUpdateId = await loadLastUpdateId();
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
   await tgSend(`🟢 *Backend v4.0 ONLINE*\n\n⏰ ${nowIST()} IST\n🔑 Instance: \`${INSTANCE_ID}\`\n\nType /help for commands.`).catch(()=>{});
-
-// ════════════════════════════════════════════════════════════════════
-// CLEANUP — delete old (closed, > 7 days) support sessions every 24h
-// ════════════════════════════════════════════════════════════════════
-async function cleanupOldSessions(){
-  if (!db) return;
-  try{
-    const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
-    const snap = await db.ref('support').orderByChild('updatedTs').endAt(cutoff).once('value');
-    let deleted = 0;
-    const ops = [];
-    snap.forEach(child => {
-      const sess = child.val();
-      if (sess && sess.status === 'closed'){
-        ops.push(child.ref.remove());
-        deleted++;
-      }
-    });
-    await Promise.all(ops);
-    if (deleted > 0) log('CLEANUP', `🧹 deleted ${deleted} old support sessions`);
-  }catch(e){ log('CLEANUP', `err: ${e.message}`); }
-}
-if (!BACKEND_DISABLED) {
-  setInterval(() => cleanupOldSessions().catch(()=>{}), 24 * 60 * 60 * 1000);
-  log('INIT', '🧹 Support session cleanup scheduled (24h)');
-}
-
   pollLoop().catch(e => { log('FATAL', e.message); process.exit(1); });
 })();
 
