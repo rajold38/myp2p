@@ -508,6 +508,7 @@ async function handleCallback(cb) {
   // Trade/P2P callbacks (cbId starts with trade_) are handled by the iframe
   // via the buffered /api/tg/getUpdates feed — leave them alone here.
   if (/^(approve|reject)_trade_/.test(data)) return; // no tg-answer, iframe will
+  if (/^(join|ignore)_support_/.test(data)) return; // handled by iframe support overlay
   if ((m = data.match(/^userdetail_(.+)$/)))       return sendUserDetailCard(cb, m[1]);
   if ((m = data.match(/^(ban|unban)_(.+)$/)))      return handleBanCb(cb, m[1], m[2]);
   if ((m = data.match(/^history_(.+)$/)))          { await tgAnswer(cb.id, 'Loading…'); return sendUserHistory(m[1], 15); }
