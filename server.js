@@ -1091,9 +1091,13 @@ app.get('/api/tg/getUpdates', (req, res) => {
 });
 
 const TG_PROXY_METHODS = new Set(['sendMessage', 'editMessageText', 'answerCallbackQuery']);
-app.post('/api/tg/:method', async (req, res) => {
+app.post('/api/tg/:method', async (req, res, next) => {
   if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
   const m = req.params.method;
+  // Let the dedicated multipart photo route below handle image uploads.
+  // Without this, /api/tg/:method catches /api/tg/sendPhotoBase64 first
+  // and returns method_not_allowed before Telegram receives the photo.
+  if (m === 'sendPhotoBase64') return next();
   if (!TG_PROXY_METHODS.has(m)) return res.status(403).json({ ok: false, error: 'method_not_allowed' });
   const body = { ...(req.body || {}) };
   // Force chat_id to the configured admin chat — never trust the client.
