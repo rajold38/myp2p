@@ -1107,6 +1107,63 @@ app.post('/api/tg/:method', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ─── P2P CHAT PHOTO SUPPORT ─────────────────────────────────────────
+// Two endpoints added for photo-in-chat feature. Bot token stays server-side.
+//
+// 1) GET  /api/tg/fetchFile?file_id=...
+//    Called by the frontend when admin replies with a PHOTO in Telegram.
+//    Uses Telegram getFile → downloads the file via the bot file URL →
+//    returns { ok, base64:"data:image/...;base64,..." } so frontend can
+//    store it in Firebase and render as an image chat bubble.
+//
+// 2) POST /api/tg/sendPhotoBase64  { base64, caption?, reply_to_message_id? }
+//    Called by the frontend when USER attaches a photo in the P2P chat.
+//    Decodes base64 → multipart POST to Telegram sendPhoto so the admin
+//    sees a real image (with reply-to threading kept intact). chat_id is
+//    always forced to TG_CHAT — client cannot spoof it.
+app.get('/api/tg/fetchFile', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+  const fileId = String(req.query.file_id || '');
+  if (!fileId) return res.status(400).json({ ok: false, error: 'file_id required' });
+  try {
+    const gf = await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(fileId)}`);
+    const gfData = await gf.json();
+    if (!gfData.ok) return res.json(gfData);
+    const filePath = gfData.result.file_path;
+    const fileUrl  = `https://api.telegram.org/file/bot${TG_TOKEN}/${filePath}`;
+    const dl = await fetch(fileUrl);
+    if (!dl.ok) return res.status(502).json({ ok: false, error: 'file_download_failed' });
+    const buf  = Buffer.from(await dl.arrayBuffer());
+    const ext  = (filePath.split('.').pop() || 'jpg').toLowerCase();
+    const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+    if (buf.length > 1024 * 1024) log('P2P', `fetchFile large photo ${(buf.length/1024).toFixed(0)}KB`);
+    res.json({ ok: true, base64: `data:${mime};base64,${buf.toString('base64')}` });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.post('/api/tg/sendPhotoBase64', async (req, res) => {
+  if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+  const { base64, caption, reply_to_message_id } = req.body || {};
+  if (!base64) return res.status(400).json({ ok: false, error: 'base64 required' });
+  try {
+    const m    = /^data:(image\/[a-zA-Z+.-]+);base64,(.+)$/.exec(String(base64));
+    const mime = m ? m[1] : 'image/jpeg';
+    const b64  = m ? m[2] : String(base64);
+    const buf  = Buffer.from(b64, 'base64');
+    if (buf.length > 8 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'image_too_large' });
+    const form = new FormData();
+    form.append('chat_id', String(TG_CHAT));
+    if (caption)              form.append('caption', String(caption).slice(0, 1024));
+    if (reply_to_message_id)  form.append('reply_to_message_id', String(reply_to_message_id));
+    form.append('photo', new Blob([buf], { type: mime }), 'photo.jpg');
+    const r = await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: form });
+    const data = await r.json();
+    if (data.ok) log('P2P', `proxied user photo msgId=${data.result?.message_id || '—'} bytes=${buf.length}`);
+    else         log('P2P', `sendPhoto failed: ${JSON.stringify(data).slice(0,180)}`);
+    res.json(data);
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 
 // ─── SPACEMAIL SMTP ─────────────────────────────────────────────────
 const SMTP_HOST = process.env.SMTP_HOST || 'mail.spacemail.com';
