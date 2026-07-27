@@ -23,7 +23,8 @@
 
 import express from 'express';
 import admin from 'firebase-admin';
-import fetch from 'node-fetch';
+import fetch, { FormData } from 'node-fetch';
+import { Blob } from 'buffer';
 import nodemailer from 'nodemailer';
 import fs from 'fs';
 import path from 'path';
@@ -1045,7 +1046,7 @@ function makeProxyUpdate(kind, result) {
 // EXPRESS — serves frontend + health check + self-ping
 // ════════════════════════════════════════════════════════════════════
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 // CORS — allow the Vercel-hosted frontend (or any origin) to reach the proxy
 app.use((req, res, next) => {
