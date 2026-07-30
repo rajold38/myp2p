@@ -12,9 +12,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
     "express": "^5.2.1",
     "firebase-admin": "^13.10.0",
     "node-fetch": "^3.3.2",
-    "nodemailer": "^6.9.16"
+    "nodemailer": "^6.9.16",
+    "qrcode": "^1.5.4"
   }
 }
