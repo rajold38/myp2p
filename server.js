@@ -1587,7 +1587,7 @@ BIEXC — t.me/biexc10`
 
 const WA_ADMIN_KEY = process.env.WA_ADMIN_KEY || 'biexc-admin';
 const OTP_SALT     = process.env.OTP_SALT || (FIREBASE_SA_JSON ? FIREBASE_SA_JSON.slice(0, 32) : 'biexc-otp-salt');
-const WA_AUTH_DIR  = path.join(__dirname, 'wa_auth');
+const WA_AUTH_DIR  = process.env.WA_AUTH_DIR || path.join(__dirname, 'wa_auth');
 const OTP_TTL_MS   = 5 * 60 * 1000;   // code valid 5 minutes
 const OTP_RESEND_MS = 60 * 1000;      // 60s between sends to same number
 const OTP_MAX_PER_HOUR = 5;           // per phone number
@@ -1683,26 +1683,48 @@ app.get('/api/wa/status', (req, res) => {
   res.json({ ok: true, status: WA.status, hasQr: !!WA.qr, me: WA.sock?.user?.id || null, lastErr: WA.lastErr });
 });
 
+// ─── QR as PNG (server-rendered, no CDN needed) ─────────────────────
+app.get('/api/wa/qr.png', async (req, res) => {
+  if (req.query.key !== WA_ADMIN_KEY) return res.status(403).send('forbidden');
+  if (WA.status === 'idle' || WA.status === 'error') await waConnect();
+  for (let i = 0; i < 30 && !WA.qr && WA.status !== 'open'; i++)
+    await new Promise(r => setTimeout(r, 400));
+  if (!WA.qr) return res.status(404).send('no_qr');
+  try {
+    const QRCode = (await import('qrcode')).default;
+    const buf = await QRCode.toBuffer(WA.qr, { width: 300, margin: 1 });
+    res.set('Cache-Control', 'no-store').type('png').send(buf);
+  } catch (e) {
+    log('WA', `qr render failed: ${e.message}`);
+    res.status(500).send('qr_render_failed');
+  }
+});
+
 app.get('/api/wa/qr', async (req, res) => {
   if (req.query.key !== WA_ADMIN_KEY) return res.status(403).send('forbidden');
   if (WA.status === 'idle' || WA.status === 'error') await waConnect();
   // give Baileys a moment to emit the first QR
-  for (let i = 0; i < 25 && !WA.qr && WA.status !== 'open'; i++) await new Promise(r => setTimeout(r, 400));
-  const payload = JSON.stringify({ status: WA.status, qr: WA.qr });
+  for (let i = 0; i < 30 && !WA.qr && WA.status !== 'open'; i++)
+    await new Promise(r => setTimeout(r, 400));
+
+  const k = encodeURIComponent(WA_ADMIN_KEY);
+  const body = WA.status === 'open'
+    ? `<p style="color:#0ECB81">✅ Already linked as ${WA.sock?.user?.id || ''}</p>`
+    : WA.qr
+      ? `<div style="background:#fff;display:inline-block;padding:12px;border-radius:12px">
+           <img src="/api/wa/qr.png?key=${k}&t=${Date.now()}" width="300" height="300" alt="WhatsApp QR">
+         </div>
+         <p style="color:#848E9C">status: ${WA.status}</p>`
+      : `<p style="color:#848E9C">status: ${WA.status} — waiting for QR…${WA.lastErr ? ' · ' + WA.lastErr : ''}</p>`;
+
   res.type('html').send(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>BIEXC · Link WhatsApp</title>
+<meta http-equiv="refresh" content="${WA.status === 'open' ? 30 : WA.qr ? 20 : 3}">
 <body style="background:#181A20;color:#EAECEF;font:15px -apple-system,Arial;text-align:center;padding:28px">
 <h2 style="color:#FCD535">Link WhatsApp</h2>
-<div id=box style="background:#fff;display:inline-block;padding:12px;border-radius:12px;min-height:264px;min-width:264px"></div>
-<p id=st style="color:#848E9C"></p>
-<p style="color:#848E9C;max-width:420px;margin:0 auto">WhatsApp → Settings → <b>Linked devices</b> → <b>Link a device</b> → scan this QR. Page auto-refreshes.</p>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
-<script>
-var d = ${payload};
-if (d.status === 'open') { document.getElementById('st').textContent = '✅ Already linked'; document.getElementById('box').style.display='none'; }
-else if (d.qr) { QRCode.toCanvas(d.qr, { width: 256 }, function(e, c){ if(!e) document.getElementById('box').appendChild(c); }); document.getElementById('st').textContent = 'status: ' + d.status; setTimeout(function(){location.reload();}, 20000); }
-else { document.getElementById('st').textContent = 'status: ' + d.status + ' — waiting for QR…'; setTimeout(function(){location.reload();}, 3000); }
-</script></body>`);
+${body}
+<p style="color:#848E9C;max-width:420px;margin:12px auto">WhatsApp → Settings → <b>Linked devices</b> → <b>Link a device</b> → scan this QR. Page auto-refreshes.</p>
+</body>`);
 });
 
 app.post('/api/wa/logout', async (req, res) => {
