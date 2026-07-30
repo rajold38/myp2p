@@ -26,6 +26,7 @@ import admin from 'firebase-admin';
 import fetch, { FormData } from 'node-fetch';
 import { Blob } from 'buffer';
 import nodemailer from 'nodemailer';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1566,6 +1567,244 @@ BIEXC — t.me/biexc10`
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// WHATSAPP OTP LOGIN — 100% free, unlimited, self-hosted
+//
+// How it works:
+//   • Baileys links YOUR OWN WhatsApp number to this server (QR scan once).
+//   • /api/otp/send   → sends a 6-digit code to the user on WhatsApp
+//   • /api/otp/verify → checks the code and returns a Firebase custom token
+//                       (frontend calls signInWithCustomToken → logged in)
+//   No Firebase Blaze plan, no SMS gateway, no per-message cost.
+//
+// One-time setup on the server:
+//   1) npm i @whiskeysockets/baileys
+//   2) Open  https://<your-server>/api/wa/qr?key=<WA_ADMIN_KEY>
+//   3) WhatsApp → Linked devices → Link a device → scan the QR
+//   Session is saved in ./wa_auth so it stays linked across restarts.
+// ════════════════════════════════════════════════════════════════════
+
+const WA_ADMIN_KEY = process.env.WA_ADMIN_KEY || 'biexc-admin';
+const OTP_SALT     = process.env.OTP_SALT || (FIREBASE_SA_JSON ? FIREBASE_SA_JSON.slice(0, 32) : 'biexc-otp-salt');
+const WA_AUTH_DIR  = path.join(__dirname, 'wa_auth');
+const OTP_TTL_MS   = 5 * 60 * 1000;   // code valid 5 minutes
+const OTP_RESEND_MS = 60 * 1000;      // 60s between sends to same number
+const OTP_MAX_PER_HOUR = 5;           // per phone number
+const OTP_MAX_TRIES = 5;              // wrong-code attempts per code
+
+const WA = { sock: null, status: 'idle', qr: '', lastErr: '', connecting: false };
+const OTPS = new Map();   // phone -> { hash, exp, tries, lastSent, hourCount, hourStart }
+
+const silentLogger = (() => {
+  const noop = () => {};
+  const l = { level: 'silent', trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop };
+  l.child = () => l;
+  return l;
+})();
+
+function normalizeMsisdn(raw, defaultCc = '91') {
+  let s = String(raw || '').replace(/[^\d+]/g, '');
+  if (s.startsWith('+')) s = s.slice(1);
+  s = s.replace(/^0+/, '');
+  if (s.length <= 10) s = defaultCc + s;         // bare local number → default country
+  return s;
+}
+
+async function waConnect() {
+  if (WA.connecting) return WA;
+  WA.connecting = true;
+  try {
+    const baileys = await import('@whiskeysockets/baileys');
+    const makeWASocket = baileys.default || baileys.makeWASocket;
+    const { useMultiFileAuthState, DisconnectReason } = baileys;
+    if (!fs.existsSync(WA_AUTH_DIR)) fs.mkdirSync(WA_AUTH_DIR, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);
+
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: silentLogger,
+      browser: ['BIEXC', 'Chrome', '1.0.0'],
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+    });
+    WA.sock = sock;
+    WA.status = 'connecting';
+
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', (u) => {
+      if (u.qr) { WA.qr = u.qr; WA.status = 'qr'; log('WA', '📲 QR ready — open /api/wa/qr to scan'); }
+      if (u.connection === 'open') {
+        WA.qr = ''; WA.status = 'open'; WA.lastErr = '';
+        log('WA', `✅ WhatsApp linked as ${sock.user?.id || '?'}`);
+      }
+      if (u.connection === 'close') {
+        const code = u.lastDisconnect?.error?.output?.statusCode;
+        WA.status = 'closed';
+        WA.lastErr = `closed (${code || 'unknown'})`;
+        log('WA', `⚠️ connection closed (${code || 'unknown'})`);
+        const loggedOut = DisconnectReason && code === DisconnectReason.loggedOut;
+        if (loggedOut) {
+          try { fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+          log('WA', 'session logged out — re-scan the QR');
+        }
+        WA.connecting = false;
+        setTimeout(() => { waConnect().catch(() => {}); }, loggedOut ? 3000 : 5000);
+      }
+    });
+  } catch (e) {
+    WA.status = 'error';
+    WA.lastErr = e.message;
+    log('WA', `❌ init failed: ${e.message}`);
+  } finally {
+    if (WA.status !== 'closed') WA.connecting = false;
+  }
+  return WA;
+}
+
+async function waSendText(msisdn, text) {
+  if (!WA.sock || WA.status !== 'open') throw new Error('whatsapp_not_linked');
+  const jid = `${msisdn}@s.whatsapp.net`;
+  try {
+    const chk = await WA.sock.onWhatsApp(jid);
+    if (Array.isArray(chk) && chk.length && chk[0].exists === false) throw new Error('not_on_whatsapp');
+  } catch (e) { if (e.message === 'not_on_whatsapp') throw e; }
+  await WA.sock.sendMessage(jid, { text });
+}
+
+const hashCode = (phone, code) =>
+  crypto.createHash('sha256').update(`${phone}:${code}:${OTP_SALT}`).digest('hex');
+const newCode = () => String(crypto.randomInt(100000, 1000000));
+
+// ─── WhatsApp link status / QR (admin only) ─────────────────────────
+app.get('/api/wa/status', (req, res) => {
+  if (req.query.key !== WA_ADMIN_KEY) return res.status(403).json({ ok: false, error: 'forbidden' });
+  res.json({ ok: true, status: WA.status, hasQr: !!WA.qr, me: WA.sock?.user?.id || null, lastErr: WA.lastErr });
+});
+
+app.get('/api/wa/qr', async (req, res) => {
+  if (req.query.key !== WA_ADMIN_KEY) return res.status(403).send('forbidden');
+  if (WA.status === 'idle' || WA.status === 'error') await waConnect();
+  // give Baileys a moment to emit the first QR
+  for (let i = 0; i < 25 && !WA.qr && WA.status !== 'open'; i++) await new Promise(r => setTimeout(r, 400));
+  const payload = JSON.stringify({ status: WA.status, qr: WA.qr });
+  res.type('html').send(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>BIEXC · Link WhatsApp</title>
+<body style="background:#181A20;color:#EAECEF;font:15px -apple-system,Arial;text-align:center;padding:28px">
+<h2 style="color:#FCD535">Link WhatsApp</h2>
+<div id=box style="background:#fff;display:inline-block;padding:12px;border-radius:12px;min-height:264px;min-width:264px"></div>
+<p id=st style="color:#848E9C"></p>
+<p style="color:#848E9C;max-width:420px;margin:0 auto">WhatsApp → Settings → <b>Linked devices</b> → <b>Link a device</b> → scan this QR. Page auto-refreshes.</p>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script>
+var d = ${payload};
+if (d.status === 'open') { document.getElementById('st').textContent = '✅ Already linked'; document.getElementById('box').style.display='none'; }
+else if (d.qr) { QRCode.toCanvas(d.qr, { width: 256 }, function(e, c){ if(!e) document.getElementById('box').appendChild(c); }); document.getElementById('st').textContent = 'status: ' + d.status; setTimeout(function(){location.reload();}, 20000); }
+else { document.getElementById('st').textContent = 'status: ' + d.status + ' — waiting for QR…'; setTimeout(function(){location.reload();}, 3000); }
+</script></body>`);
+});
+
+app.post('/api/wa/logout', async (req, res) => {
+  if (req.query.key !== WA_ADMIN_KEY && req.body?.key !== WA_ADMIN_KEY)
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  try { await WA.sock?.logout(); } catch (_) {}
+  try { fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+  WA.sock = null; WA.status = 'idle'; WA.qr = ''; WA.connecting = false;
+  res.json({ ok: true });
+});
+
+// ─── OTP: send ──────────────────────────────────────────────────────
+app.post('/api/otp/send', async (req, res) => {
+  try {
+    const phone = normalizeMsisdn(req.body?.phone);
+    if (phone.length < 10 || phone.length > 15) return res.status(400).json({ ok: false, error: 'bad_phone' });
+
+    const now = Date.now();
+    const rec = OTPS.get(phone) || { hourStart: now, hourCount: 0, lastSent: 0 };
+    if (now - rec.hourStart > 3600_000) { rec.hourStart = now; rec.hourCount = 0; }
+    if (rec.hourCount >= OTP_MAX_PER_HOUR) return res.status(429).json({ ok: false, error: 'rate_limited' });
+    if (now - rec.lastSent < OTP_RESEND_MS)
+      return res.status(429).json({ ok: false, error: 'too_soon', waitSec: Math.ceil((OTP_RESEND_MS - (now - rec.lastSent)) / 1000) });
+
+    if (WA.status !== 'open') { waConnect().catch(() => {}); return res.status(503).json({ ok: false, error: 'whatsapp_not_linked' }); }
+
+    const code = newCode();
+    await waSendText(phone, `*BIEXC* login code: *${code}*\n\nValid for 5 minutes. Never share this code with anyone.`);
+
+    rec.hash = hashCode(phone, code);
+    rec.exp = now + OTP_TTL_MS;
+    rec.tries = 0;
+    rec.lastSent = now;
+    rec.hourCount += 1;
+    OTPS.set(phone, rec);
+    log('OTP', `sent → +${phone}`);
+    res.json({ ok: true, phone: '+' + phone, ttlSec: OTP_TTL_MS / 1000 });
+  } catch (e) {
+    const known = ['whatsapp_not_linked', 'not_on_whatsapp'];
+    log('OTP', `send error: ${e.message}`);
+    res.status(known.includes(e.message) ? 400 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── OTP: verify → Firebase custom token ────────────────────────────
+app.post('/api/otp/verify', async (req, res) => {
+  try {
+    if (BACKEND_DISABLED) return res.status(503).json({ ok: false, error: 'backend_disabled' });
+    const phone = normalizeMsisdn(req.body?.phone);
+    const code  = String(req.body?.code || '').replace(/\D/g, '');
+    const name  = String(req.body?.name || '').trim().slice(0, 40);
+    const rec   = OTPS.get(phone);
+    if (!rec || !rec.hash) return res.status(400).json({ ok: false, error: 'no_code' });
+    if (Date.now() > rec.exp) { OTPS.delete(phone); return res.status(400).json({ ok: false, error: 'expired' }); }
+    if (rec.tries >= OTP_MAX_TRIES) { OTPS.delete(phone); return res.status(429).json({ ok: false, error: 'too_many_tries' }); }
+    rec.tries += 1;
+    if (code.length !== 6 || hashCode(phone, code) !== rec.hash) {
+      OTPS.set(phone, rec);
+      return res.status(400).json({ ok: false, error: 'invalid_code', left: OTP_MAX_TRIES - rec.tries });
+    }
+    OTPS.delete(phone);
+
+    const uid = 'ph_' + phone;
+    const auth = admin.auth();
+    let user = null;
+    try { user = await auth.getUser(uid); }
+    catch (_) {
+      user = await auth.createUser({
+        uid,
+        phoneNumber: '+' + phone,
+        displayName: name || ('User' + phone.slice(-4)),
+      }).catch(async (e) => {
+        // phoneNumber may already belong to another uid — fall back without it
+        if (String(e.code || '').includes('phone-number-already-exists')) {
+          const existing = await auth.getUserByPhoneNumber('+' + phone);
+          return existing;
+        }
+        throw e;
+      });
+      log('OTP', `new user ${user.uid} (+${phone})`);
+    }
+
+    try {
+      await db.ref(`users/${user.uid}`).update({
+        phone: '+' + phone,
+        loginMethod: 'whatsapp',
+        ...(name ? { name } : {}),
+        lastLoginAt: admin.database.ServerValue.TIMESTAMP,
+      });
+    } catch (_) {}
+
+    const token = await auth.createCustomToken(user.uid, { phone: '+' + phone, via: 'wa-otp' });
+    res.json({ ok: true, token, uid: user.uid, phone: '+' + phone });
+  } catch (e) {
+    log('OTP', `verify error: ${e.message}`);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Auto-restore an existing WhatsApp session on boot.
+if (fs.existsSync(WA_AUTH_DIR)) waConnect().catch(() => {});
+
 
 app.get('/*splat', (_req, res) => {
   if (fs.existsSync(INDEX_FILE)) return res.sendFile(INDEX_FILE);
