@@ -1611,8 +1611,24 @@ function normalizeMsisdn(raw, defaultCc = '91') {
   return s;
 }
 
+let waRetryTimer = null;
+
+// Wait until WhatsApp is actually connected (or timeout). Used by /api/otp/send
+// so a cold start / reconnect does not instantly fail the user's login.
+function waWaitOpen(ms = 20000) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (WA.status === 'open') return resolve(true);
+      if (Date.now() - t0 >= ms) return resolve(false);
+      setTimeout(tick, 400);
+    };
+    tick();
+  });
+}
+
 async function waConnect() {
-  if (WA.connecting) return WA;
+  if (WA.connecting || WA.status === 'open') return WA;
   WA.connecting = true;
   try {
     const baileys = await import('@whiskeysockets/baileys');
@@ -1621,6 +1637,15 @@ async function waConnect() {
     if (!fs.existsSync(WA_AUTH_DIR)) fs.mkdirSync(WA_AUTH_DIR, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);
 
+    // Kill any previous socket so we never run two sockets on one session
+    // (that makes WhatsApp drop the link with a 440 "conflict" loop).
+    if (WA.sock) {
+      try { WA.sock.ev.removeAllListeners('connection.update'); } catch (_) {}
+      try { WA.sock.ev.removeAllListeners('creds.update'); } catch (_) {}
+      try { WA.sock.end(new Error('replaced')); } catch (_) {}
+      WA.sock = null;
+    }
+
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
@@ -1628,40 +1653,57 @@ async function waConnect() {
       browser: ['BIEXC', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      keepAliveIntervalMs: 20000,
+      connectTimeoutMs: 60000,
+      retryRequestDelayMs: 500,
     });
     WA.sock = sock;
     WA.status = 'connecting';
 
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', (u) => {
+      if (sock !== WA.sock) return;                 // ignore stale sockets
       if (u.qr) { WA.qr = u.qr; WA.status = 'qr'; log('WA', '📲 QR ready — open /api/wa/qr to scan'); }
       if (u.connection === 'open') {
-        WA.qr = ''; WA.status = 'open'; WA.lastErr = '';
+        WA.qr = ''; WA.status = 'open'; WA.lastErr = ''; WA.connecting = false;
         log('WA', `✅ WhatsApp linked as ${sock.user?.id || '?'}`);
       }
       if (u.connection === 'close') {
         const code = u.lastDisconnect?.error?.output?.statusCode;
         WA.status = 'closed';
         WA.lastErr = `closed (${code || 'unknown'})`;
+        WA.connecting = false;                       // ALWAYS release the lock
         log('WA', `⚠️ connection closed (${code || 'unknown'})`);
         const loggedOut = DisconnectReason && code === DisconnectReason.loggedOut;
         if (loggedOut) {
           try { fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+          WA.sock = null;
           log('WA', 'session logged out — re-scan the QR');
         }
-        WA.connecting = false;
-        setTimeout(() => { waConnect().catch(() => {}); }, loggedOut ? 3000 : 5000);
+        // single scheduled retry (no stacking timers)
+        if (waRetryTimer) clearTimeout(waRetryTimer);
+        waRetryTimer = setTimeout(() => { waRetryTimer = null; waConnect().catch(() => {}); }, loggedOut ? 3000 : 3000);
       }
     });
   } catch (e) {
     WA.status = 'error';
     WA.lastErr = e.message;
+    WA.connecting = false;
     log('WA', `❌ init failed: ${e.message}`);
+    if (waRetryTimer) clearTimeout(waRetryTimer);
+    waRetryTimer = setTimeout(() => { waRetryTimer = null; waConnect().catch(() => {}); }, 8000);
   } finally {
-    if (WA.status !== 'closed') WA.connecting = false;
+    // never leave the lock stuck on 'closed'
+    if (WA.status !== 'connecting') WA.connecting = false;
   }
   return WA;
 }
+
+// Watchdog: if the link is not open, keep trying in the background so the very
+// first user login after a restart/sleep does not fail.
+setInterval(() => {
+  if (WA.status !== 'open' && !WA.connecting && !waRetryTimer) waConnect().catch(() => {});
+}, 30000);
 
 async function waSendText(msisdn, text) {
   if (!WA.sock || WA.status !== 'open') throw new Error('whatsapp_not_linked');
@@ -1683,48 +1725,26 @@ app.get('/api/wa/status', (req, res) => {
   res.json({ ok: true, status: WA.status, hasQr: !!WA.qr, me: WA.sock?.user?.id || null, lastErr: WA.lastErr });
 });
 
-// ─── QR as PNG (server-rendered, no CDN needed) ─────────────────────
-app.get('/api/wa/qr.png', async (req, res) => {
-  if (req.query.key !== WA_ADMIN_KEY) return res.status(403).send('forbidden');
-  if (WA.status === 'idle' || WA.status === 'error') await waConnect();
-  for (let i = 0; i < 30 && !WA.qr && WA.status !== 'open'; i++)
-    await new Promise(r => setTimeout(r, 400));
-  if (!WA.qr) return res.status(404).send('no_qr');
-  try {
-    const QRCode = (await import('qrcode')).default;
-    const buf = await QRCode.toBuffer(WA.qr, { width: 300, margin: 1 });
-    res.set('Cache-Control', 'no-store').type('png').send(buf);
-  } catch (e) {
-    log('WA', `qr render failed: ${e.message}`);
-    res.status(500).send('qr_render_failed');
-  }
-});
-
 app.get('/api/wa/qr', async (req, res) => {
   if (req.query.key !== WA_ADMIN_KEY) return res.status(403).send('forbidden');
   if (WA.status === 'idle' || WA.status === 'error') await waConnect();
   // give Baileys a moment to emit the first QR
-  for (let i = 0; i < 30 && !WA.qr && WA.status !== 'open'; i++)
-    await new Promise(r => setTimeout(r, 400));
-
-  const k = encodeURIComponent(WA_ADMIN_KEY);
-  const body = WA.status === 'open'
-    ? `<p style="color:#0ECB81">✅ Already linked as ${WA.sock?.user?.id || ''}</p>`
-    : WA.qr
-      ? `<div style="background:#fff;display:inline-block;padding:12px;border-radius:12px">
-           <img src="/api/wa/qr.png?key=${k}&t=${Date.now()}" width="300" height="300" alt="WhatsApp QR">
-         </div>
-         <p style="color:#848E9C">status: ${WA.status}</p>`
-      : `<p style="color:#848E9C">status: ${WA.status} — waiting for QR…${WA.lastErr ? ' · ' + WA.lastErr : ''}</p>`;
-
+  for (let i = 0; i < 25 && !WA.qr && WA.status !== 'open'; i++) await new Promise(r => setTimeout(r, 400));
+  const payload = JSON.stringify({ status: WA.status, qr: WA.qr });
   res.type('html').send(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>BIEXC · Link WhatsApp</title>
-<meta http-equiv="refresh" content="${WA.status === 'open' ? 30 : WA.qr ? 20 : 3}">
 <body style="background:#181A20;color:#EAECEF;font:15px -apple-system,Arial;text-align:center;padding:28px">
 <h2 style="color:#FCD535">Link WhatsApp</h2>
-${body}
-<p style="color:#848E9C;max-width:420px;margin:12px auto">WhatsApp → Settings → <b>Linked devices</b> → <b>Link a device</b> → scan this QR. Page auto-refreshes.</p>
-</body>`);
+<div id=box style="background:#fff;display:inline-block;padding:12px;border-radius:12px;min-height:264px;min-width:264px"></div>
+<p id=st style="color:#848E9C"></p>
+<p style="color:#848E9C;max-width:420px;margin:0 auto">WhatsApp → Settings → <b>Linked devices</b> → <b>Link a device</b> → scan this QR. Page auto-refreshes.</p>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script>
+var d = ${payload};
+if (d.status === 'open') { document.getElementById('st').textContent = '✅ Already linked'; document.getElementById('box').style.display='none'; }
+else if (d.qr) { QRCode.toCanvas(d.qr, { width: 256 }, function(e, c){ if(!e) document.getElementById('box').appendChild(c); }); document.getElementById('st').textContent = 'status: ' + d.status; setTimeout(function(){location.reload();}, 20000); }
+else { document.getElementById('st').textContent = 'status: ' + d.status + ' — waiting for QR…'; setTimeout(function(){location.reload();}, 3000); }
+</script></body>`);
 });
 
 app.post('/api/wa/logout', async (req, res) => {
@@ -1749,7 +1769,14 @@ app.post('/api/otp/send', async (req, res) => {
     if (now - rec.lastSent < OTP_RESEND_MS)
       return res.status(429).json({ ok: false, error: 'too_soon', waitSec: Math.ceil((OTP_RESEND_MS - (now - rec.lastSent)) / 1000) });
 
-    if (WA.status !== 'open') { waConnect().catch(() => {}); return res.status(503).json({ ok: false, error: 'whatsapp_not_linked' }); }
+    if (WA.status !== 'open') {
+      waConnect().catch(() => {});
+      const ready = await waWaitOpen(20000);   // give the link time to come up
+      if (!ready) {
+        log('OTP', `WA not ready (status=${WA.status}, err=${WA.lastErr || '-'})`);
+        return res.status(503).json({ ok: false, error: 'whatsapp_not_linked', waStatus: WA.status });
+      }
+    }
 
     const code = newCode();
     await waSendText(phone, `*BIEXC* login code: *${code}*\n\nValid for 5 minutes. Never share this code with anyone.`);
@@ -1825,7 +1852,7 @@ app.post('/api/otp/verify', async (req, res) => {
 });
 
 // Auto-restore an existing WhatsApp session on boot.
-if (fs.existsSync(WA_AUTH_DIR)) waConnect().catch(() => {});
+waConnect().catch(() => {});
 
 
 app.get('/*splat', (_req, res) => {
