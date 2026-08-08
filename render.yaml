@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: p2p-telegram-bot
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT
+        sync: false
+      - key: FIREBASE_DB_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: MASTER_MNEMONIC
+        sync: false
+      - key: MASTER_PASSPHRASE
+        sync: false
+      - key: TRONGRID_API_KEY
+        sync: false
+      - key: SOLANA_RPC
+        value: https://api.mainnet-beta.solana.com
+      - key: DEPOSIT_MIN_CONFIRMATIONS
+        value: 3
+      - key: DEPOSIT_POLL_MS
+        value: 60000
+      - key: DEPOSIT_MAX_BLOCK_SPAN
+        value: 3000
+      - key: DEBUG_ADMIN_KEY
+        sync: false
+      # Optional overrides — only needed if you want a private/paid RPC
+      # instead of the free public nodes baked into deposit-engine.js.
+      # - key: ETH_RPC_URL
+      #   sync: false
+      # - key: BSC_RPC_URL
+      #   sync: false
+      # - key: POLYGON_RPC_URL
+      #   sync: false
+      # - key: AVALANCHE_RPC_URL
+      #   sync: false
