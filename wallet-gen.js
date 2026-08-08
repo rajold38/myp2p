@@ -1,87 +1,35 @@
-// ════════════════════════════════════════════════════════════════════
-// wallet-gen.js — HD wallet derivation (ESM, myp2p server ke liye)
-//
-// Ek master BIP39 mnemonic se har user ka apna permanent address:
-//   EVM  m/44'/60'/0'/0/i    -> ETH, BNB, POL, AVAX + saare ERC20/BEP20
-//   TRON m/44'/195'/0'/0/i   -> TRX, USDT-TRC20
-//   BTC  m/84'/0'/0'/0/i     -> bc1... native segwit
-//   SOL  m/44'/501'/i'/0'    -> SOL
-//
-// npm i bip39 @scure/bip32 ethers tronweb bitcoinjs-lib tiny-secp256k1 \
-//       @solana/web3.js ed25519-hd-key
-// ════════════════════════════════════════════════════════════════════
-
 import * as bip39 from 'bip39';
 import { HDKey } from '@scure/bip32';
 import { ethers } from 'ethers';
 import TronWeb from 'tronweb';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
-import { derivePath } from 'ed25519-hd-key';
 import solanaWeb3 from '@solana/web3.js';
+import { derivePath } from 'ed25519-hd-key';
 
 const { Keypair } = solanaWeb3;
 bitcoin.initEccLib(ecc);
 
 const MNEMONIC = process.env.MASTER_MNEMONIC || '';
 export const WALLETS_ENABLED = bip39.validateMnemonic(MNEMONIC);
+const SEED = WALLETS_ENABLED ? bip39.mnemonicToSeedSync(MNEMONIC) : null;
 
-if (!WALLETS_ENABLED) {
-  console.warn('⚠️  MASTER_MNEMONIC missing/invalid — per-user deposit addresses disabled.');
-}
-
-const SEED = WALLETS_ENABLED
-  ? bip39.mnemonicToSeedSync(MNEMONIC, process.env.MASTER_PASSPHRASE || '')
-  : null;
-
-function evm(i) {
-  if (!SEED) throw new Error('MASTER_MNEMONIC not configured');
-  const n = ethers.HDNodeWallet.fromSeed(SEED).derivePath(`m/44'/60'/0'/0/${i}`);
-  return { address: ethers.getAddress(n.address), privateKey: n.privateKey };
-}
-function tron(i) {
-  if (!SEED) throw new Error('MASTER_MNEMONIC not configured');
-  const n = HDKey.fromMasterSeed(SEED).derive(`m/44'/195'/0'/0/${i}`);
-  if (!n.privateKey) throw new Error('TRON private key derivation failed');
-  const pk = Buffer.from(n.privateKey).toString('hex');
-  return { address: TronWeb.address.fromPrivateKey(pk), privateKey: pk };
-}
-function btc(i) {
-  if (!SEED) throw new Error('MASTER_MNEMONIC not configured');
-  const n = HDKey.fromMasterSeed(SEED).derive(`m/84'/0'/0'/0/${i}`);
-  const { address } = bitcoin.payments.p2wpkh({
-    pubkey: Buffer.from(n.publicKey),
-    network: bitcoin.networks.bitcoin,
-  });
-  if (!address || !n.privateKey) throw new Error('BTC key derivation failed');
-  return { address, privateKey: Buffer.from(n.privateKey).toString('hex') };
-}
-function sol(i) {
-  if (!SEED) throw new Error('MASTER_MNEMONIC not configured');
-  const { key } = derivePath(`m/44'/501'/${i}'/0'`, SEED.toString('hex'));
-  const kp = Keypair.fromSeed(key);
-  return { address: kp.publicKey.toBase58(), privateKey: Buffer.from(kp.secretKey).toString('hex') };
-}
-
-/** Public addresses — yehi frontend ko bhejna hai. */
 export function deriveAddresses(index) {
-  if (!WALLETS_ENABLED) throw new Error('MASTER_MNEMONIC not configured');
-  if (!Number.isInteger(index) || index < 0) throw new Error('bad derivation index');
-  return { evm: evm(index).address, tron: tron(index).address, btc: btc(index).address, sol: sol(index).address };
-}
+  const evmWallet = ethers.HDNodeWallet.fromSeed(SEED).derivePath(`m/44'/60'/0'/0/${index}`);
+  
+  const tronNode = HDKey.fromMasterSeed(SEED).derive(`m/44'/195'/0'/0/${index}`);
+  const tronPk = Buffer.from(tronNode.privateKey).toString('hex');
+  
+  const btcNode = HDKey.fromMasterSeed(SEED).derive(`m/84'/0'/0'/0/${index}`);
+  const { address: btcAddr } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(btcNode.publicKey) });
 
-/** Private keys — SIRF server-side sweep ke liye. Kabhi API/log/frontend mein nahi. */
-export function derivePrivateKeys(index) {
-  if (!WALLETS_ENABLED) throw new Error('MASTER_MNEMONIC not configured');
-  return { evm: evm(index).privateKey, tron: tron(index).privateKey, btc: btc(index).privateKey, sol: sol(index).privateKey };
-}
+  const { key } = derivePath(`m/44'/501'/${index}'/0'`, SEED.toString('hex'));
+  const solAddr = Keypair.fromSeed(key).publicKey.toBase58();
 
-/** coin + chain -> konsa address dikhana hai (frontend bhi yehi logic use karega) */
-export function bucketFor(coinSymbol, chainName = '') {
-  const c = String(coinSymbol || '').toUpperCase();
-  const ch = String(chainName || '').toUpperCase();
-  if (c === 'BTC' && !ch.includes('BEP')) return 'btc';
-  if (c === 'SOL' || ch.includes('SOLANA')) return 'sol';
-  if (c === 'TRX' || ch.includes('TRC')) return 'tron';
-  return 'evm';
+  return {
+    evm: evmWallet.address,
+    tron: TronWeb.address.fromPrivateKey(tronPk),
+    btc: btcAddr,
+    sol: solAddr
+  };
 }
