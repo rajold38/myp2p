@@ -37,6 +37,10 @@ import { deriveAddresses, WALLETS_ENABLED } from './wallet-gen.js';
 
 const TRONGRID_KEY = process.env.TRONGRID_API_KEY || '';
 const SOLANA_RPC   = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+// litecoinspace.org = mempool.space team's own Litecoin explorer. Same free
+// public API shape as mempool.space (no key, no paywall). Override with
+// LTC_EXPLORER_URL if you ever want a different/self-hosted instance.
+const LTC_EXPLORER  = (process.env.LTC_EXPLORER_URL || 'https://litecoinspace.org/api').replace(/\/$/, '');
 const POLL_MS      = Math.max(30_000, Number(process.env.DEPOSIT_POLL_MS || 60_000));
 const MIN_CONF     = Math.max(1, Number(process.env.DEPOSIT_MIN_CONFIRMATIONS || 3));
 // Safety cap so a long backend downtime doesn't try to scan 500k blocks in one go.
@@ -146,7 +150,7 @@ export function mountDepositEngine(app, ctx) {
   }
 
   function publicAddresses(wallet) {
-    return { evm: wallet.evm, tron: wallet.tron, btc: wallet.btc, sol: wallet.sol };
+    return { evm: wallet.evm, tron: wallet.tron, btc: wallet.btc, ltc: wallet.ltc, sol: wallet.sol };
   }
 
   async function ensureWallet(uid) {
@@ -171,6 +175,7 @@ export function mountDepositEngine(app, ctx) {
         [safeKey(wallet.evm.toLowerCase())]: uid,
         [safeKey(wallet.tron)]: uid,
         [safeKey(wallet.btc)]: uid,
+        [safeKey(wallet.ltc)]: uid,
         [safeKey(wallet.sol)]: uid,
       });
       if (wallet.index === index) log('WALLET', `created permanent addresses for ${uid} at index ${index}`);
@@ -353,6 +358,16 @@ export function mountDepositEngine(app, ctx) {
     }
   }
 
+  async function pollLtc(uid, address) {
+    const txs = await fetchJson(`${LTC_EXPLORER}/address/${address}/txs`);
+    if (!Array.isArray(txs)) return;
+    for (const tx of txs.slice(0, 20)) {
+      if (!tx.status?.confirmed) continue;
+      const received = (tx.vout || []).filter((out) => out.scriptpubkey_address === address).reduce((sum, out) => sum + out.value, 0);
+      await credit(uid, 'LTC', 'LITECOIN', received / 1e8, tx.txid, address, 'outputs');
+    }
+  }
+
   async function rpc(method, params) {
     const result = await fetchJson(SOLANA_RPC, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
     if (result.error) throw new Error(result.error.message || 'Solana RPC error');
@@ -401,15 +416,17 @@ export function mountDepositEngine(app, ctx) {
       }
 
       // TRON / BTC / SOL: still per-user (free APIs are already address-scoped).
-      let tronErr = 0, btcErr = 0, solErr = 0, tronN = 0, btcN = 0, solN = 0;
+      let tronErr = 0, btcErr = 0, ltcErr = 0, solErr = 0, tronN = 0, btcN = 0, ltcN = 0, solN = 0;
       for (const uid of uids) {
         const wallet = wallets[uid];
         try { if (wallet.tron) { tronN++; await pollTron(uid, wallet.tron); } } catch (error) { tronErr++; warn('POLL', `TRON ${uid}: ${error.message}`); }
         try { if (wallet.btc) { btcN++; await pollBtc(uid, wallet.btc); } } catch (error) { btcErr++; warn('POLL', `BTC ${uid}: ${error.message}`); }
+        try { if (wallet.ltc) { ltcN++; await pollLtc(uid, wallet.ltc); } } catch (error) { ltcErr++; warn('POLL', `LTC ${uid}: ${error.message}`); }
         try { if (wallet.sol) { solN++; await pollSol(uid, wallet.sol); } } catch (error) { solErr++; warn('POLL', `SOL ${uid}: ${error.message}`); }
       }
       summary.push(`TRON checked ${tronN} (${tronErr} errors)`);
       summary.push(`BTC checked ${btcN} (${btcErr} errors)`);
+      summary.push(`LTC checked ${ltcN} (${ltcErr} errors)`);
       summary.push(`SOL checked ${solN} (${solErr} errors)`);
     } catch (error) {
       warn('POLL', `cycle-level failure: ${error.message}`);
