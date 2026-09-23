@@ -126,7 +126,61 @@ async function setBalance(fuid, coin, value) {
   }
   return { oldBal: r8(prev), newBal: v };
 }
-...
+
+/** Push one history row. Shape: { hid, ts, date, type, coin, amt, status, ... } */
+async function pushHistory(fuid, entry) {
+  if (!fuid) return null;
+  const ref = db.ref(`users/${fuid}/history`).push();
+  const hid = entry.hid || ref.key;
+  await ref.set({ hid, ts: Date.now(), date: nowIST(), status: 'COMPLETED', coin: 'USDT', ...entry });
+  return hid;
+}
+
+/** Flip the status of an existing history row (matched by hid or key). */
+async function updateHistoryStatus(fuid, hid, status) {
+  if (!fuid || !hid) return;
+  try {
+    const snap = await db.ref(`users/${fuid}/history`).once('value');
+    const jobs = [];
+    snap.forEach(c => {
+      const v = c.val() || {};
+      if (c.key === hid || v.hid === hid) {
+        jobs.push(db.ref(`users/${fuid}/history/${c.key}`).update({ status, resolvedAt: Date.now() }));
+      }
+    });
+    await Promise.all(jobs);
+  } catch (e) { log('HIST', `status err ${e.message}`); }
+}
+
+/** In-app notification for one user — read by the app's bell icon
+ *  (users/{fuid}/notifs → { title, body, type, ts, read }). */
+async function pushNotif(fuid, { title, body, type = 'INFO' }) {
+  if (!fuid) return;
+  try {
+    await db.ref(`users/${fuid}/notifs`).push({ title, body, type, ts: Date.now(), read: false });
+  } catch (e) { log('NOTIF', `err ${e.message}`); }
+}
+
+// ─── MESSAGE FORMATTING — every bot message uses this one shape ──────
+const LINE = '━━━━━━━━━━━━━━━━━━';
+const fmtNum = (n) => r8(n).toLocaleString('en-US', { maximumFractionDigits: 8 });
+
+/** card('📥 TITLE', [['UID','ABC'], 'plain line'], 'footer') */
+function card(title, rows = [], foot = '') {
+  const body = rows.map(r => Array.isArray(r) ? `${r[0]}: *${r[1]}*` : String(r));
+  return [`*${title}*`, LINE, ...body, LINE, foot || `⏰ ${nowIST()} IST`].join('\n');
+}
+const ok  = (title, rows) => card(`✅ ${title}`, rows);
+const bad = (msg) => `❌ ${msg}`;
+
+/** IST midnight for a moment, and its YYYY-MM-DD key. */
+const IST_OFF = 5.5 * 3600_000;
+function istDayStart(ts = Date.now()) {
+  const d = new Date(ts + IST_OFF);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - IST_OFF;
+}
+const istDayKey = (ts = Date.now()) => new Date(ts + IST_OFF).toISOString().slice(0, 10);
+
 /** Write the legacy `users/{fuid}/balance` mirror via a single multi-path
  *  update. Idempotent — safe to call twice with the same value. */
 async function writeLegacyUsdtMirror(fuid, newBal) {
@@ -338,25 +392,25 @@ function rememberCb(id) {
 }
 
 function fmtRequestMsg(type, user, req) {
-  const head = type === 'dep' ? '📥 *NEW DEPOSIT REQUEST*' : '💸 *NEW WITHDRAWAL REQUEST*';
   const coin = (req.coin || 'USDT').toUpperCase();
-  const balances = user.balances || {};
-  const lines = [
-    head, '',
-    `👤 UID: \`${user.uid || '—'}\``,
-    `📛 Name: *${user.name || '—'}*`,
-    `📧 Email: ${user.email || '—'}`,
-    `💎 Coin: *${coin}*`,
-    `💵 Amount: *${req.amt} ${coin}*`,
+  const amt  = parseFloat(req.amt) || 0;
+  const bals = user.balances || {};
+  const rows = [
+    ['👤 UID', `\`${user.uid || '—'}\``],
+    ['📛 Name', user.name || '—'],
+    ['📧 Email', user.email || '—'],
+    ['💵 Amount', `${fmtNum(amt)} ${coin}`],
   ];
-  if (req.network || req.chain) lines.push(`🌐 Network: ${req.network || req.chain}`);
-  if (req.txid)                 lines.push(`🔗 TxID: \`${req.txid}\``);
-  if (req.address || req.addr)  lines.push(`📬 Address: \`${req.address || req.addr}\``);
-  if (req.utr)                  lines.push(`🧾 UTR: \`${req.utr}\``);
-  lines.push(`💰 Current ${coin}: *${r8(balances[coin] || 0)}*`);
-  lines.push(`💰 USDT: *${r8(balances.USDT || user.balance || 0).toFixed(2)}*`);
-  lines.push('', `⏰ ${nowIST()} IST`);
-  return lines.join('\n');
+  if (req.network || req.chain) rows.push(['🌐 Network', req.network || req.chain]);
+  if (req.txid)                 rows.push(['🔗 TxID', `\`${req.txid}\``]);
+  if (req.address || req.addr)  rows.push(['📬 Address', `\`${req.address || req.addr}\``]);
+  if (req.utr)                  rows.push(['🧾 UTR', `\`${req.utr}\``]);
+  rows.push([`💰 Wallet ${coin}`, fmtNum(bals[coin] || (coin === 'USDT' ? user.balance : 0) || 0)]);
+  if (coin !== 'USDT') rows.push(['💰 Wallet USDT', fmtNum(bals.USDT || user.balance || 0)]);
+  if (coin === 'USDT' && amt >= BIG_AMOUNT) {
+    rows.push('', `🚨 *LARGE ${type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL'}* — verify before approving`);
+  }
+  return card(type === 'dep' ? '📥 DEPOSIT REQUEST' : '📤 WITHDRAWAL REQUEST', rows);
 }
 
 async function maybeSendButtons(fuid, type, req, cbId) {
@@ -426,7 +480,7 @@ if (db) {
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v, BOT_START_TIME - 10_000);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
-
+    await alertNewUser(snap.key, v).catch(e => log('ERR', `newuser ${e.message}`));
   });
 }
 
@@ -556,6 +610,22 @@ async function handleCallback(cb) {
     return;
   }
   if ((m = data.match(/^kyc(approve|reject)_(.+)$/))) return handleKycDecision(cb, m[1], m[2]);
+  if ((m = data.match(/^kycreq_(.+)$/)))    { await tgAnswer(cb.id, '📝 KYC required'); return requireKycForUid(m[1]); }
+  if ((m = data.match(/^bal_(.+)$/)))       { await tgAnswer(cb.id, '💰 Loading…');     return handleBalances(m[1]); }
+  if ((m = data.match(/^msgprompt_(.+)$/))) {
+    await tgAnswer(cb.id, 'Send the text');
+    await tgSend(`✏️ Reply with:\n\`/msg ${m[1]} your message\``);
+    return;
+  }
+  // ── button dashboard ──────────────────────────────────────────────
+  if (data === 'menu_home')    { await tgAnswer(cb.id, '🏠'); return sendMenu(); }
+  if (data === 'menu_users')   { await tgAnswer(cb.id, '👥'); return handleUsersList(); }
+  if (data === 'menu_stats')   { await tgAnswer(cb.id, '📊'); return handleStats(); }
+  if (data === 'menu_pending') { await tgAnswer(cb.id, '⏳'); return handleTrades(); }
+  if (data === 'menu_today')   { await tgAnswer(cb.id, '📈'); return sendDailySummary(); }
+  if (data === 'menu_broad')   { await tgAnswer(cb.id, '📢'); return handleBroadList(); }
+  if (data === 'menu_help')    { await tgAnswer(cb.id, '🧾'); return tgSend(HELP_TEXT); }
+  if (data === 'menu_find')    { await tgAnswer(cb.id, '🔍'); return tgSend('🔍 Send `/user UID` — e.g. `/user AB12CD`'); }
   await tgAnswer(cb.id, '?');
 
 }
@@ -593,104 +663,136 @@ async function handleApproveRejectCb(cb, action, cbId) {
 }
 
 async function handleBanCb(cb, action, uid) {
+  await tgAnswer(cb.id, action === 'ban' ? '🚫 Banning…' : '✅ Unbanning…');
+  await setBanned(uid, action === 'ban');
+}
+
+/** Ban / unban a user + tell them in-app. */
+async function setBanned(uid, banned) {
   const found = await findUserByUID(uid);
-  if (!found) { await tgAnswer(cb.id, 'Not found'); return; }
-  const banned = action === 'ban';
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
   await db.ref(`users/${found.fuid}`).update({ banned });
-  await tgAnswer(cb.id, banned ? '🚫 Banned' : '✅ Unbanned');
-  log('ADMIN', `${banned?'BAN':'UNBAN'} UID=${uid}`);
-  await tgSend(`${banned?'🚫 *USER BANNED*':'✅ *USER UNBANNED*'}\n\n👤 \`${uid}\`\n📛 ${found.user.name || 'Unknown'}`);
+  await pushNotif(found.fuid, banned
+    ? { title: 'Account restricted', body: 'Your account has been restricted. Please contact support.', type: 'ALERT' }
+    : { title: 'Account restored',   body: 'Your account is active again. Happy trading!', type: 'INFO' });
+  log('ADMIN', `${banned ? 'BAN' : 'UNBAN'} UID=${uid}`);
+  await tgSend(card(banned ? '🚫 USER BANNED' : '✅ USER UNBANNED', [
+    ['👤 UID', `\`${uid}\``],
+    ['📛 Name', found.user.name || '—'],
+  ]));
+}
+
+/** Send an in-app message to one user. */
+async function handleAdminMessage(uid, body) {
+  const found = await findUserByUID(uid);
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
+  await pushNotif(found.fuid, { title: 'Message from Support', body, type: 'SUPPORT' });
+  log('ADMIN', `MSG → UID=${uid}`);
+  await tgSend(ok('MESSAGE DELIVERED', [
+    ['👤 UID', `\`${uid}\``],
+    ['💬 Text', body.slice(0, 300)],
+  ]));
 }
 
 // ════════════════════════════════════════════════════════════════════
 // ADMIN COMMANDS
 // ════════════════════════════════════════════════════════════════════
 const HELP_TEXT = [
-  '🤖 *PRO P2P + TRADING ADMIN BOT v4.0*', '',
-  '━━━━━━━━━━━━━━━━━━━',
-  '👥 *USERS*',
-  '━━━━━━━━━━━━━━━━━━━',
-  '`/users` — List all users',
-  '`/user UID` — User details card',
-  '`/history UID` — Last 15 transactions',
-  '`/ban UID` · `/unban UID`',
+  '*🧾 BIEXC ADMIN — COMMANDS*', LINE,
+  '👥 *Users*',
+  '`/users`  ·  `/user UID`  ·  `/history UID`',
+  '`/ban UID`  ·  `/unban UID`  ·  `/kyc UID`',
+  '`/msg UID <text>` — in-app message to the user',
   '',
-  '━━━━━━━━━━━━━━━━━━━',
-  '💰 *BALANCE (multi-coin)*',
-  '━━━━━━━━━━━━━━━━━━━',
-  '`/credit UID AMT [COIN]` — Add funds (default USDT)',
-  '`/debit  UID AMT [COIN]` — Deduct funds',
-  '`/setbalance UID COIN AMT` — Set exact balance',
-  '`/balances UID` — Show all coin balances',
-  '`/convert UID FROM TO AMT` — Manual swap',
+  '💰 *Balance*',
+  '`/credit UID AMT [COIN]`',
+  '`/debit UID AMT [COIN]`',
+  '`/setbalance UID COIN AMT`',
+  '`/balances UID`  ·  `/convert UID FROM TO AMT`',
+  '⚡ shortcut: `#UID AMT` → USDT credit',
   '',
-  '━━━━━━━━━━━━━━━━━━━',
-  '🔄 *TRADES & ORDERS*',
-  '━━━━━━━━━━━━━━━━━━━',
-  '`/trades` — All pending deposits/withdrawals/P2P',
-  '`/cancel TRADEID` — Cancel a pending request',
-  '`/closeorder ORDERID` — Force-close a P2P order',
-  '`/closep2p UID` — Close all active P2P for user',
+  '🔄 *Trades*',
+  '`/trades`  ·  `/cancel ID`',
+  '`/closeorder ID`  ·  `/closep2p UID`',
   '',
-  '━━━━━━━━━━━━━━━━━━━',
-  '📊 *PLATFORM*',
-  '━━━━━━━━━━━━━━━━━━━',
-  '`/stats` — Platform stats',
-  '`/broadcast MSG` — Announcement to all',
-  '`/broad` — List all broadcasts with delete buttons',
-  '`/broaddel <key>` — Delete one broadcast (global)',
-  '`/broadclear` — Wipe ALL broadcasts (global)',
-  '`/ping` · `/help`',
-  '',
-  '⚡ Quick: `#UID AMT` (USDT credit)',
+  '📊 *Platform*',
+  '`/stats`  ·  `/today`  ·  `/ping`',
+  '`/broadcast MSG`  ·  `/broad`  ·  `/broaddel KEY`  ·  `/broadclear`',
+  LINE,
+  '🏠 `/menu` — button dashboard',
 ].join('\n');
 
+const MENU_KB = { inline_keyboard: [
+  [{ text: '👥 Users',     callback_data: 'menu_users'   }, { text: '📊 Stats',       callback_data: 'menu_stats' }],
+  [{ text: '⏳ Pending',   callback_data: 'menu_pending' }, { text: '📈 Today',       callback_data: 'menu_today' }],
+  [{ text: '🔍 Find user', callback_data: 'menu_find'    }, { text: '📢 Broadcasts',  callback_data: 'menu_broad' }],
+  [{ text: '🧾 Commands',  callback_data: 'menu_help'    }],
+] };
+
+/** Home dashboard — live numbers + buttons, no commands to remember. */
+async function sendMenu() {
+  const s = await collectStats();
+  await tgSend(card('🏠 BIEXC ADMIN DASHBOARD', [
+    ['👥 Users', `${s.total}  (🚫 ${s.banned})`],
+    ['💰 Total USDT', fmtNum(s.totalUsdt)],
+    ['⏳ Pending', `📥 ${s.pendDep}  ·  📤 ${s.pendWit}`],
+    ['🔄 Active P2P', s.activeP2P],
+  ]), { reply_markup: MENU_KB });
+}
+
 async function sendUserDetailCard(cb, uid) {
-  await tgAnswer(cb.id, 'Loading…');
+  if (cb?.id) await tgAnswer(cb.id, 'Loading…');
   const found = await findUserByUID(uid);
-  if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
   const u = found.user;
   await migrateLegacyBalanceOnce(found.fuid, u);
   warnIfLegacyMismatch(uid, u);
+
   const balances = u.balances || {};
   const balLines = Object.entries(balances)
-    .filter(([,v]) => parseFloat(v) > 0)
-    .sort((a,b) => parseFloat(b[1]) - parseFloat(a[1]))
+    .map(([c, v]) => [c, r8(v)])
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 8)
-    .map(([c,v]) => `   • ${c}: *${r8(v)}*`)
-    .join('\n') || '   (no balances)';
+    .map(([c, v]) => `   • ${c}: *${fmtNum(v)}*`);
 
   const histSnap = await db.ref(`users/${found.fuid}/history`).once('value');
   const histArr = [];
-  histSnap.forEach(c => histArr.push(c.val()));
+  histSnap.forEach(c => histArr.push(c.val() || {}));
   histArr.sort((a, b) => (b.ts || 0) - (a.ts || 0));
   const last3 = histArr.slice(0, 3).map(h => {
-    const sign = /WITHDRAW|DEBIT|CONVERT_OUT|SELL/i.test(h.type) ? '-' : '+';
-    const ico = h.status==='COMPLETED'?'✅':h.status==='REJECTED'?'❌':h.status==='CANCELLED'?'🚫':'⏳';
-    return `  ${ico} ${h.type} ${sign}${r8(h.amt)} ${(h.coin||'USDT')}`;
-  }).join('\n') || '  (no transactions)';
+    const sign = /WITHDRAW|DEBIT|CONVERT_OUT|SELL/i.test(h.type || '') ? '−' : '+';
+    const ico = h.status === 'COMPLETED' ? '✅' : h.status === 'REJECTED' ? '❌' : h.status === 'CANCELLED' ? '🚫' : '⏳';
+    return `   ${ico} ${h.type || '—'}  ${sign}${fmtNum(h.amt)} ${h.coin || 'USDT'}`;
+  });
 
-  const text = [
-    `👤 *USER DETAILS — ${u.uid}*`, '',
-    `📛 Name: *${u.name || '—'}*`,
-    `📧 Email: ${u.email || '—'}`,
-    `📱 Phone: ${u.phone || '—'}`,
-    `🔑 Status: ${u.banned ? '🚫 BANNED' : '✅ Active'}`,
-    `📅 Joined: ${u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata'}) : '—'}`,
-    '', `💰 *Balances:*`, balLines,
-    '', `📊 *Last 3 Transactions:*`, last3
-  ].join('\n');
+  const rows = [
+    ['👤 UID', `\`${u.uid || '—'}\``],
+    ['📛 Name', u.name || '—'],
+    ['📧 Email', u.email || '—'],
+    ['📱 Phone', u.phone || '—'],
+    ['🔑 Status', u.banned ? '🚫 BANNED' : '✅ Active'],
+    ['📝 KYC', u.kycStatus || (u.kycSubmission?.status ? `${u.kycSubmission.status} (submitted)` : '—')],
+    ['📅 Joined', u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'],
+    '', '💰 *Balances*', ...(balLines.length ? balLines : ['   (empty)']),
+    '', '📊 *Last 3 transactions*', ...(last3.length ? last3 : ['   (none)']),
+  ];
 
   const buttons = [
-    [{ text: '💰 Credit', callback_data: `creditprompt_${uid}` },
+    [{ text: '➕ Credit', callback_data: `creditprompt_${uid}` },
      { text: '➖ Debit',  callback_data: `debitprompt_${uid}` }],
+    [{ text: '💰 Balances', callback_data: `bal_${uid}` },
+     { text: '📋 History',  callback_data: `history_${uid}` }],
+    [{ text: '💬 Message', callback_data: `msgprompt_${uid}` },
+     { text: '📝 Ask KYC',  callback_data: `kycreq_${uid}` }],
     [ u.banned
         ? { text: '✅ Unban', callback_data: `unban_${uid}` }
         : { text: '🚫 Ban',   callback_data: `ban_${uid}` },
-      { text: '📋 History', callback_data: `history_${uid}` }],
-    [{ text: '🔄 Close P2P', callback_data: `closep2p_${uid}` }]
+      { text: '🔄 Close P2P', callback_data: `closep2p_${uid}` }],
+    [{ text: '↻ Refresh', callback_data: `userdetail_${uid}` },
+     { text: '🏠 Menu',   callback_data: 'menu_home' }],
   ];
-  await tgSend(text, { reply_markup: { inline_keyboard: buttons } });
+  await tgSend(card(`👤 USER — ${u.uid || uid}`, rows), { reply_markup: { inline_keyboard: buttons } });
 }
 
 async function sendUserHistory(uid, limit = 15) {
@@ -702,63 +804,135 @@ async function sendUserHistory(uid, limit = 15) {
   snap.forEach(c => arr.push(c.val()));
   arr.sort((a, b) => (b.ts || 0) - (a.ts || 0));
   const items = arr.slice(0, limit).map(h => {
-    const sign = /WITHDRAW|DEBIT|CONVERT_OUT|SELL/i.test(h.type) ? '-' : '+';
-    const ico = h.status==='COMPLETED'?'✅':h.status==='REJECTED'?'❌':h.status==='CANCELLED'?'🚫':'⏳';
-    const d = h.date || (h.ts ? new Date(h.ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : '');
-    const net = h.network ? ' · '+h.network : '';
-    return `${ico} ${h.type} ${sign}${r8(h.amt)} ${h.coin||'USDT'}${net} — ${d}`;
+    const sign = /WITHDRAW|DEBIT|CONVERT_OUT|SELL/i.test(h.type || '') ? '−' : '+';
+    const ico = h.status === 'COMPLETED' ? '✅' : h.status === 'REJECTED' ? '❌' : h.status === 'CANCELLED' ? '🚫' : '⏳';
+    const d = h.date || (h.ts ? new Date(h.ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '');
+    const net = h.network ? ` · ${h.network}` : '';
+    return `${ico} *${h.type || '—'}*  ${sign}${fmtNum(h.amt)} ${h.coin || 'USDT'}${net}\n    ${d}`;
   });
-  await tgSend(`📋 *HISTORY — ${uid}* (last ${items.length})\n\n${items.join('\n')}`);
+  await tgSend(card(`📋 HISTORY — ${uid}`, [[`Showing`, `last ${items.length}`], '', ...items]),
+    { reply_markup: { inline_keyboard: [[{ text: '👤 User card', callback_data: `userdetail_${uid}` }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
 }
 
 async function handleUsersList() {
   const snap = await db.ref('users').once('value');
-  if (!snap.exists()) { await tgSend('No users found.'); return; }
   const users = [];
   snap.forEach(c => { const u = c.val(); if (u && u.uid) users.push(u); });
-  if (!users.length) { await tgSend('No users found.'); return; }
-  await tgSend(`👥 *ALL USERS (${users.length} total)*`);
+  if (!users.length) { await tgSend(bad('No users yet.')); return; }
+  users.sort((a, b) => r8((b.balances || {}).USDT || b.balance || 0) - r8((a.balances || {}).USDT || a.balance || 0));
+  await tgSend(card('👥 ALL USERS', [['Total', users.length], ['Sorted by', 'USDT balance']]));
   const CHUNK = 8;
   for (let i = 0; i < users.length; i += CHUNK) {
     const slice = users.slice(i, i + CHUNK);
     const lines = slice.map(u => {
       const st = u.banned ? '🚫' : '✅';
-      const usdt = r8((u.balances && u.balances.USDT) || u.balance || 0);
-      return `${st} \`${u.uid}\` | *${u.name || '—'}* | 💰 ${usdt} USDT`;
+      const usdt = fmtNum((u.balances || {}).USDT || u.balance || 0);
+      return `${st} \`${u.uid}\`  *${u.name || '—'}*\n     💰 ${usdt} USDT`;
     });
-    const keyboard = slice.map(u => [{ text: `👁 ${u.uid} — ${u.name||'—'}`.slice(0,60), callback_data: `userdetail_${u.uid}` }]);
+    const keyboard = slice.map(u => [{ text: `👁 ${u.uid} — ${u.name || '—'}`.slice(0, 60), callback_data: `userdetail_${u.uid}` }]);
+    keyboard.push([{ text: '🏠 Menu', callback_data: 'menu_home' }]);
     await tgSend(lines.join('\n'), { reply_markup: { inline_keyboard: keyboard } });
   }
 }
 
-async function handleStats() {
+/** One pass over `users` → every number the dashboard / stats / summary need. */
+async function collectStats() {
   const snap = await db.ref('users').once('value');
-  let total = 0, banned = 0, totalUsdt = 0, pendDep = 0, pendWit = 0, activeP2P = 0;
+  const s = {
+    total: 0, banned: 0, totalUsdt: 0, pendDep: 0, pendWit: 0, pendDepAmt: 0, pendWitAmt: 0,
+    activeP2P: 0, newToday: 0, depToday: 0, depTodayAmt: 0, witToday: 0, witTodayAmt: 0, kycPending: 0,
+  };
+  const dayStart = istDayStart();
   snap.forEach(c => {
     const u = c.val() || {}; if (!u.uid) return;
-    total++; if (u.banned) banned++;
-    totalUsdt += parseFloat((u.balances && u.balances.USDT) || u.balance || 0);
+    s.total++; if (u.banned) s.banned++;
+    s.totalUsdt += r8((u.balances || {}).USDT || u.balance || 0);
+    if ((u.createdAt || 0) >= dayStart) s.newToday++;
+    if ((u.kycSubmission && !u.kycSubmission.status) || u.kycStatus === 'PENDING') s.kycPending++;
     const reqs = u.pendingReqs || {};
-    pendDep += Object.keys(reqs.dep || {}).filter(k => k !== 'botLock').length;
-    pendWit += Object.keys(reqs.wit || {}).filter(k => k !== 'botLock').length;
+    for (const [kind, key] of [['dep', 'Dep'], ['wit', 'Wit']]) {
+      for (const [k, v] of Object.entries(reqs[kind] || {})) {
+        if (k === 'botLock' || !v) continue;
+        s[`pend${key}`]++;
+        s[`pend${key}Amt`] += r8(v.amt);
+      }
+    }
     for (const o of Object.values(u.orders || {})) {
-      if (o?.status && !['completed','cancelled','canceled'].includes(String(o.status).toLowerCase())) activeP2P++;
+      if (o?.status && !['completed', 'cancelled', 'canceled'].includes(String(o.status).toLowerCase())) s.activeP2P++;
+    }
+    for (const h of Object.values(u.history || {})) {
+      if (!h || (h.ts || 0) < dayStart || h.status !== 'COMPLETED') continue;
+      if (/DEPOSIT/i.test(h.type || ''))  { s.depToday++; s.depTodayAmt += r8(h.amt); }
+      if (/WITHDRAW/i.test(h.type || '')) { s.witToday++; s.witTodayAmt += r8(h.amt); }
     }
   });
-  const upMs = Date.now() - BOT_START_TIME;
-  const upH = Math.floor(upMs / 3600000);
-  const upM = Math.floor((upMs % 3600000) / 60000);
-  await tgSend([
-    '📊 *PLATFORM STATS*', '',
-    `👥 Users: *${total}* (✅ ${total-banned} · 🚫 ${banned})`,
-    `💰 Total USDT: *${totalUsdt.toFixed(2)}*`,
-    `📥 Pending Dep: *${pendDep}* · 📤 Pending Wit: *${pendWit}*`,
-    `🔄 Active P2P: *${activeP2P}*`,
-    `⏰ Uptime: *${upH}h ${upM}m*`,
-    `🔑 Instance: \`${INSTANCE_ID}\``,
-  ].join('\n'));
+  return s;
 }
 
+async function handleStats() {
+  const s = await collectStats();
+  const upMs = Date.now() - BOT_START_TIME;
+  await tgSend(card('📊 PLATFORM STATS', [
+    ['👥 Users', `${s.total}  (✅ ${s.total - s.banned} · 🚫 ${s.banned})`],
+    ['🆕 New today', s.newToday],
+    ['💰 Total USDT', fmtNum(s.totalUsdt)],
+    ['📥 Pending deposits', `${s.pendDep}  (${fmtNum(s.pendDepAmt)} USDT)`],
+    ['📤 Pending withdrawals', `${s.pendWit}  (${fmtNum(s.pendWitAmt)} USDT)`],
+    ['📝 KYC waiting', s.kycPending],
+    ['🔄 Active P2P', s.activeP2P],
+    ['⏰ Uptime', `${Math.floor(upMs / 3600000)}h ${Math.floor((upMs % 3600000) / 60000)}m`],
+    ['🔑 Instance', `\`${INSTANCE_ID}\``],
+  ]), { reply_markup: { inline_keyboard: [[
+    { text: '↻ Refresh', callback_data: 'menu_stats' }, { text: '🏠 Menu', callback_data: 'menu_home' },
+  ]] } });
+}
+
+// ── Daily summary + live alerts ──────────────────────────────────────
+const BIG_AMOUNT = parseFloat(process.env.BIG_AMOUNT || '1000');
+let lastSummaryDay = null;
+const alertedUsers = new Set();
+
+/** Today's activity at a glance (also sent automatically at 9am IST). */
+async function sendDailySummary() {
+  const s = await collectStats();
+  await tgSend(card(`📈 TODAY — ${istDayKey()}`, [
+    ['🆕 New users', s.newToday],
+    ['📥 Deposits', `${s.depToday}  (${fmtNum(s.depTodayAmt)} USDT)`],
+    ['📤 Withdrawals', `${s.witToday}  (${fmtNum(s.witTodayAmt)} USDT)`],
+    ['📊 Net flow', `${fmtNum(s.depTodayAmt - s.witTodayAmt)} USDT`],
+    ['⏳ Still pending', `📥 ${s.pendDep} · 📤 ${s.pendWit}`],
+    ['💰 Total USDT held', fmtNum(s.totalUsdt)],
+    ['👥 Users', s.total],
+  ]), { reply_markup: { inline_keyboard: [[
+    { text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '🏠 Menu', callback_data: 'menu_home' },
+  ]] } });
+}
+
+/** Fire the summary once a day, shortly after 9am IST. */
+async function dailySummaryTick() {
+  try {
+    const now = Date.now();
+    const key = istDayKey(now);
+    const hourIST = new Date(now + IST_OFF).getUTCHours();
+    if (hourIST < 9 || lastSummaryDay === key) return;
+    lastSummaryDay = key;
+    if (!(await amIActive())) return;
+    await sendDailySummary();
+  } catch (e) { log('ERR', `summary ${e.message}`); }
+}
+
+/** Ping the admin when a brand-new account signs up. */
+async function alertNewUser(fuid, u) {
+  if (!u?.uid || !u.createdAt) return;
+  if (u.createdAt < BOT_START_TIME || alertedUsers.has(fuid)) return;
+  alertedUsers.add(fuid);
+  await tgSend(card('🆕 NEW USER SIGNED UP', [
+    ['👤 UID', `\`${u.uid}\``],
+    ['📛 Name', u.name || '—'],
+    ['📧 Email', u.email || '—'],
+    ['📱 Phone', u.phone || '—'],
+  ]), { reply_markup: { inline_keyboard: [[{ text: '👁 Open user', callback_data: `userdetail_${u.uid}` }]] } });
+}
 async function handleTrades() {
   const snap = await db.ref('users').once('value');
   const lines = ['📊 *ALL PENDING / ONGOING TRADES*\n'];
@@ -932,14 +1106,19 @@ async function handleConvert(uid, from, to, amt) {
 }
 
 async function handleBroadcast(message) {
-  if (!message) { await tgSend('Usage: `/broadcast <message>`'); return; }
+  if (!message) { await tgSend(bad('Usage: `/broadcast <message>`')); return; }
   const snap = await db.ref('users').once('value');
   let count = 0;
   snap.forEach(c => { if (c.val()?.uid) count++; });
   const entry = { text: message, ts: Date.now(), from: 'admin', date: nowIST() };
-  await db.ref('broadcast').push(entry);
+  // Write both node names — the app reads `broadcasts`, older builds read `broadcast`.
+  const key = db.ref('broadcasts').push().key;
+  await db.ref().update({ [`broadcasts/${key}`]: entry, [`broadcast/${key}`]: entry });
   log('BROADCAST', `to ${count} users: "${message}"`);
-  await tgSend(`✅ *BROADCAST SENT*\n\nReach: *${count} users*\n💬 "${message}"`);
+  await tgSend(ok('BROADCAST SENT', [
+    ['👥 Reach', `${count} users`],
+    ['💬 Message', message.slice(0, 300)],
+  ]));
 }
 
 // ── /broad — list all broadcasts with delete buttons ───────────────
@@ -963,12 +1142,12 @@ async function handleBroadList() {
 }
 
 async function handleBroadDelete(key) {
-  await db.ref(`broadcast/${key}`).remove();
+  await db.ref().update({ [`broadcast/${key}`]: null, [`broadcasts/${key}`]: null });
   log('BROADCAST', `deleted ${key}`);
 }
 
 async function handleBroadClearAll() {
-  await db.ref('broadcast').remove();
+  await db.ref().update({ broadcast: null, broadcasts: null });
   log('BROADCAST', 'cleared all');
 }
 
@@ -983,16 +1162,21 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
-  if (text === '/start' || text === '/help') return tgSend(HELP_TEXT);
-  if (text === '/ping')   return tgSend(`🟢 Bot online — ${nowIST()} IST\nUptime: ${Math.floor((Date.now()-BOT_START_TIME)/60000)}m\nInstance: \`${INSTANCE_ID}\``);
+  if (text === '/start' || text === '/menu')  return sendMenu();
+  if (text === '/help')   return tgSend(HELP_TEXT);
+  if (text === '/ping')   return tgSend(card('🟢 BOT ONLINE', [
+    ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
+    ['🔑 Instance', `\`${INSTANCE_ID}\``],
+  ]));
   if (text === '/users')  return handleUsersList();
-  if (text === '/trades') return handleTrades();
+  if (text === '/trades' || text === '/pending') return handleTrades();
   if (text === '/stats')  return handleStats();
+  if (text === '/today' || text === '/summary')  return sendDailySummary();
 
   let m;
   if ((m = text.match(/^\/(?:kyc|uid)\s+([A-Z0-9]{2,15})$/i)))             return requireKycForUid(m[1].toUpperCase());
-  if ((m = text.match(/^\/user\s+([A-Z0-9]{2,15})$/i)))                   return sendUserDetailCard({ id: 'cmd' }, m[1].toUpperCase());
-
+  if ((m = text.match(/^\/user\s+([A-Z0-9]{2,15})$/i)))                   return sendUserDetailCard(null, m[1].toUpperCase());
+  if ((m = text.match(/^\/msg\s+([A-Z0-9]{2,15})\s+([\s\S]+)$/i)))        return handleAdminMessage(m[1].toUpperCase(), m[2].trim());
   if ((m = text.match(/^\/history\s+([A-Z0-9]{2,15})$/i)))                return sendUserHistory(m[1].toUpperCase(), 15);
   if ((m = text.match(/^\/balances\s+([A-Z0-9]{2,15})$/i)))               return handleBalances(m[1].toUpperCase());
   if ((m = text.match(/^\/credit\s+([A-Z0-9]{2,15})\s+([\d.]+)(?:\s+([A-Z]{2,8}))?$/i)))
@@ -1003,16 +1187,17 @@ async function handleUpdate(upd) {
     return handleSetBalance(m[1].toUpperCase(), m[2].toUpperCase(), parseFloat(m[3]));
   if ((m = text.match(/^\/convert\s+([A-Z0-9]{2,15})\s+([A-Z]{2,8})\s+([A-Z]{2,8})\s+([\d.]+)$/i)))
     return handleConvert(m[1].toUpperCase(), m[2], m[3], parseFloat(m[4]));
-  if ((m = text.match(/^\/ban\s+([A-Z0-9]{2,15})$/i)))      return db.ref(`users`).once('value').then(s => { s.forEach(c => { if (c.val()?.uid?.toUpperCase()===m[1].toUpperCase()) db.ref(`users/${c.key}`).update({ banned: true }); }); tgSend(`🚫 Banned \`${m[1]}\``); });
-  if ((m = text.match(/^\/unban\s+([A-Z0-9]{2,15})$/i)))    return db.ref(`users`).once('value').then(s => { s.forEach(c => { if (c.val()?.uid?.toUpperCase()===m[1].toUpperCase()) db.ref(`users/${c.key}`).update({ banned: false }); }); tgSend(`✅ Unbanned \`${m[1]}\``); });
+  if ((m = text.match(/^\/ban\s+([A-Z0-9]{2,15})$/i)))      return setBanned(m[1].toUpperCase(), true);
+  if ((m = text.match(/^\/unban\s+([A-Z0-9]{2,15})$/i)))    return setBanned(m[1].toUpperCase(), false);
   if ((m = text.match(/^\/cancel\s+(\S+)$/i)))              return handleCancel(m[1]);
   if ((m = text.match(/^\/closeorder\s+(\S+)$/i)))          return handleCloseOrder(m[1]);
   if ((m = text.match(/^\/closep2p\s+([A-Z0-9]{2,15})$/i))) return closeAllP2PForUser(m[1].toUpperCase());
   if ((m = text.match(/^\/broadcast\s+([\s\S]+)$/i)))       return handleBroadcast(m[1].trim());
   if (text === '/broad' || text === '/broadlist')           return handleBroadList();
-  if (text === '/broadclear')                               return handleBroadClearAll().then(() => tgSend('✅ All broadcasts cleared.'));
-  if ((m = text.match(/^\/broaddel\s+(\S+)$/i)))            return handleBroadDelete(m[1]).then(() => tgSend(`✅ Deleted broadcast \`${m[1]}\``));
+  if (text === '/broadclear')                               return handleBroadClearAll().then(() => tgSend(ok('ALL BROADCASTS CLEARED', [])));
+  if ((m = text.match(/^\/broaddel\s+(\S+)$/i)))            return handleBroadDelete(m[1]).then(() => tgSend(ok('BROADCAST DELETED', [['🔑 Key', `\`${m[1]}\``]])));
   if ((m = text.match(/^#([A-Z0-9]{2,15})\s+([\d.]+)$/i)))  return adminCreditDebit(m[1].toUpperCase(), parseFloat(m[2]), '+', 'ADMIN_CREDIT', 'USDT');
+  if (text.startsWith('/')) return tgSend(bad('Unknown command — tap a button below or send /help.'), { reply_markup: MENU_KB });
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1627,7 +1812,10 @@ if (RENDER_URL) {
   await claimInstanceLock();
   lastUpdateId = await loadLastUpdateId();
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
-  await tgSend(`🟢 *Backend v4.0 ONLINE*\n\n⏰ ${nowIST()} IST\n🔑 Instance: \`${INSTANCE_ID}\`\n\nType /help for commands.`).catch(()=>{});
+  // If we boot after 9am IST, skip today's summary so restarts don't spam it.
+  if (new Date(Date.now() + IST_OFF).getUTCHours() >= 9) lastSummaryDay = istDayKey();
+  await sendMenu().catch(() => {});
+  setInterval(() => { dailySummaryTick(); }, 5 * 60_000);
   pollLoop().catch(e => { log('FATAL', e.message); process.exit(1); });
 })();
 
