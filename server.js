@@ -331,13 +331,33 @@ async function handleKycDecision(cb, action, uid) {
 // ════════════════════════════════════════════════════════════════════
 // SINGLE-INSTANCE GUARD + PERSISTENT OFFSET
 // ════════════════════════════════════════════════════════════════════
+const LOCK_STALE_MS = 90_000;   // an instance that stopped beating loses the lock
+
 async function claimInstanceLock() {
-  await db.ref('botMeta/activeInstance').set({ id: INSTANCE_ID, ts: BOT_START_TIME });
+  await db.ref('botMeta/activeInstance').set({ id: INSTANCE_ID, ts: Date.now() });
   log('INIT', `🔒 Claimed instance lock`);
 }
+/** Refresh our heartbeat so no other instance steals the lock while we poll. */
+async function beatInstanceLock() {
+  try { await db.ref('botMeta/activeInstance').update({ id: INSTANCE_ID, ts: Date.now() }); } catch (e) {}
+}
+/**
+ * We are the active poller when the lock is empty, ours, or abandoned
+ * (previous instance died without releasing it — the old code slept forever
+ * in that case, which is why the bot answered once and then went silent).
+ */
 async function amIActive() {
-  const v = (await db.ref('botMeta/activeInstance').once('value')).val();
-  return !v || v.id === INSTANCE_ID;
+  let v = null;
+  try { v = (await db.ref('botMeta/activeInstance').once('value')).val(); }
+  catch (e) { return true; }                       // DB hiccup: keep polling
+  if (!v || v.id === INSTANCE_ID) return true;
+  const age = Date.now() - Number(v.ts || 0);
+  if (age > LOCK_STALE_MS) {
+    log('POLL', `🔓 stale lock from ${v.id} (${Math.round(age / 1000)}s old) — taking over`);
+    await claimInstanceLock();
+    return true;
+  }
+  return false;
 }
 async function loadLastUpdateId() {
   return parseInt((await db.ref('botMeta/lastUpdateId').once('value')).val() || 0, 10);
@@ -578,7 +598,11 @@ async function handleCallback(cb) {
   rememberCb(cb.id);
 
   const chatId = String(cb.message?.chat?.id || '');
-  if (chatId !== String(TG_CHAT)) { await tgAnswer(cb.id, 'Unauthorized'); return; }
+  if (chatId !== String(TG_CHAT)) {
+    log('CB', `⛔ ignored tap from chat ${chatId} (TG_CHAT=${TG_CHAT})`);
+    await tgAnswer(cb.id, 'Unauthorized');
+    return;
+  }
   const data = cb.data || '';
 
   let m;
@@ -626,6 +650,7 @@ async function handleCallback(cb) {
   if (data === 'menu_broad')   { await tgAnswer(cb.id, '📢'); return handleBroadList(); }
   if (data === 'menu_help')    { await tgAnswer(cb.id, '🧾'); return tgSend(HELP_TEXT); }
   if (data === 'menu_find')    { await tgAnswer(cb.id, '🔍'); return tgSend('🔍 Send `/user UID` — e.g. `/user AB12CD`'); }
+  log('CB', `❓ no handler for callback_data="${data}"`);
   await tgAnswer(cb.id, '?');
 
 }
@@ -1204,23 +1229,60 @@ async function handleUpdate(upd) {
 // POLLING
 // ════════════════════════════════════════════════════════════════════
 let lastUpdateId = 0;
+let lastPollOkAt = Date.now();
+let pollFailStreak = 0;
+
+/** A webhook and getUpdates cannot coexist: Telegram then answers every
+ *  getUpdates with 409 and the bot goes permanently silent. */
+async function dropWebhook(reason) {
+  try {
+    const r = await fetch(`${TG_API}/deleteWebhook?drop_pending_updates=false`).then(x => x.json());
+    log('POLL', `🔌 deleteWebhook (${reason}) → ${r && r.ok ? 'ok' : JSON.stringify(r)}`);
+  } catch (e) { log('POLL', `deleteWebhook failed: ${e.message}`); }
+}
+
 async function pollUpdates() {
   try {
     if (!(await amIActive())) {
-      log('POLL', '⏸️ another instance active — sleeping 30s');
-      await new Promise(r => setTimeout(r, 30_000));
+      log('POLL', '⏸️ another instance active — sleeping 15s');
+      await new Promise(r => setTimeout(r, 15_000));
       return;
     }
+    await beatInstanceLock();
     const res = await fetch(`${TG_API}/getUpdates?offset=${lastUpdateId + 1}&timeout=25&allowed_updates=${encodeURIComponent('["callback_query","message"]')}`);
-    const data = await res.json();
-    if (!data.ok) return;
+    const data = await res.json().catch(() => null);
+
+    if (!data || !data.ok) {
+      pollFailStreak++;
+      const code = data && data.error_code;
+      const desc = (data && data.description) || 'no response';
+      log('POLL', `⚠️ getUpdates failed (${code || '—'}): ${desc}`);
+      // 409 = webhook set or a second getUpdates consumer. Both are fatal to
+      // button taps, so clear the webhook and retake the lock, then retry.
+      if (code === 409 || /conflict|webhook/i.test(desc)) {
+        await dropWebhook('409 conflict');
+        await claimInstanceLock();
+      }
+      if (code === 401 || code === 404) {
+        log('POLL', '🛑 bot token rejected by Telegram — check TG_BOT_TOKEN');
+      }
+      await new Promise(r => setTimeout(r, Math.min(15_000, 1000 * pollFailStreak)));
+      return;
+    }
+
+    pollFailStreak = 0;
+    lastPollOkAt = Date.now();
     for (const upd of (data.result || [])) {
       lastUpdateId = upd.update_id;
       await saveLastUpdateId(lastUpdateId).catch(()=>{});
       pushRecentUpdate(upd);
       try { await handleUpdate(upd); } catch (e) { log('ERR', `handleUpdate: ${e.message}`); }
     }
-  } catch (e) { log('POLL', `err ${e.message}`); }
+  } catch (e) {
+    pollFailStreak++;
+    log('POLL', `err ${e.message}`);
+    await new Promise(r => setTimeout(r, Math.min(10_000, 1000 * pollFailStreak)));
+  }
 }
 
 async function pollLoop() {
@@ -1228,6 +1290,17 @@ async function pollLoop() {
     await pollUpdates();
     await new Promise(r => setTimeout(r, 300));
   }
+}
+
+/** Watchdog: if no successful poll for 3 minutes, force the bot back online. */
+function startPollWatchdog() {
+  setInterval(async () => {
+    if (Date.now() - lastPollOkAt < 180_000) return;
+    log('POLL', '🚑 no successful poll for 3m — reclaiming lock + clearing webhook');
+    lastPollOkAt = Date.now();
+    await dropWebhook('watchdog');
+    await claimInstanceLock().catch(() => {});
+  }, 60_000);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1810,13 +1883,19 @@ if (RENDER_URL) {
     return;
   }
   await claimInstanceLock();
+  await dropWebhook('boot');            // guarantees getUpdates can run
   lastUpdateId = await loadLastUpdateId();
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
   // If we boot after 9am IST, skip today's summary so restarts don't spam it.
   if (new Date(Date.now() + IST_OFF).getUTCHours() >= 9) lastSummaryDay = istDayKey();
   await sendMenu().catch(() => {});
   setInterval(() => { dailySummaryTick(); }, 5 * 60_000);
-  pollLoop().catch(e => { log('FATAL', e.message); process.exit(1); });
+  setInterval(() => { beatInstanceLock(); }, 20_000);
+  startPollWatchdog();
+  pollLoop().catch(e => {
+    log('FATAL', `pollLoop died: ${e.message} — restarting in 2s`);
+    setTimeout(() => pollLoop().catch(() => process.exit(1)), 2000);
+  });
 })();
 
 process.on('uncaughtException',  e => log('UNCAUGHT', e.stack || e.message));
