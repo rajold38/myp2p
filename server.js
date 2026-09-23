@@ -85,7 +85,11 @@ if (!BACKEND_DISABLED) {
 const r8 = (n) => parseFloat(((+n) || 0).toFixed(8));
 
 /** Atomic, idempotent balance mutation for ANY coin.
- *  Returns { oldBal, newBal } or null on failure / insufficient funds. */
+ *  Returns { oldBal, newBal } or null on failure / insufficient funds.
+ *  For USDT it ALSO mirrors the confirmed value onto the legacy
+ *  `users/{fuid}/balance` node itself — immediately after the transaction
+ *  commits, with no other await in between — so no caller can ever forget
+ *  the legacy sync and the desync window is as small as physically possible. */
 async function mutateBalance(fuid, coin, delta) {
   if (!fuid || !coin) return null;
   const COIN = String(coin).toUpperCase();
@@ -99,66 +103,83 @@ async function mutateBalance(fuid, coin, delta) {
     return next;
   });
   if (!tx.committed) return null;
+  // Legacy mirror — single multi-path update, nothing awaited in between.
+  if (COIN === 'USDT') await writeLegacyUsdtMirror(fuid, outcome.newBal);
   return outcome;
 }
 
-/** Set a coin balance to an exact value (admin commands). */
+/** Set a coin balance to an exact value (admin commands).
+ *  Also mirrors USDT to the legacy node in the same operation. */
 async function setBalance(fuid, coin, value) {
   const COIN = String(coin).toUpperCase();
   const v = r8(value);
   const ref = db.ref(`users/${fuid}/balances/${COIN}`);
   const prev = (await ref.once('value')).val() || 0;
-  await ref.set(v);
+  if (COIN === 'USDT') {
+    // One atomic multi-path write for both nodes — they can never disagree.
+    await db.ref().update({
+      [`users/${fuid}/balances/USDT`]: v,
+      [`users/${fuid}/balance`]: v,
+    });
+  } else {
+    await ref.set(v);
+  }
   return { oldBal: r8(prev), newBal: v };
 }
-
-/** Push a unified-shape history entry. Returns the generated hid. */
-async function pushHistory(fuid, entry) {
-  const hid = entry.hid || `h_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-  const clean = {
-    hid,
-    ts: entry.ts || Date.now(),
-    date: nowIST(),
-    isoDate: new Date().toISOString(),
-    type: entry.type || 'UNKNOWN',
-    coin: (entry.coin || 'USDT').toUpperCase(),
-    amt: r8(entry.amt || 0),
-    status: entry.status || 'COMPLETED',
-    ...entry,
-  };
-  await db.ref(`users/${fuid}/history`).push(clean);
-  return hid;
+...
+/** Write the legacy `users/{fuid}/balance` mirror via a single multi-path
+ *  update. Idempotent — safe to call twice with the same value. */
+async function writeLegacyUsdtMirror(fuid, newBal) {
+  if (!fuid) return;
+  try {
+    await db.ref().update({ [`users/${fuid}/balance`]: r8(newBal || 0) });
+  } catch (e) { log('LEGACY', `mirror err ${e.message}`); }
 }
 
-/** Update a history row's status by its hid. */
-async function updateHistoryStatus(fuid, hid, status) {
-  if (!hid) return;
-  const snap = await db.ref(`users/${fuid}/history`).once('value');
-  if (!snap.exists()) return;
-  const updates = {};
-  snap.forEach(child => {
-    if (child.val()?.hid === hid) updates[`${child.key}/status`] = status;
-  });
-  if (Object.keys(updates).length) {
-    await db.ref(`users/${fuid}/history`).update(updates);
-  }
-}
-
-/** Keep legacy users/{fuid}/balance synced for old frontend screens. */
+/** Keep legacy users/{fuid}/balance synced for old frontend screens.
+ *  Kept for backwards-compatibility: idempotent and safe to call twice,
+ *  since mutateBalance/setBalance already sync USDT themselves. */
 async function syncLegacyUsdtBalance(fuid, coin, newBal) {
   if (!fuid || String(coin || '').toUpperCase() !== 'USDT') return;
-  await db.ref(`users/${fuid}/balance`).set(r8(newBal || 0));
+  await writeLegacyUsdtMirror(fuid, newBal);
 }
+
+/** Warn (once per read) when the two balance nodes disagree. */
+const LEGACY_EPS = 1e-6;
+function warnIfLegacyMismatch(uid, userVal) {
+  try {
+    if (!userVal) return;
+    const legacy = parseFloat(userVal.balance);
+    const usdt = parseFloat(userVal.balances?.USDT);
+    if (!Number.isFinite(legacy) || !Number.isFinite(usdt)) return;
+    if (Math.abs(legacy - usdt) > LEGACY_EPS) {
+      log('WARN', `legacy/balances mismatch for ${uid}: legacy=${legacy} vs balances.USDT=${usdt}`);
+    }
+  } catch (e) {}
+}
+
+/** fuids already known to be migrated — avoids re-checking on every event. */
+const MIGRATED_FUIDS = new Set();
 
 /** Lazy migration: legacy `balance` (USDT number) → `balances.USDT`. */
 async function migrateLegacyBalanceOnce(fuid, userVal) {
   try {
-    if (!userVal) return;
+    if (!userVal || !fuid) return;
+    if (MIGRATED_FUIDS.has(fuid)) return; // already confirmed — skip entirely
     const hasMap = userVal.balances && typeof userVal.balances === 'object';
     const hasLegacy = userVal.balance !== undefined && userVal.balance !== null;
+    if (hasMap && userVal.balances.USDT !== undefined) {
+      MIGRATED_FUIDS.add(fuid);
+      return;
+    }
     if (hasLegacy && (!hasMap || userVal.balances.USDT === undefined)) {
       const v = r8(userVal.balance);
-      await db.ref(`users/${fuid}/balances/USDT`).set(v);
+      // Both nodes written together so they start out in sync.
+      await db.ref().update({
+        [`users/${fuid}/balances/USDT`]: v,
+        [`users/${fuid}/balance`]: v,
+      });
+      MIGRATED_FUIDS.add(fuid);
       log('MIGRATE', `${fuid.slice(0,8)} legacy balance ${v} → balances.USDT`);
     }
   } catch (e) { log('MIGRATE', `err ${e.message}`); }
@@ -630,6 +651,7 @@ async function sendUserDetailCard(cb, uid) {
   if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
   const u = found.user;
   await migrateLegacyBalanceOnce(found.fuid, u);
+  warnIfLegacyMismatch(uid, u);
   const balances = u.balances || {};
   const balLines = Object.entries(balances)
     .filter(([,v]) => parseFloat(v) > 0)
@@ -884,6 +906,7 @@ async function handleBalances(uid) {
   const found = await findUserByUID(uid);
   if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
   await migrateLegacyBalanceOnce(found.fuid, found.user);
+  warnIfLegacyMismatch(uid, found.user);
   const bals = (await db.ref(`users/${found.fuid}/balances`).once('value')).val() || {};
   const lines = Object.entries(bals)
     .map(([c,v]) => ({ c, v: r8(v) }))
