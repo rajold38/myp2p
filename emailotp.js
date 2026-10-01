@@ -30,12 +30,29 @@ const hash = (c) => crypto.createHash('sha256').update(String(c)).digest('hex');
 const gen = () => String(crypto.randomInt(100000, 1000000));
 
 function mailHtml(code, purpose) {
-  const what = purpose === 'signup' ? 'create your BIEXC account' : 'sign in to BIEXC';
-  return `<div style="font-family:Arial,sans-serif;max-width:460px;margin:0 auto;padding:28px;background:#0b0d12;color:#f2f4f8;border-radius:16px">
-  <div style="font-size:22px;font-weight:800;color:#f7a600;letter-spacing:1px">BIEXC</div>
-  <p style="font-size:15px;line-height:1.5;margin:18px 0 8px">Use this code to ${what}:</p>
-  <div style="font-size:34px;font-weight:800;letter-spacing:10px;background:#141821;border:1px solid #262c3a;border-radius:12px;padding:16px;text-align:center;color:#fff">${code}</div>
-  <p style="font-size:13px;color:#8d94a6;line-height:1.5;margin-top:18px">The code expires in 10 minutes. Never share it with anyone — BIEXC staff will never ask for it. If you didn't request this, ignore this email.</p></div>`;
+  const isSignup = purpose === 'signup';
+  const title = isSignup ? 'Verify your email' : 'Confirm your sign in';
+  const preheader = isSignup ? 'Complete your BIEXC account setup.' : 'Use this secure code to sign in to BIEXC.';
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head>
+<body style="margin:0;padding:0;background:#f2f3f5;color:#15171a;font-family:Arial,Helvetica,sans-serif">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0">${preheader}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;background:#f2f3f5"><tr><td align="center" style="padding:32px 14px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;max-width:560px;background:#ffffff;border:1px solid #e2e4e8;border-radius:12px;overflow:hidden">
+<tr><td style="height:5px;background:#f5b51b;font-size:0">&nbsp;</td></tr>
+<tr><td style="padding:28px 32px 20px">
+<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="width:38px;height:38px;border-radius:8px;background:#f5b51b;text-align:center;font-size:19px;font-weight:900;color:#111111">B</td><td style="padding-left:10px;font-size:20px;font-weight:900;color:#111318;letter-spacing:1px">BIEXC</td></tr></table>
+<h1 style="font-size:25px;line-height:1.25;margin:28px 0 8px;color:#111318;font-weight:800">${title}</h1>
+<p style="font-size:15px;line-height:1.6;margin:0;color:#666d78">${isSignup ? 'Enter this one-time code to finish creating your account.' : 'Enter this one-time code to securely access your account.'}</p>
+</td></tr>
+<tr><td style="padding:0 32px"><div style="background:#111318;border-radius:10px;padding:22px 12px;text-align:center;color:#ffffff;font-size:34px;line-height:1;font-weight:800;letter-spacing:9px">${code}</div></td></tr>
+<tr><td style="padding:18px 32px 28px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fff8e5;border-left:3px solid #f5b51b;border-radius:6px"><tr><td style="padding:12px 14px;color:#5f5742;font-size:13px;line-height:1.55"><strong style="color:#2a261d">Valid for 10 minutes.</strong> Never share this code. BIEXC support will never ask for it.</td></tr></table>
+<p style="font-size:12px;line-height:1.6;color:#8a9099;margin:20px 0 0">If you did not request this, you can safely ignore this email. No changes will be made to your account.</p>
+</td></tr>
+<tr><td style="border-top:1px solid #eceef1;padding:18px 32px;color:#969ca5;font-size:11px;line-height:1.5">Security notification from BIEXC<br>Automated email — please do not reply.</td></tr>
+</table>
+</td></tr></table></body></html>`;
 }
 
 async function sendMail(to, code, purpose) {
