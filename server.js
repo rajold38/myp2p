@@ -29,6 +29,7 @@ import nodemailer from 'nodemailer';
 import * as WA from './whatsapp.js';
 import { mountOtp } from './otp.js';
 import { mountEmailOtp } from './emailotp.js';
+import { createReferral } from './referral.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -60,6 +61,7 @@ const log = (tag, msg) => console.log(`[${nowIST()} IST] [${tag}] ${msg}`);
 
 // ─── FIREBASE INIT (skipped if backend disabled) ────────────────────
 let db = null;
+let REF = null; // Refer & Earn engine (set up after Express starts)
 const TG_API          = `https://api.telegram.org/bot${TG_TOKEN}`;
 const BOT_START_TIME  = Date.now();
 const INSTANCE_ID     = `${BOT_START_TIME}_${Math.random().toString(36).slice(2,8)}`;
@@ -316,6 +318,7 @@ async function approveKyc(uid) {
   });
   await pushNotif(found.fuid, { title: 'KYC approved 🎉', body: 'Your identity is verified. All features are unlocked.', type: 'INFO' });
   log('KYC', `approved by admin UID=${uid}`);
+  if (REF) REF.evaluate(found.fuid).catch(() => {});
   await tgSend(ok('KYC APPROVED', [['👤 UID', `\`${uid}\``], ['📛 Name', found.user.name || '—']]),
     { reply_markup: { inline_keyboard: [[{ text: '👁 Open user', callback_data: `userdetail_${uid}` }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
 }
@@ -602,7 +605,7 @@ if (db) {
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
-
+    if (REF && v.referral?.by && !v.referral.rewarded) await REF.evaluate(snap.key).catch(e => log('ERR', `refer ${e.message}`));
   });
   db.ref('users').on('child_added', async (snap) => {
     if (!(await amIActive())) return;
@@ -650,6 +653,7 @@ async function handleApprove(fuid, type, req, cbId) {
   }
   if (result) await syncLegacyUsdtBalance(fuid, coin, result.newBal);
   await updateHistoryStatus(fuid, claimed.hid, 'COMPLETED');
+  if (type === 'dep' && REF) REF.onDeposit(fuid, coin, amt).catch(() => {});
   await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
   const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
   queueResolutionEmail({ type, action: 'approve', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
@@ -723,6 +727,7 @@ async function handleCallback(cb) {
   if (/^(join|ignore)_support_/.test(data)) return; // handled by iframe support overlay
   if ((m = data.match(/^userdetail_(.+)$/)))       return sendUserDetailCard(cb, m[1]);
   if ((m = data.match(/^(ban|unban)_(.+)$/)))      return handleBanCb(cb, m[1], m[2]);
+  if ((m = data.match(/^refs_(.+)$/)))             { await tgAnswer(cb.id, 'Loading…'); return sendUserReferrals(m[1]); }
   if ((m = data.match(/^history_(.+)$/)))          { await tgAnswer(cb.id, 'Loading…'); return sendUserHistory(m[1], 15); }
   if ((m = data.match(/^closep2p_(.+)$/)))         { await tgAnswer(cb.id, 'Closing…'); return closeAllP2PForUser(m[1]); }
   if ((m = data.match(/^(creditprompt|debitprompt)_(.+)$/))) { await tgAnswer(cb.id, '🪙'); return coinPicker(m[1] === 'creditprompt' ? 'credit' : 'debit', m[2]); }
@@ -898,6 +903,9 @@ async function sendUserDetailCard(cb, uid) {
     ['📱 Phone', u.phone || '—'],
     ['🔑 Status', u.banned ? '🚫 BANNED' : '✅ Active'],
     ['📝 KYC', kycInfo(u).label],
+    ['🎁 Refer code', u.refer?.code ? `\`${u.refer.code}\`` : '—'],
+    ['🤝 Referred by', u.referral?.by ? `\`${u.referral.byUid || '—'}\` ${u.referral.byName || ''}${u.referral.rewarded ? ' · paid ✅' : ''}` : '—'],
+    ['👥 Invited', `${Object.keys(u.refer?.invites || {}).length} · earned ${fmtNum(u.refer?.earned || 0)} USDT`],
     ['📅 Joined', u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'],
     '', '💰 *Balances*', ...(balLines.length ? balLines : ['   (empty)']),
     '', '📊 *Last 3 transactions*', ...(last3.length ? last3 : ['   (none)']),
@@ -909,7 +917,8 @@ async function sendUserDetailCard(cb, uid) {
      { text: '➖ Debit',  callback_data: `debitgo_${uid}` },
      { text: '🎯 Set bal', callback_data: `setbalgo_${uid}` }],
     [{ text: '💰 Balances', callback_data: `bal_${uid}` },
-     { text: '📋 History',  callback_data: `history_${uid}` }],
+     { text: '📋 History',  callback_data: `history_${uid}` },
+     { text: '🎁 Referrals', callback_data: `refs_${uid}` }],
     [ kd ? { text: '♻️ Reset KYC', callback_data: `kycrevoke_${uid}` }
          : { text: '✅ Approve KYC', callback_data: `kycok_${uid}` },
       { text: '💬 Message', callback_data: `msgprompt_${uid}` }],
@@ -922,6 +931,21 @@ async function sendUserDetailCard(cb, uid) {
      { text: '🏠 Menu',   callback_data: 'menu_home' }],
   ];
   await tgSend(card(`👤 USER — ${u.uid || uid}`, rows), { reply_markup: { inline_keyboard: buttons } });
+}
+
+async function sendUserReferrals(uid) {
+  const found = await findUserByUID(uid);
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
+  const u = found.user;
+  const inv = Object.values(u.refer?.invites || {}).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  const ico = { registered: '🆕', kyc: '🪪', deposited: '💵', rewarded: '✅', expired: '⌛' };
+  const lines = [`🎁 *REFERRALS — ${u.uid || uid}*`, '',
+    `🏷 Code: \`${u.refer?.code || '—'}\``,
+    `👥 Invited: *${inv.length}*  ·  ✅ Paid: *${inv.filter(i => i.status === 'rewarded').length}*`,
+    `💰 Earned: *${fmtNum(u.refer?.earned || 0)} USDT*`,
+    u.referral?.by ? `🤝 Referred by: \`${u.referral.byUid || '—'}\` ${u.referral.byName || ''} · deposit $${fmtNum(u.referral.depositUsd || 0)}${u.referral.rewarded ? ' · paid ✅' : ''}` : '🤝 Referred by: —',
+    '', ...(inv.length ? inv.slice(0, 25).map(i => `${ico[i.status] || '•'} \`${i.uid || '—'}\` ${i.name || ''} · ${i.status} · $${fmtNum(i.deposit || 0)}`) : ['(no invites yet)'])];
+  await tgSend(lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '👁 Open user', callback_data: `userdetail_${uid}` }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
 }
 
 async function sendUserHistory(uid, limit = 15) {
@@ -1937,6 +1961,10 @@ BIEXC — t.me/biexc10`
 // ─── WHATSAPP OTP LOGIN (QR page, /api/otp/send, /api/otp/verify) ───
 mountOtp(app, { admin, db, log, adminKey: process.env.WA_ADMIN_KEY || '' });
 mountEmailOtp(app, { admin, db, log });
+if (db) {
+  REF = createReferral({ admin, db, log, mutateBalance, pushHistory, pushNotif, tgSend });
+  REF.mount(app);
+}
 
 app.get('/*splat', (_req, res) => {
   if (fs.existsSync(INDEX_FILE)) return res.sendFile(INDEX_FILE);
