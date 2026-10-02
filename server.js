@@ -770,6 +770,23 @@ async function handleCallback(cb) {
   }
   // ── button dashboard ──────────────────────────────────────────────
   if (data === 'menu_home')    { await tgAnswer(cb.id, '🏠'); return sendMenu(); }
+  if (data === 'wa_panel')     { await tgAnswer(cb.id, '📱'); return sendWaPanel(); }
+  if (data === 'wa_qr')        { await tgAnswer(cb.id, '🔄 New QR…'); return sendWaQR(true); }
+  if (data === 'wa_test') {
+    const st = WA.status();
+    if (!st.linked) { await tgAnswer(cb.id, 'Not linked'); return sendWaPanel(); }
+    try { await WA.sendText(st.number, `✅ BIEXC test message — WhatsApp OTP is working (${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })})`); await tgAnswer(cb.id, '✅ Sent'); return tgSend('🧪 Test message sent to your own WhatsApp (check "Message yourself").'); }
+    catch (e) { await tgAnswer(cb.id, 'Failed'); return tgSend(`⚠️ Test failed: ${e.message}`); }
+  }
+  if (data === 'wa_unlinkask') {
+    await tgAnswer(cb.id, 'Confirm');
+    return tgSend('⚠️ Unlink WhatsApp? OTPs WhatsApp par jana band ho jayenge jab tak dobara link na karo.', { reply_markup: { inline_keyboard: [[{ text: '🔌 Yes, unlink', callback_data: 'wa_unlink' }, { text: '✖ Cancel', callback_data: 'askcancel' }]] } });
+  }
+  if (data === 'wa_unlink') {
+    await tgAnswer(cb.id, 'Unlinking…');
+    await WA.logout();
+    return tgSend('🔌 WhatsApp unlinked.', { reply_markup: { inline_keyboard: [[{ text: '📱 Link again (QR)', callback_data: 'wa_qr' }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
+  }
   if (data === 'menu_users')   { await tgAnswer(cb.id, '👥'); return handleUsersList(); }
   if (data === 'menu_stats')   { await tgAnswer(cb.id, '📊'); return handleStats(); }
   if (data === 'menu_pending') { await tgAnswer(cb.id, '⏳'); return handleTrades(); }
@@ -856,7 +873,94 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
+  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }],
 ] };
+
+// ════════════════════════════════════════════════════════════════════
+// WHATSAPP PANEL — /whatsapp : linked account, or a QR to link it
+// ════════════════════════════════════════════════════════════════════
+let WA_QR_MSG = null;         // message_id of the last QR photo we sent
+let WA_QR_SENT_AT = 0;
+const waAgo = (ts) => { if (!ts) return '—'; const m = Math.round((Date.now() - ts) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ${m % 60}m ago`; };
+const WA_LINKED_KB = { inline_keyboard: [
+  [{ text: '🧪 Send test message', callback_data: 'wa_test' }, { text: '↻ Refresh', callback_data: 'wa_panel' }],
+  [{ text: '🔌 Unlink WhatsApp', callback_data: 'wa_unlinkask' }],
+  [{ text: '🏠 Menu', callback_data: 'menu_home' }],
+] };
+const WA_QR_KB = { inline_keyboard: [
+  [{ text: '🔄 New QR', callback_data: 'wa_qr' }, { text: '↻ Check status', callback_data: 'wa_panel' }],
+  [{ text: '🏠 Menu', callback_data: 'menu_home' }],
+] };
+
+async function tgDeleteMsg(id) { if (id) await tgFetch('deleteMessage', { chat_id: TG_CHAT, message_id: id }); }
+
+async function tgSendPhotoBuf(buf, caption, reply_markup) {
+  try {
+    const fd = new FormData();
+    fd.append('chat_id', String(TG_CHAT));
+    fd.append('caption', caption.slice(0, 1024));
+    fd.append('parse_mode', 'Markdown');
+    if (reply_markup) fd.append('reply_markup', JSON.stringify(reply_markup));
+    fd.append('photo', new Blob([buf], { type: 'image/png' }), 'whatsapp-qr.png');
+    const r = await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!j.ok) log('WA', `sendPhoto failed: ${j.description}`);
+    return j;
+  } catch (e) { log('WA', `sendPhoto err: ${e.message}`); return { ok: false }; }
+}
+
+async function sendWaLinkedCard() {
+  const s = WA.status();
+  return tgSend(card('📱 WHATSAPP — LINKED ✅', [
+    ['📞 Number', s.number ? `+${s.number}` : '—'],
+    ['👤 Name', s.name || '—'],
+    ['🟢 Status', 'Connected'],
+    ['⏱ Connected', waAgo(s.linkedAt)],
+  ], 'OTP messages go out from this number. Session is saved — stays linked after restarts.'), { reply_markup: WA_LINKED_KB });
+}
+
+async function sendWaQR(force = false) {
+  if (!force && WA_QR_MSG && Date.now() - WA_QR_SENT_AT < 15_000) return;  // debounce
+  const wait = await tgSend('⏳ Preparing WhatsApp QR…');
+  const r = await WA.requestQR();
+  if (wait?.ok) await tgDeleteMsg(wait.result.message_id);
+  if (r.linked) return sendWaLinkedCard();
+  const buf = await WA.getQRBuffer();
+  if (!buf) return tgSend('⚠️ QR could not be created right now. Try again in a few seconds.', { reply_markup: WA_QR_KB });
+  await tgDeleteMsg(WA_QR_MSG);
+  const caption = '*📱 Link WhatsApp*\n\n' +
+    '1. Phone me WhatsApp kholo\n' +
+    '2. ⋮ (Settings) → *Linked devices* → *Link a device*\n' +
+    '3. Ye QR scan karo\n\n' +
+    '_QR ~20 sec me badalta hai — expire ho to_ 🔄 *New QR* _dabao._\n' +
+    'Link hote hi yahan ✅ message aayega.';
+  const j = await tgSendPhotoBuf(buf, caption, WA_QR_KB);
+  if (j.ok) { WA_QR_MSG = j.result.message_id; WA_QR_SENT_AT = Date.now(); }
+}
+
+async function sendWaPanel() {
+  const s = WA.status();
+  if (s.linked) return sendWaLinkedCard();
+  if (s.registered && (s.state === 'connecting' || s.state === 'offline')) {
+    return tgSend(card('📱 WHATSAPP — RECONNECTING ⏳', [
+      ['📞 Number', s.number ? `+${s.number}` : 'saved session'],
+      ['🔁 Status', 'Reconnecting (session kept, no QR needed)'],
+    ], 'Wait 10–30 sec, then tap Refresh.'), { reply_markup: { inline_keyboard: [[{ text: '↻ Refresh', callback_data: 'wa_panel' }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
+  }
+  return sendWaQR(true);
+}
+
+// live events from the engine → bot messages
+WA.onEvent(async (type, info) => {
+  if (type === 'linked') {
+    await tgDeleteMsg(WA_QR_MSG); WA_QR_MSG = null;
+    await tgSend(`✅ *WhatsApp linked!*\n📞 +${info.number || '—'}${info.name ? `  (${info.name})` : ''}\nAb ye logout nahi hoga — session saved hai.`, { reply_markup: WA_LINKED_KB });
+  } else if (type === 'loggedout') {
+    await tgSend('❌ *WhatsApp logged out* (phone se device hataya gaya). Dobara link karne ke liye QR lo 👇', { reply_markup: { inline_keyboard: [[{ text: '📱 Get QR', callback_data: 'wa_qr' }]] } });
+  } else if (type === 'replaced') {
+    log('WA', 'connection replaced by another instance — retrying');
+  }
+});
 
 /** Home dashboard — live numbers + buttons, no commands to remember. */
 async function sendMenu() {
@@ -1317,6 +1421,7 @@ async function handleUpdate(upd) {
 
   if (!text) return;
   if (/^\/(start|menu|help)\b/i.test(text)) { ASK = null; return sendMenu(); }
+  if (/^\/(whatsapp|wa)\b/i.test(text)) { ASK = null; return sendWaPanel(); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
     ['🔑 Instance', `\`${INSTANCE_ID}\``],
@@ -1975,9 +2080,15 @@ app.listen(PORT, () => log('HTTP', `🌐 Listening on :${PORT}`));
 
 // Start the WhatsApp session (persisted in Firebase → survives restarts)
 if (String(process.env.WA_ENABLED || 'true') !== 'false') {
-  WA.start(db).then(s => log('WA', `engine started (state=${s.state}) → open /api/wa/qr to link`))
+  WA.start(db).then(s => log('WA', `engine started (state=${s.state}) → send /whatsapp in Telegram to link`))
               .catch(e => log('WA', `engine failed: ${e.message}`));
 }
+
+// Telegram "/" command list
+tgFetch('setMyCommands', { commands: [
+  { command: 'menu', description: 'Admin dashboard' },
+  { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
+] }).catch(() => {});
 
 // Self-ping to keep Render free tier awake
 if (RENDER_URL) {
