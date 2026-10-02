@@ -77,12 +77,15 @@ function logoAsset() {
 
 function mailHtml(code, purpose, name, base) {
   const isSignup = purpose === 'signup';
-  const title = isSignup ? 'Verify your email address' : 'Confirm it\u2019s you';
-  const preheader = isSignup
+  const isReset = purpose === 'reset';
+  const title = isReset ? 'Reset your password' : isSignup ? 'Verify your email address' : 'Confirm it\u2019s you';
+  const preheader = isReset ? 'Use this code to set a new password for your BIEXC account.' : isSignup
     ? 'One quick step left \u2014 enter this code to finish creating your BIEXC account.'
     : 'A sign-in was requested for your account. Use this secure code to continue.';
   const greet = name ? `Hi ${name},` : 'Hello,';
-  const bodyLine = isSignup
+  const bodyLine = isReset
+    ? 'We received a request to reset the password of your BIEXC account. Enter the 6-digit code below in the app, then choose your new password.'
+    : isSignup
     ? 'You\u2019re just one step away from your new BIEXC account. Enter the 6-digit code below to verify this email address and finish signing up.'
     : 'We noticed a sign-in attempt to your BIEXC account. Enter the 6-digit code below to continue \u2014 this confirms it\u2019s really you.';
   const pair = String(code).replace(/(\d{3})(\d{3})/, '$1 $2');
@@ -139,7 +142,7 @@ ${copyBar}
 
     <!-- Body -->
     <tr><td style="padding:26px 32px 8px">
-      <div style="font-size:13px;font-weight:700;color:#c9930f;letter-spacing:2px;text-transform:uppercase;padding-bottom:8px">${isSignup ? 'Account verification' : 'Sign-in confirmation'}</div>
+      <div style="font-size:13px;font-weight:700;color:#c9930f;letter-spacing:2px;text-transform:uppercase;padding-bottom:8px">${isReset ? 'Password reset' : isSignup ? 'Account verification' : 'Sign-in confirmation'}</div>
       <h1 style="font-size:26px;line-height:1.25;margin:0 0 12px;color:#0b0d12;font-weight:800;font-family:Arial,Helvetica,sans-serif">${title}</h1>
       <p style="font-size:15px;line-height:1.65;margin:0;color:#5c6370;font-family:Arial,Helvetica,sans-serif">${greet} ${bodyLine}</p>
     </td></tr>
@@ -168,7 +171,7 @@ ${copyBar}
       </table>
     </td></tr>
     <tr><td style="padding:14px 32px 32px">
-      <p style="font-size:12px;line-height:1.6;color:#9aa0aa;margin:0;font-family:Arial,Helvetica,sans-serif">This code was sent because someone tried to ${isSignup ? 'create a BIEXC account' : 'sign in to a BIEXC account'} with this email address. If it was you, you\u2019re all set.</p>
+      <p style="font-size:12px;line-height:1.6;color:#9aa0aa;margin:0;font-family:Arial,Helvetica,sans-serif">This code was sent because someone tried to ${isReset ? 'reset the password of a BIEXC account' : isSignup ? 'create a BIEXC account' : 'sign in to a BIEXC account'} with this email address. If it was you, you\u2019re all set.</p>
     </td></tr>
 
     <!-- Footer (light) -->
@@ -257,7 +260,7 @@ async function sendMail(to, code, purpose, name) {
     body: JSON.stringify({
       from,
       to: [to],
-      subject: `${code} is your BIEXC verification code`,
+      subject: purpose === 'reset' ? `${code} is your BIEXC password reset code` : `${code} is your BIEXC verification code`,
       html: mailHtml(code, purpose, name, copyBase()),
       text: `${code} is your BIEXC verification code.\n\nIt expires in 10 minutes. Never share this code with anyone — BIEXC staff will never ask for it.\n\nIf you didn't request it, ignore this email.`,
       headers: { 'X-Entity-Ref-ID': `otp-${purpose}-${Date.now()}` },
@@ -367,6 +370,62 @@ export function mountEmailOtp(app, { admin, db, log = console.log }) {
       res.json({ ok: true, token });
     } catch (e) {
       L('verify error: ' + e.message);
+      res.json({ ok: false, error: 'verify_failed' });
+    }
+  });
+
+  // ── Forgot password: code by email (Resend) → set new password ─────
+  //   POST /api/password-reset/send    { email }                 -> { ok, waitSec }
+  //   POST /api/password-reset/confirm { email, code, password } -> { ok, token }
+  app.post('/api/password-reset/send', async (req, res) => {
+    try {
+      const email = normEmail(req.body?.email);
+      if (!okEmail(email)) return res.json({ ok: false, error: 'bad_email' });
+      const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+      const now = Date.now();
+      const hits = (ipHits.get(ip) || []).filter(t => now - t < 3600_000);
+      if (hits.length >= 20) return res.json({ ok: false, error: 'rate_limited' });
+      const user = await admin.auth().getUserByEmail(email).catch(() => null);
+      if (!user) return res.json({ ok: false, error: 'no_account' });
+      const key = email + '|reset';
+      const st = store.get(key) || { sent: [] };
+      if (st.lastSent && now - st.lastSent < RESEND_MS) return res.json({ ok: false, error: 'too_soon', waitSec: Math.ceil((RESEND_MS - (now - st.lastSent)) / 1000) });
+      st.sent = (st.sent || []).filter(t => now - t < 3600_000);
+      if (st.sent.length >= MAX_PER_HOUR) return res.json({ ok: false, error: 'rate_limited' });
+      const code = gen();
+      await sendMail(email, code, 'reset', user.displayName || '');
+      st.code = hash(code); st.exp = now + TTL; st.tries = 0; st.lastSent = now; st.sent.push(now);
+      store.set(key, st); hits.push(now); ipHits.set(ip, hits);
+      L(`reset code sent → ${email}`);
+      res.json({ ok: true, waitSec: RESEND_MS / 1000 });
+    } catch (e) {
+      L('reset send error: ' + e.message);
+      res.json({ ok: false, error: e.message === 'not_configured' ? 'not_configured' : 'send_failed' });
+    }
+  });
+
+  app.post('/api/password-reset/confirm', async (req, res) => {
+    try {
+      const email = normEmail(req.body?.email);
+      const code = String(req.body?.code || '').replace(/\D/g, '');
+      const password = String(req.body?.password || '');
+      if (password.length < 8 || password.length > 128) return res.json({ ok: false, error: 'weak_password' });
+      const key = email + '|reset';
+      const st = store.get(key);
+      if (!st || !st.code) return res.json({ ok: false, error: 'no_code' });
+      if (Date.now() > st.exp) { store.delete(key); return res.json({ ok: false, error: 'expired' }); }
+      if (st.tries >= MAX_TRIES) { store.delete(key); return res.json({ ok: false, error: 'too_many_tries' }); }
+      if (hash(code) !== st.code) { st.tries++; return res.json({ ok: false, error: 'invalid_code', left: MAX_TRIES - st.tries }); }
+      store.delete(key);
+      const user = await admin.auth().getUserByEmail(email);
+      await admin.auth().updateUser(user.uid, { password, emailVerified: true });
+      await admin.auth().revokeRefreshTokens(user.uid).catch(() => {});   // log out other devices
+      const token = await admin.auth().createCustomToken(user.uid, { login: 'password_reset' });
+      if (db) await db.ref(`users/${user.uid}`).update({ passwordChangedAt: Date.now(), lastLogin: Date.now() }).catch(() => {});
+      L(`password reset ✓ ${email}`);
+      res.json({ ok: true, token });
+    } catch (e) {
+      L('reset confirm error: ' + e.message);
       res.json({ ok: false, error: 'verify_failed' });
     }
   });
