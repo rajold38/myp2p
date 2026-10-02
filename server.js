@@ -459,7 +459,16 @@ async function beatInstanceLock() {
  * (previous instance died without releasing it — the old code slept forever
  * in that case, which is why the bot answered once and then went silent).
  */
+let _activeCache = { ok: true, at: 0 };
 async function amIActive() {
+  // Cached for 8s — this was a Firebase read on EVERY poll and EVERY user
+  // change, which added a full round-trip of latency to each button tap.
+  if (Date.now() - _activeCache.at < 8_000) return _activeCache.ok;
+  const ok = await amIActiveRaw();
+  _activeCache = { ok, at: Date.now() };
+  return ok;
+}
+async function amIActiveRaw() {
   let v = null;
   try { v = (await db.ref('botMeta/activeInstance').once('value')).val(); }
   catch (e) { return true; }                       // DB hiccup: keep polling
@@ -496,7 +505,68 @@ async function tgFetch(endpoint, body) {
 }
 const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'Markdown', ...extra });
 const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
-const tgAnswer = (cbId, text) => tgFetch('answerCallbackQuery', { callback_query_id: cbId, text });
+const tgAnswer = (cbId, text, alert = false) => tgFetch('answerCallbackQuery', { callback_query_id: cbId, text, show_alert: !!alert });
+
+// ════════════════════════════════════════════════════════════════════
+// ONE-TAP GUARD — an Approve / Reject button can work ONLY ONCE.
+// Layer 1: in-memory Map, set synchronously → a double tap that arrives
+//          in the same instant is blocked with zero delay.
+// Layer 2: Firebase transaction at botLocks/taps/{key} → survives restarts,
+//          redeploys and a second server instance.
+// The key is the request id (not the action), so Approve-then-Reject or
+// Reject-then-Approve on the same request is also blocked.
+// ════════════════════════════════════════════════════════════════════
+const TAP_DONE = new Map(); // key -> { action, ts }
+const tapKey = (s) => String(s).replace(/[.#$\[\]\/]/g, '_').slice(0, 200);
+async function claimTapOnce(rawKey, action) {
+  const k = tapKey(rawKey);
+  if (TAP_DONE.has(k)) return { ok: false, prev: TAP_DONE.get(k).action };
+  TAP_DONE.set(k, { action, ts: Date.now() });
+  if (TAP_DONE.size > 3000) {
+    const cutoff = Date.now() - 6 * 3600_000;
+    for (const [kk, v] of TAP_DONE) if (v.ts < cutoff) TAP_DONE.delete(kk);
+  }
+  if (!db) return { ok: true };
+  try {
+    let prev = null;
+    const tx = await db.ref(`botLocks/taps/${k}`).transaction(cur => {
+      if (cur) { prev = cur.action || 'done'; return; }   // already used → abort
+      return { action, ts: Date.now(), by: INSTANCE_ID };
+    });
+    if (!tx.committed) {
+      TAP_DONE.set(k, { action: prev || tx.snapshot?.val()?.action || 'done', ts: Date.now() });
+      return { ok: false, prev: prev || tx.snapshot?.val()?.action || 'done' };
+    }
+    return { ok: true };
+  } catch (e) {
+    log('TAP', `lock err ${e.message} — memory lock still active`);
+    return { ok: true };
+  }
+}
+/** Undo a tap lock — only used when processing failed BEFORE anything changed. */
+async function releaseTap(rawKey) {
+  const k = tapKey(rawKey);
+  TAP_DONE.delete(k);
+  try { if (db) await db.ref(`botLocks/taps/${k}`).remove(); } catch (e) {}
+}
+/** Swap the Approve/Reject buttons for a single status label — instantly. */
+function setCbButtons(cb, label) {
+  const msg = cb?.message; if (!msg?.message_id) return Promise.resolve();
+  return tgFetch('editMessageReplyMarkup', {
+    chat_id: msg.chat?.id || TG_CHAT, message_id: msg.message_id,
+    reply_markup: { inline_keyboard: [[{ text: label, callback_data: 'noop_done' }]] },
+  }).catch(() => {});
+}
+const doneWord = (a) => a === 'reject' ? 'REJECTED' : a === 'approve' ? 'APPROVED' : 'PROCESSED';
+/** Short memory-only debounce for buttons that are safe but noisy when double-tapped. */
+const TAP_DEBOUNCE = new Map();
+function debounceTap(key, ms = 8000) {
+  const t = TAP_DEBOUNCE.get(key);
+  if (t && Date.now() - t < ms) return false;
+  TAP_DEBOUNCE.set(key, Date.now());
+  if (TAP_DEBOUNCE.size > 500) for (const [k, v] of TAP_DEBOUNCE) if (Date.now() - v > 60_000) TAP_DEBOUNCE.delete(k);
+  return true;
+}
 
 async function tgSendButtons(text, cbId) {
   const r = await tgFetch('sendMessage', {
@@ -707,7 +777,7 @@ function fmtResolutionMsg(label, action, ctx, req) {
 // ════════════════════════════════════════════════════════════════════
 // CALLBACK ROUTER
 // ════════════════════════════════════════════════════════════════════
-async function handleCallback(cb) {
+async function handleCallback(cb, upd = null) {
   if (processedCbIds.has(cb.id)) { await tgAnswer(cb.id, '✓'); return; }
   rememberCb(cb.id);
 
@@ -720,10 +790,35 @@ async function handleCallback(cb) {
   const data = cb.data || '';
 
   let m;
-  if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3]);
-  // Trade/P2P callbacks (cbId starts with trade_) are handled by the iframe
-  // via the buffered /api/tg/getUpdates feed — leave them alone here.
-  if (/^(approve|reject)_trade_/.test(data)) return; // no tg-answer, iframe will
+  if (data === 'noop_done') { await tgAnswer(cb.id, '✔ Already done — nothing more to do.'); return; }
+  if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3], upd);
+  // Trade/P2P callbacks (cbId starts with trade_) are completed by the app
+  // via the buffered /api/tg/getUpdates feed. The server now makes sure only
+  // the FIRST tap ever reaches the app — every later tap is refused here.
+  if ((m = data.match(/^(approve|reject)_(trade_.+)$/))) {
+    const action = m[1], tradeCb = m[2];
+    if (action === 'approve') {
+      const owner = await findTradeOwner(tradeCb);
+      if (owner && !kycAllowsTrade(owner.user)) {
+        await tgAnswer(cb.id, `⛔ BLOCKED — UID ${owner.user.uid || '?'} has NOT completed KYC. You can only Reject this order.`, true);
+        log('TRADE', `approve blocked — no KYC UID=${owner.user.uid}`);
+        return;
+      }
+    }
+    const lock = await claimTapOnce(`cb_${tradeCb}`, action);
+    if (!lock.ok) {
+      await tgAnswer(cb.id, `⚠️ Already ${doneWord(lock.prev)} — this button works only once.`, true);
+      setCbButtons(cb, `${lock.prev === 'reject' ? '❌' : '✅'} ${doneWord(lock.prev)}`);
+      log('TAP', `blocked duplicate ${action} for ${tradeCb}`);
+      return;
+    }
+    // Instant feedback + kill the buttons before anything else.
+    tgAnswer(cb.id, action === 'approve' ? '✅ Approved — order completing' : '❌ Rejected');
+    setCbButtons(cb, action === 'approve' ? '✅ APPROVED' : '❌ REJECTED');
+    if (upd) pushRecentUpdate(upd);                  // hand it to the app — exactly once
+    log('TRADE', `${action} ${tradeCb} → forwarded once`);
+    return;
+  }
   if (/^(join|ignore)_support_/.test(data)) return; // handled by iframe support overlay
   if ((m = data.match(/^userdetail_(.+)$/)))       return sendUserDetailCard(cb, m[1]);
   if ((m = data.match(/^(ban|unban)_(.+)$/)))      return handleBanCb(cb, m[1], m[2]);
@@ -743,7 +838,11 @@ async function handleCallback(cb) {
     await tgSend(`✅ *ALL broadcasts cleared* — wiped from every user's notifications.`);
     return;
   }
-  if ((m = data.match(/^kycok_(.+)$/)))     { await tgAnswer(cb.id, '✅ Approving KYC…'); return approveKyc(m[1]); }
+  if ((m = data.match(/^kycview_(.+)$/)))   { await tgAnswer(cb.id, '🪪 Loading KYC…'); return sendKycDetails(m[1]); }
+  if ((m = data.match(/^kycok_(.+)$/)))     {
+    if (!debounceTap(`kycok_${m[1]}`, 15000)) { await tgAnswer(cb.id, '✔ Already approving — please wait'); return; }
+    await tgAnswer(cb.id, '✅ Approving KYC…'); setCbButtons(cb, '✅ KYC APPROVED'); return approveKyc(m[1]);
+  }
   if ((m = data.match(/^kycrevoke_(.+)$/))) {
     await tgAnswer(cb.id, 'Confirm');
     const id = newConfirm({ op: 'kycrevoke', uid: m[1] });
@@ -755,7 +854,10 @@ async function handleCallback(cb) {
     if (m[3] === '*') { ask('coin', { op: m[1], uid: m[2] }); return tgSend('⌨️ Type the coin symbol, e.g. `MATIC`', { reply_markup: cancelKb }); }
     return askAmount(m[1], m[2], m[3].toUpperCase());
   }
-  if ((m = data.match(/^cfm_(.+)$/)))       { await tgAnswer(cb.id, '⏳'); return runConfirm(m[1]); }
+  if ((m = data.match(/^cfm_(.+)$/)))       {
+    if (!CONFIRM.has(m[1])) { await tgAnswer(cb.id, '✔ Already done / expired'); setCbButtons(cb, '✔ DONE'); return; }
+    await tgAnswer(cb.id, '⏳ Working…'); setCbButtons(cb, '✔ DONE'); return runConfirm(m[1]);
+  }
   if (data === 'askcancel')                 { ASK = null; await tgAnswer(cb.id, 'Cancelled'); return tgSend('✖ Cancelled.', { reply_markup: MENU_KB }); }
   if ((m = data.match(/^banask_(.+)$/))) {
     await tgAnswer(cb.id, 'Confirm');
@@ -800,8 +902,37 @@ async function handleCallback(cb) {
 
 }
 
-async function handleApproveRejectCb(cb, action, cbId) {
-  await tgAnswer(cb.id, action === 'approve' ? '⏳ Approving…' : '⏳ Rejecting…');
+async function handleApproveRejectCb(cb, action, cbId, upd = null) {
+  const lock = await claimTapOnce(`cb_${cbId}`, action);
+  if (!lock.ok) {
+    await tgAnswer(cb.id, `⚠️ Already ${doneWord(lock.prev)} — this button works only once.`, true);
+    setCbButtons(cb, `${lock.prev === 'reject' ? '❌' : '✅'} ${doneWord(lock.prev)}`);
+    log('TAP', `blocked duplicate ${action} for ${cbId}`);
+    return;
+  }
+  // Instant reply + buttons removed straight away (no waiting for the DB).
+  tgAnswer(cb.id, action === 'approve' ? '✅ Approving…' : '❌ Rejecting…');
+  setCbButtons(cb, action === 'approve' ? '⏳ APPROVING…' : '⏳ REJECTING…');
+  try {
+    const done = await processApproveReject(cb, action, cbId);
+    if (upd) pushRecentUpdate(upd); // app updates its screen — once
+    if (!done) setCbButtons(cb, '✔ ALREADY HANDLED');
+  } catch (e) {
+    // Nothing is half-done here: claimPendingReq() is itself atomic, so it is
+    // safe to let the admin tap again after a crash/network error.
+    log('ERR', `approve/reject ${cbId}: ${e.message}`);
+    await releaseTap(`cb_${cbId}`);
+    await tgFetch('editMessageReplyMarkup', {
+      chat_id: cb.message?.chat?.id || TG_CHAT, message_id: cb.message?.message_id,
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ APPROVE', callback_data: `approve_${cbId}` },
+        { text: '❌ REJECT',  callback_data: `reject_${cbId}` }]] },
+    });
+    await tgSend(bad(`Could not finish that — please tap again. (${e.message})`));
+  }
+}
+
+async function processApproveReject(cb, action, cbId) {
   let ctx = sentByCbId.get(cbId);
   let req = null;
   if (!ctx) {
@@ -822,14 +953,16 @@ async function handleApproveRejectCb(cb, action, cbId) {
   } else {
     try { req = (await db.ref(`users/${ctx.fuid}/pendingReqs/${ctx.type}/${cbId}`).once('value')).val(); } catch (e) {}
   }
-  if (!ctx) { return; }
+  if (!ctx) { return false; }
 
   const handler = action === 'approve' ? handleApprove : handleReject;
   const r = await handler(ctx.fuid, ctx.type, req || ctx, cbId);
-  if (!r) { return; }
+  if (!r) { return false; }
   const label = ctx.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL';
-  if (ctx.msgId) await tgEdit(ctx.msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req));
+  const msgId = ctx.msgId || cb.message?.message_id;
+  if (msgId) await tgEdit(msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req));
   sentByCbId.delete(cbId);
+  return true;
 }
 
 async function handleBanCb(cb, action, uid) {
@@ -974,6 +1107,70 @@ async function sendMenu() {
   ], 'Tap a button 👇 — no commands needed'), { reply_markup: MENU_KB });
 }
 
+/** KYC rule for P2P: Level 2 approved, or Level 2 documents submitted. */
+function kycAllowsTrade(u) {
+  const k = u?.kycLevels || {};
+  return (k.level || 0) >= 2 || u?.kycStatus === 'APPROVED' || ((k.level || 0) >= 1 && k.l2status === 'PENDING');
+}
+/** cbId looks like trade_<orderId>_<ts> → find which user owns that order. */
+async function findTradeOwner(tradeCb) {
+  try {
+    const orderId = String(tradeCb).split('_')[1];
+    const snap = await db.ref('users').once('value');
+    let hit = null;
+    snap.forEach(c => {
+      if (hit) return;
+      const u = c.val() || {};
+      const chats = u.chats || {};
+      for (const [cid, st] of Object.entries(chats)) if (st?.cbId === tradeCb || cid === orderId) { hit = { fuid: c.key, user: u }; return; }
+      for (const [oid, o] of Object.entries(u.orders || {})) if (oid === orderId || String(o?.id) === orderId) { hit = { fuid: c.key, user: u }; return; }
+    });
+    return hit;
+  } catch (e) { log('TRADE', `owner lookup err ${e.message}`); return null; }
+}
+
+/** Full KYC + contact details for one user, with the Aadhaar/PAN photos. */
+async function sendKycDetails(uid) {
+  const found = await findUserByUID(uid);
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
+  const u = found.user, k = u.kycLevels || {}, b = k.basic || {}, d = k.docs || {};
+  const when = (t) => t ? new Date(t).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—';
+  const st = k.l2status === 'PENDING' ? '🟡 Submitted (review)' : (k.level || 0) >= 2 || u.kycStatus === 'APPROVED' ? '✅ Approved' : (k.level || 0) >= 1 ? '🔵 Only Level 1' : '⚪ Not started';
+  const mask = (x, keep = 4) => x ? String(x) : '—';
+  await tgSend(card(`🪪 KYC — ${u.uid || uid}`, [
+    ['📝 Status', st],
+    ['🛂 P2P allowed', kycAllowsTrade(u) ? '✅ Yes' : '⛔ No'],
+    '', '*Level 1 — personal*',
+    ['📛 Full name', b.name || '—'],
+    ['📱 Mobile', b.phone ? `+91 ${String(b.phone).replace(/^\+?91/, '')}` : (u.phone || '—')],
+    ['📧 Email', u.email || '—'],
+    ['🎂 DOB', b.dob || '—'],
+    ['💼 Profession', b.profession || '—'],
+    ['🏠 Address', b.address || '—'],
+    ['🏙 City / PIN', [b.city, b.pin].filter(Boolean).join(' · ') || '—'],
+    ['🗺 State', b.state || '—'],
+    ['🕐 L1 at', when(k.l1At || b.ts)],
+    '', '*Level 2 — documents*',
+    ['🆔 Aadhaar', d.aadhaar?.id ? mask(d.aadhaar.id) : (d.aadhaar ? 'photo only' : '—')],
+    ['🧾 PAN', d.pan?.id ? mask(d.pan.id) : (d.pan ? 'photo only' : '—')],
+    ['✔ Name match', [d.aadhaar?.nameMatch, d.pan?.nameMatch].filter(Boolean).join(' / ') || '—'],
+    ['🕐 L2 at', when(k.l2At)],
+    ['👮 Approved by', k.approvedBy ? `${k.approvedBy} · ${when(k.approvedAt)}` : '—'],
+  ]), { reply_markup: { inline_keyboard: [[
+    (k.level || 0) >= 2 || u.kycStatus === 'APPROVED'
+      ? { text: '♻️ Reset KYC', callback_data: `kycrevoke_${uid}` }
+      : { text: '✅ Approve KYC', callback_data: `kycok_${uid}` },
+    { text: '👤 Back to user', callback_data: `userdetail_${uid}` }]] } });
+  for (const [label, doc] of [['Aadhaar', d.aadhaar], ['PAN', d.pan]]) {
+    const img = doc?.img;
+    if (typeof img !== 'string' || !img.startsWith('data:image')) continue;
+    try {
+      const buf = Buffer.from(img.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+      await tgSendPhotoBuf(buf, `🪪 ${label} — ${b.name || u.name || ''} (${u.uid || uid})`);
+    } catch (e) { log('KYC', `photo err ${e.message}`); }
+  }
+}
+
 async function sendUserDetailCard(cb, uid) {
   if (cb?.id) await tgAnswer(cb.id, 'Loading…');
   const found = await findUserByUID(uid);
@@ -1026,6 +1223,8 @@ async function sendUserDetailCard(cb, uid) {
     [ kd ? { text: '♻️ Reset KYC', callback_data: `kycrevoke_${uid}` }
          : { text: '✅ Approve KYC', callback_data: `kycok_${uid}` },
       { text: '💬 Message', callback_data: `msgprompt_${uid}` }],
+    [{ text: '🪪 KYC details', callback_data: `kycview_${uid}` },
+     { text: '📞 Contact info', callback_data: `kycview_${uid}` }],
     [ u.banned
         ? { text: '✅ Unban', callback_data: `unban_${uid}` }
         : { text: '🚫 Ban',   callback_data: `banask_${uid}` },
@@ -1412,7 +1611,7 @@ async function handleBroadClearAll() {
 // UPDATE / MESSAGE HANDLER
 // ════════════════════════════════════════════════════════════════════
 async function handleUpdate(upd) {
-  if (upd.callback_query) return handleCallback(upd.callback_query);
+  if (upd.callback_query) return handleCallback(upd.callback_query, upd);
   const msg = upd.message;
   if (!msg) return;
   const chatId = String(msg.chat.id);
@@ -1443,6 +1642,10 @@ async function handleUpdate(upd) {
 // ════════════════════════════════════════════════════════════════════
 let lastUpdateId = 0;
 let lastPollOkAt = Date.now();
+let lastBeatAt = 0;
+/** Approve/Reject taps are handed to the app only AFTER the one-tap guard
+ *  accepts them (see handleCallback) — never straight from the poll loop. */
+const isGuardedTap = (upd) => /^(approve|reject)_(dep_|wit_|trade_)/.test(upd?.callback_query?.data || '');
 let pollFailStreak = 0;
 
 /** A webhook and getUpdates cannot coexist: Telegram then answers every
@@ -1461,7 +1664,7 @@ async function pollUpdates() {
       await new Promise(r => setTimeout(r, 15_000));
       return;
     }
-    await beatInstanceLock();
+    if (Date.now() - lastBeatAt > 20_000) { lastBeatAt = Date.now(); beatInstanceLock(); }
     const res = await fetch(`${TG_API}/getUpdates?offset=${lastUpdateId + 1}&timeout=25&allowed_updates=${encodeURIComponent('["callback_query","message"]')}`);
     const data = await res.json().catch(() => null);
 
@@ -1485,10 +1688,14 @@ async function pollUpdates() {
 
     pollFailStreak = 0;
     lastPollOkAt = Date.now();
-    for (const upd of (data.result || [])) {
-      lastUpdateId = upd.update_id;
-      await saveLastUpdateId(lastUpdateId).catch(()=>{});
-      pushRecentUpdate(upd);
+    const batch = data.result || [];
+    if (batch.length) {
+      // One offset write per batch (was one awaited write per update).
+      lastUpdateId = batch[batch.length - 1].update_id;
+      saveLastUpdateId(lastUpdateId).catch(() => {});
+    }
+    for (const upd of batch) {
+      if (!isGuardedTap(upd)) pushRecentUpdate(upd);
       try { await handleUpdate(upd); } catch (e) { log('ERR', `handleUpdate: ${e.message}`); }
     }
   } catch (e) {
@@ -1501,7 +1708,7 @@ async function pollUpdates() {
 async function pollLoop() {
   while (true) {
     await pollUpdates();
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 40));
   }
 }
 
