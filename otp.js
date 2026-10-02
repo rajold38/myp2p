@@ -84,13 +84,29 @@ export function mountOtp(app, { admin, db, log = console.log, adminKey = '' }) {
       store.delete(phone);
 
       const e164 = '+' + phone;
-      let user;
-      try { user = await admin.auth().getUserByPhoneNumber(e164); }
-      catch {
+      let user = await admin.auth().getUserByPhoneNumber(e164).catch(() => null);
+      // Same person may already have an email account with this phone saved
+      // (KYC / profile) → log into THAT account instead of creating a new one.
+      if (!user && db) {
+        try {
+          const variants = [e164, phone, phone.slice(-10)];
+          for (const v of variants) {
+            const snap = await db.ref('users').orderByChild('phone').equalTo(v).limitToFirst(1).get();
+            if (snap.exists()) {
+              const uid = Object.keys(snap.val())[0];
+              user = await admin.auth().getUser(uid).catch(() => null);
+              if (user && !user.phoneNumber) await admin.auth().updateUser(uid, { phoneNumber: e164 }).catch(() => {});
+              if (user) break;
+            }
+          }
+        } catch (e) { L(`phone lookup skipped: ${e.message}`); }
+      }
+      if (!user) {
         user = await admin.auth().createUser({
           phoneNumber: e164,
           displayName: name || `User ${phone.slice(-4)}`
         });
+        L(`new account via WhatsApp +${phone}`);
       }
       if (name && !user.displayName) {
         await admin.auth().updateUser(user.uid, { displayName: name }).catch(() => {});
