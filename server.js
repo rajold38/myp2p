@@ -242,26 +242,39 @@ async function migrateLegacyBalanceOnce(fuid, userVal) {
   } catch (e) { log('MIGRATE', `err ${e.message}`); }
 }
 
-/** Look up a user by their short UID. */
+/** Shown UID for any user (old accounts may have no `uid` field). */
+const shownUID = (fuid, u) => String(u?.uid || String(fuid).slice(0, 8)).toUpperCase();
+/** Find a user by short UID, full Firebase id, its first 8 chars, email or phone. */
 async function findUserByUID(uid) {
-  if (!uid) return null;
-  const U = String(uid).toUpperCase();
+  if (uid == null) return null;
+  const raw = String(uid).trim().replace(/^`+|`+$/g, '');
+  if (!raw) return null;
+  const U = raw.toUpperCase();
   try {
-    const snap = await db.ref('users').orderByChild('uid').equalTo(U).once('value');
-    if (snap.exists()) {
-      const val = snap.val();
-      const fuid = Object.keys(val)[0];
-      return { fuid, user: val[fuid] };
+    for (const v of [U, raw]) {
+      const snap = await db.ref('users').orderByChild('uid').equalTo(v).once('value');
+      if (snap.exists()) { const val = snap.val(); const fuid = Object.keys(val)[0]; return { fuid, user: val[fuid] }; }
+    }
+  } catch (e) {}
+  try {
+    if (/^[A-Za-z0-9_-]{20,40}$/.test(raw)) {
+      const d = await db.ref(`users/${raw}`).once('value');
+      if (d.exists()) return { fuid: raw, user: d.val() };
     }
   } catch (e) {}
   const all = await db.ref('users').once('value');
-  let result = null;
+  const digits = raw.replace(/\D/g, '');
+  let exact = null, loose = null;
   all.forEach(child => {
-    if (String(child.val()?.uid || '').toUpperCase() === U) {
-      result = { fuid: child.key, user: child.val() };
-    }
+    const u = child.val() || {}; const k = child.key;
+    if (String(u.uid || '').toUpperCase() === U || k === raw) { exact = exact || { fuid: k, user: u }; return; }
+    if (!loose && (
+      shownUID(k, u) === U ||
+      (raw.includes('@') && String(u.email || '').toLowerCase() === raw.toLowerCase()) ||
+      (digits.length >= 10 && [u.phone, u.kycLevels?.basic?.phone].some(p => String(p || '').replace(/\D/g, '').endsWith(digits.slice(-10))))
+    )) loose = { fuid: k, user: u };
   });
-  return result;
+  return exact || loose;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -373,9 +386,10 @@ async function sendSearchResults(q) {
   const snap = await db.ref('users').once('value');
   const hits = [];
   snap.forEach(c => {
-    const u = c.val() || {}; if (!u.uid) return;
-    const hay = `${u.name || ''} ${u.email || ''} ${u.phone || ''} ${u.kycLevels?.basic?.name || ''} ${u.uid}`.toLowerCase();
-    if (hay.includes(Q)) hits.push(u);
+    const u = c.val(); if (!u || typeof u !== 'object') return;
+    const id = shownUID(c.key, u);
+    const hay = `${u.name || ''} ${u.email || ''} ${u.phone || ''} ${u.kycLevels?.basic?.name || ''} ${u.kycLevels?.basic?.phone || ''} ${id} ${c.key}`.toLowerCase();
+    if (hay.includes(Q)) hits.push({ ...u, uid: id });
   });
   if (!hits.length) {
     await tgSend(bad(`No user matches “${q}”.`), { reply_markup: { inline_keyboard: [[{ text: '🔎 Search again', callback_data: 'menu_search' }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
@@ -391,7 +405,8 @@ async function sendSearchResults(q) {
 async function handleAskReply(text) {
   const a = ASK; ASK = null;
   if (a.kind === 'uid') {
-    const uid = text.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    const t = text.trim();
+    const uid = t.includes('@') ? t : t.replace(/[^A-Za-z0-9_-]/g, '');
     if (!uid) { ask('uid'); return tgSend(bad('Send a valid UID, e.g. `AB12CD`'), { reply_markup: cancelKb }); }
     return sendUserDetailCard(null, uid);
   }
@@ -498,7 +513,16 @@ async function tgFetch(endpoint, body) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    const data = await r.json();
+    let data = await r.json();
+    // A name/email with _ * ` [ breaks Markdown → Telegram refuses the whole
+    // message (that is why some user cards never appeared). Retry as plain text.
+    if (!data.ok && body && body.parse_mode && /parse entities|can't find end/i.test(data.description || '')) {
+      const plain = { ...body }; delete plain.parse_mode;
+      if (typeof plain.text === 'string') plain.text = plain.text.replace(/[*`]/g, '');
+      if (typeof plain.caption === 'string') plain.caption = plain.caption.replace(/[*`]/g, '');
+      const r2 = await fetch(`${TG_API}/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(plain) });
+      data = await r2.json();
+    }
     if (!data.ok) log('TG', `${endpoint} failed: ${data.description || JSON.stringify(data)}`);
     return data;
   } catch (e) { log('TG', `fetch err ${endpoint}: ${e.message}`); return { ok: false, error: e.message }; }
@@ -1174,7 +1198,8 @@ async function sendKycDetails(uid) {
 async function sendUserDetailCard(cb, uid) {
   if (cb?.id) await tgAnswer(cb.id, 'Loading…');
   const found = await findUserByUID(uid);
-  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`)); return; }
+  if (!found) { await tgSend(bad(`UID \`${uid}\` not found.`), { reply_markup: { inline_keyboard: [[{ text: '🔎 Search by name', callback_data: 'menu_search' }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } }); return; }
+  uid = shownUID(found.fuid, found.user);
   const u = found.user;
   await migrateLegacyBalanceOnce(found.fuid, u);
   warnIfLegacyMismatch(uid, u);
@@ -1273,7 +1298,7 @@ async function sendUserHistory(uid, limit = 15) {
 async function handleUsersList() {
   const snap = await db.ref('users').once('value');
   const users = [];
-  snap.forEach(c => { const u = c.val(); if (u && u.uid) users.push(u); });
+  snap.forEach(c => { const u = c.val(); if (u && typeof u === 'object') users.push({ ...u, uid: shownUID(c.key, u) }); });
   if (!users.length) { await tgSend(bad('No users yet.')); return; }
   users.sort((a, b) => r8((b.balances || {}).USDT || b.balance || 0) - r8((a.balances || {}).USDT || a.balance || 0));
   await tgSend(card('👥 ALL USERS', [['Total', users.length], ['Sorted by', 'USDT balance']]));
@@ -1628,9 +1653,9 @@ async function handleUpdate(upd) {
   if (ASK && Date.now() - ASK.ts < ASK_TTL && !text.startsWith('/')) return handleAskReply(text);
   ASK = null;
   // Typed a UID on its own → open that user straight away
-  if (/^[A-Z0-9]{4,15}$/i.test(text) && /\d/.test(text)) {
-    const f = await findUserByUID(text.toUpperCase());
-    if (f) return sendUserDetailCard(null, text.toUpperCase());
+  if (/^[A-Za-z0-9_@.+-]{4,40}$/.test(text)) {
+    const f = await findUserByUID(text);
+    if (f) return sendUserDetailCard(null, shownUID(f.fuid, f.user));
   }
   // Anything else → treat as a name search, then show the dashboard buttons
   if (!text.startsWith('/') && text.length >= 2) return sendSearchResults(text.slice(0, 60));
