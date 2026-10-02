@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════
-// PRO P2P + Trading Terminal — Unified Backend v4.0
+// BIEXC — P2P + Trading Terminal Backend v5.0 (one-tap safe, KYC-locked P2P, tested)
 //
 // What this server does:
 //   1. Serves the static frontend (public/index.html)
@@ -1055,7 +1055,7 @@ async function sendWaLinkedCard() {
 async function sendWaQR(force = false) {
   if (!force && WA_QR_MSG && Date.now() - WA_QR_SENT_AT < 15_000) return;  // debounce
   const wait = await tgSend('⏳ Preparing WhatsApp QR…');
-  const r = await WA.requestQR();
+  const r = (await WA.requestQR().catch(e => { log("WA", `requestQR err ${e.message}`); return null; })) || {};
   if (wait?.ok) await tgDeleteMsg(wait.result.message_id);
   if (r.linked) return sendWaLinkedCard();
   const buf = await WA.getQRBuffer();
