@@ -297,19 +297,26 @@ async function maybeForwardKycSubmission(fuid, user) {
   if (!k || k.l2status !== 'PENDING') return;
   const key = `${fuid}_${k.l2At || 0}`;
   if (kycSentFor.has(key)) return;
-  if (k.l2At && k.l2At < BOT_START_TIME - 60_000) { kycSentFor.add(key); return; }
   kycSentFor.add(key);
-  const b = k.basic || {};
+  // Auto-approve: documents already passed the name check in the app.
+  const now = Date.now();
+  await db.ref(`users/${fuid}`).update({
+    'kycLevels/level': 2, 'kycLevels/l2status': 'APPROVED', 'kycLevels/approvedBy': 'AUTO', 'kycLevels/approvedAt': now,
+    kycStatus: 'APPROVED', kycRequired: false, kycApprovedAt: now,
+  });
+  if (REF) REF.evaluate(fuid).catch(() => {});
+  if (k.l2At && k.l2At < BOT_START_TIME - 60_000) return; // old submission → approve quietly
+  const bb = k.basic || {};
   const uid = user.uid || fuid.slice(0, 8);
-  await tgSend(card('📝 NEW KYC SUBMITTED', [
+  await tgSend(card('✅ KYC AUTO-APPROVED', [
     ['👤 UID', `\`${uid}\``],
-    ['📛 Name', b.name || user.name || '—'],
-    ['📱 Mobile', b.phone || '—'],
-    ['🎂 DOB', b.dob || '—'],
-    ['💼 Profession', b.profession || '—'],
-    ['🏠 Address', [b.address, b.city, b.state, b.pin].filter(Boolean).join(', ') || '—'],
+    ['📛 Name', bb.name || user.name || '—'],
+    ['📱 Mobile', bb.phone || '—'],
+    ['🎂 DOB', bb.dob || '—'],
+    ['💼 Profession', bb.profession || '—'],
+    ['🏠 Address', [bb.address, bb.city, bb.state, bb.pin].filter(Boolean).join(', ') || '—'],
   ]), { reply_markup: { inline_keyboard: [[
-    { text: '✅ Approve KYC', callback_data: `kycok_${uid}` },
+    { text: '🪪 KYC details', callback_data: `kycview_${uid}` },
     { text: '👁 Open user', callback_data: `userdetail_${uid}` },
   ]] } });
 }
@@ -710,23 +717,35 @@ async function bonusClaim(fuid, fn) {
   const tx = await db.ref(`users/${fuid}/bonus`).transaction(cur => { res = null; const b = cur || {}; const o = fn(b); if (!o) return; res = o.res; return o.b; });
   return tx.committed ? res : null;
 }
+async function bonusCountAction(fuid, id) {
+  const key = String(id).replace(/[.#$\[\]\/]/g, '_').slice(0, 80);
+  await bonusClaim(fuid, x => {
+    if (!x.welcomeGranted || x.welcomeStatus !== 'LOCKED') return null;
+    x.trades = x.trades || {}; if (x.trades[key]) return null;
+    x.trades[key] = Date.now(); x.tradesCompleted = (x.tradesCompleted || 0) + 1;
+    x.log = x.log || {}; x.log[`l${Date.now()}d`] = { type: 'TRADE', text: `Deposit approved (${Math.min(x.tradesCompleted, BONUS_TRADES)}/${BONUS_TRADES})`, ts: Date.now() };
+    return { b: x, res: true };
+  }).catch(() => {});
+}
 async function evaluateBonus(fuid, v) {
   if (!v || bonusBusy.has(fuid)) return;
   const b = v.bonus || {};
   const kycDone = (v.kycLevels?.level || 0) >= 2 || v.kycStatus === 'APPROVED';
-  const wantKyc = kycDone && !b.kycGranted;
+  const BONUS_START = Date.UTC(2026, 9, 3);
+  const kycAt = v.kycApprovedAt || v.kycLevels?.approvedAt || v.kycLevels?.l2At || 0;
+  const wantKyc = kycDone && !b.welcomeGranted && (v.createdAt >= BONUS_START || kycAt >= BONUS_START);
   const wantUnlock = b.welcomeGranted && b.welcomeStatus === 'LOCKED' && (b.tradesCompleted || 0) >= BONUS_TRADES;
   if (!wantKyc && !wantUnlock) return;
   bonusBusy.add(fuid);
   try {
     if (wantKyc) {
-      const amt = await bonusClaim(fuid, x => {
-        if (x.kycGranted) return null;
-        x.kycGranted = true; x.kycAmt = BONUS_KYC; x.kycAt = Date.now(); x.kycBy = 'server';
-        x.log = x.log || {}; x.log[`l${Date.now()}k`] = { type: 'KYC', text: `$${BONUS_KYC} KYC Bonus added to main balance`, ts: Date.now() };
-        return { b: x, res: BONUS_KYC };
+      const ok2 = await bonusClaim(fuid, x => {
+        if (x.welcomeGranted) return null;
+        x.welcomeGranted = true; x.welcomeAmt = BONUS_KYC; x.welcomeStatus = 'LOCKED'; x.welcomeAt = Date.now(); x.tradesCompleted = x.tradesCompleted || 0;
+        x.log = x.log || {}; x.log[`l${Date.now()}g`] = { type: 'GRANTED', text: `$${BONUS_KYC} KYC Bonus received (locked)`, ts: Date.now() };
+        return { b: x, res: true };
       });
-      if (amt) { await bonusCredit(fuid, amt, 'KYC_BONUS', 'KYC Bonus'); log('BONUS', `KYC +${amt} ${v.uid || fuid}`); await tgSend(`🎁 KYC bonus +${amt} USDT → \`${v.uid || fuid.slice(0, 8)}\``).catch(() => {}); }
+      if (ok2) log('BONUS', `KYC bonus locked ${v.uid || fuid}`);
     }
     if (wantUnlock) {
       const amt = await bonusClaim(fuid, x => {
@@ -799,6 +818,7 @@ async function handleApprove(fuid, type, req, cbId) {
   if (result) await syncLegacyUsdtBalance(fuid, coin, result.newBal);
   await updateHistoryStatus(fuid, claimed.hid, 'COMPLETED');
   if (type === 'dep' && REF) REF.onDeposit(fuid, coin, amt).catch(() => {});
+  if (type === 'dep') await bonusCountAction(fuid, `dep_${cbId}`);
   await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
   const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
   queueResolutionEmail({ type, action: 'approve', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
