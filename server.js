@@ -692,6 +692,55 @@ async function processPendingMap(fuid, data, cutoff = 0) {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// BONUS — $10 KYC bonus (main balance) + $10 welcome bonus unlock after 3 trades.
+// Same single claim point as the app (users/{fuid}/bonus transaction) → paid once.
+// ════════════════════════════════════════════════════════════════════
+const BONUS_KYC = parseFloat(process.env.BONUS_KYC || '10');
+const BONUS_TRADES = parseInt(process.env.BONUS_TRADES || '3', 10);
+const bonusBusy = new Set();
+async function bonusCredit(fuid, amt, type, note) {
+  const tr = await db.ref(`users/${fuid}/balances/USDT`).transaction(c => Math.round(((parseFloat(c) || 0) + amt) * 1e8) / 1e8);
+  if (tr.committed) await db.ref(`users/${fuid}/balance`).set(parseFloat(tr.snapshot.val()) || 0).catch(() => {});
+  const hid = `h_bonus_${type.toLowerCase()}_${Date.now()}`;
+  await db.ref(`users/${fuid}/history/${hid}`).set({ hid, ts: Date.now(), type, coin: 'USDT', amt, status: 'COMPLETED', note }).catch(() => {});
+}
+async function bonusClaim(fuid, fn) {
+  let res = null;
+  const tx = await db.ref(`users/${fuid}/bonus`).transaction(cur => { res = null; const b = cur || {}; const o = fn(b); if (!o) return; res = o.res; return o.b; });
+  return tx.committed ? res : null;
+}
+async function evaluateBonus(fuid, v) {
+  if (!v || bonusBusy.has(fuid)) return;
+  const b = v.bonus || {};
+  const kycDone = (v.kycLevels?.level || 0) >= 2 || v.kycStatus === 'APPROVED';
+  const wantKyc = kycDone && !b.kycGranted;
+  const wantUnlock = b.welcomeGranted && b.welcomeStatus === 'LOCKED' && (b.tradesCompleted || 0) >= BONUS_TRADES;
+  if (!wantKyc && !wantUnlock) return;
+  bonusBusy.add(fuid);
+  try {
+    if (wantKyc) {
+      const amt = await bonusClaim(fuid, x => {
+        if (x.kycGranted) return null;
+        x.kycGranted = true; x.kycAmt = BONUS_KYC; x.kycAt = Date.now(); x.kycBy = 'server';
+        x.log = x.log || {}; x.log[`l${Date.now()}k`] = { type: 'KYC', text: `$${BONUS_KYC} KYC Bonus added to main balance`, ts: Date.now() };
+        return { b: x, res: BONUS_KYC };
+      });
+      if (amt) { await bonusCredit(fuid, amt, 'KYC_BONUS', 'KYC Bonus'); log('BONUS', `KYC +${amt} ${v.uid || fuid}`); await tgSend(`🎁 KYC bonus +${amt} USDT → \`${v.uid || fuid.slice(0, 8)}\``).catch(() => {}); }
+    }
+    if (wantUnlock) {
+      const amt = await bonusClaim(fuid, x => {
+        if (!x.welcomeGranted || x.welcomeStatus !== 'LOCKED' || (x.tradesCompleted || 0) < BONUS_TRADES) return null;
+        x.welcomeStatus = 'UNLOCKED'; x.unlockedAt = Date.now(); x.unlockedBy = 'server';
+        x.log = x.log || {}; x.log[`l${Date.now()}u`] = { type: 'UNLOCKED', text: `Unlocked — $${x.welcomeAmt || 10} moved to main balance`, ts: Date.now() };
+        return { b: x, res: x.welcomeAmt || 10 };
+      });
+      if (amt) { await bonusCredit(fuid, amt, 'WELCOME_BONUS', `Welcome Bonus unlocked after ${BONUS_TRADES} trades`); log('BONUS', `welcome unlock +${amt} ${v.uid || fuid}`); }
+    }
+  } catch (e) { log('BONUS', `err ${e.message}`); }
+  finally { bonusBusy.delete(fuid); }
+}
+
 if (db) {
   db.ref('users').on('child_changed', async (snap) => {
     if (!(await amIActive())) return;
@@ -700,6 +749,7 @@ if (db) {
     await processPendingMap(snap.key, v);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
     if (REF && v.referral?.by && !v.referral.rewarded) await REF.evaluate(snap.key).catch(e => log('ERR', `refer ${e.message}`));
+    await evaluateBonus(snap.key, v);
   });
   db.ref('users').on('child_added', async (snap) => {
     if (!(await amIActive())) return;
@@ -708,6 +758,7 @@ if (db) {
     await processPendingMap(snap.key, v, BOT_START_TIME - 10_000);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
     await alertNewUser(snap.key, v).catch(e => log('ERR', `newuser ${e.message}`));
+    await evaluateBonus(snap.key, v);
   });
 }
 
