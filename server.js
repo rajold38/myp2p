@@ -868,16 +868,14 @@ async function supProcess(fuid) {
 async function supAgentMsg(fuid, m) {
   await supPush(fuid, { from: 'agent', ...m });
   await supRef(fuid, 'meta').update({ lastAgentAt: Date.now() });
-  pushNotif(fuid, { title: '🎧 BIEXC Support replied', body: m.text ? String(m.text).slice(0, 90) : '📷 Photo', type: 'SUPPORT' }).catch(() => {});
 }
 async function handleSupCb(cb, act, fuid) {
   if (!db) return tgAnswer(cb.id, 'Backend offline');
   const lite = await supLite(fuid);
   if (act === 'acc') {
-    const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'live'; c.acceptedAt = Date.now(); c.agent = 'BIEXC Support'; return c; });
+    const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'live'; c.acceptedAt = Date.now(); c.agent = 'Elina · BIEXC Support'; c.agentAvatar = 'elina'; return c; });
     if (!t.committed) return tgAnswer(cb.id, 'Already handled ✔', true);
     await supPush(fuid, { from: 'sys', text: 'A support agent has joined the chat ✅' });
-    pushNotif(fuid, { title: '🎧 Agent connected', body: 'A BIEXC support agent has joined your chat.', type: 'SUPPORT' }).catch(() => {});
     await supSetActive(fuid);
     await tgAnswer(cb.id, '✅ Connected');
     if (cb.message?.message_id) await tgFetch('editMessageReplyMarkup', { chat_id: TG_CHAT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Accepted — chatting now', callback_data: 'noop_done' }]] } });
