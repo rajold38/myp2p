@@ -31,6 +31,7 @@ import { mountOtp } from './otp.js';
 import { mountEmailOtp } from './emailotp.js';
 import { createReferral } from './referral.js';
 import fs from 'fs';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -760,10 +761,260 @@ async function evaluateBonus(fuid, v) {
   finally { bonusBusy.delete(fuid); }
 }
 
+
+// ════════════════════════════════════════════════════════════════════
+// UID — every account gets a short UID (KYC or not). Runs for every
+// existing user at boot (child_added) and for every new sign-up.
+// ════════════════════════════════════════════════════════════════════
+const UID_CH = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const UID_DONE = new Set();
+async function ensureUid(fuid, v) {
+  if (!db || !fuid || UID_DONE.has(fuid)) return;
+  if (v && v.uid) { UID_DONE.add(fuid); return; }
+  for (let i = 0; i < 6; i++) {
+    let id = ''; for (let j = 0; j < 6; j++) id += UID_CH[crypto.randomInt(32)];
+    const t = await db.ref(`uidIndex/${id}`).transaction(c => (c ? undefined : fuid));
+    if (!t.committed) continue;
+    const r = await db.ref(`users/${fuid}/uid`).transaction(c => c || id);
+    const final = r.snapshot.val();
+    if (final !== id) await db.ref(`uidIndex/${id}`).remove().catch(() => {});
+    UID_DONE.add(fuid);
+    log('UID', `assigned ${final} → ${fuid}`);
+    return;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// LIVE SUPPORT — in-app chat  ⇄  this Telegram bot
+// users/{fuid}/support/meta  { status: bot|waiting|live|closed, ... }
+// users/{fuid}/support/msgs  { from: user|agent|bot|sys, text?, img?, ts, fwd? }
+// ════════════════════════════════════════════════════════════════════
+const SUP = { active: null };
+const SUP_CHAIN = new Map();
+const supRef = (f, p = '') => db.ref(`users/${f}/support${p ? '/' + p : ''}`);
+const onceFlag = async (ref) => (await ref.transaction(c => (c ? undefined : Date.now()))).committed;
+async function supLoadActive() { try { SUP.active = (await db.ref('botState/supActive').once('value')).val() || null; } catch {} }
+async function supSetActive(f) { SUP.active = f || null; try { await db.ref('botState/supActive').set(f || null); } catch {} }
+async function supLite(fuid) {
+  const g = async (k) => (await db.ref(`users/${fuid}/${k}`).once('value')).val();
+  const [uid, name, email, phone, nick] = await Promise.all([g('uid'), g('name'), g('email'), g('phone'), g('profile/nickname')]);
+  return { uid: String(uid || String(fuid).slice(0, 8)).toUpperCase(), name: nick || name || 'User', email: email || '—', phone: phone || '—' };
+}
+const supPush = (fuid, m) => supRef(fuid, 'msgs').push({ ts: Date.now(), ...m });
+function supQueue(fuid) {
+  const prev = SUP_CHAIN.get(fuid) || Promise.resolve();
+  const next = prev.then(() => supProcess(fuid)).catch(e => log('SUP', `err ${e.message}`));
+  SUP_CHAIN.set(fuid, next);
+  next.finally(() => { if (SUP_CHAIN.get(fuid) === next) SUP_CHAIN.delete(fuid); });
+  return next;
+}
+function supDataUrlToBuf(u) { const m = String(u || '').match(/^data:(image\/[\w+.-]+);base64,(.+)$/); return m ? { type: m[1], buf: Buffer.from(m[2], 'base64') } : null; }
+async function supSendPhoto(buf, type, caption, extra = {}) {
+  const fd = new FormData();
+  fd.append('chat_id', String(TG_CHAT));
+  if (caption) fd.append('caption', String(caption).slice(0, 1000));
+  if (extra.reply_markup) fd.append('reply_markup', JSON.stringify(extra.reply_markup));
+  fd.append('photo', new Blob([buf], { type: type || 'image/jpeg' }), 'photo.jpg');
+  try { return await (await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: fd })).json(); } catch (e) { return { ok: false, error: e.message }; }
+}
+async function supForward(fuid, lite, m) {
+  const head = `💬 ${lite.name} · UID ${lite.uid}`;
+  const kb = SUP.active === fuid ? undefined : { inline_keyboard: [[{ text: '↩️ Reply to this user', callback_data: `sup_sw_${fuid}` }, { text: '🔚 End', callback_data: `sup_end_${fuid}` }]] };
+  let r;
+  const ph = m.img && supDataUrlToBuf(m.img);
+  if (ph) r = await supSendPhoto(ph.buf, ph.type, `${head}${m.text ? '\n\n' + m.text : ''}`, kb ? { reply_markup: kb } : {});
+  else r = await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `${head}\n\n${String(m.text || '').slice(0, 3500)}`, ...(kb ? { reply_markup: kb } : {}) });
+  const mid = r?.result?.message_id;
+  if (mid) await db.ref(`botState/supMap/${mid}`).set(fuid).catch(() => {});
+}
+async function supProcess(fuid) {
+  const s = (await supRef(fuid).once('value')).val();
+  if (!s || !s.meta) return;
+  const meta = s.meta, msgs = s.msgs || {};
+  // 1) new request → Accept / Busy card for the admin
+  if (meta.status === 'waiting' && !meta.notified && await onceFlag(supRef(fuid, 'meta/notified'))) {
+    const lite = await supLite(fuid);
+    const ctx = Object.values(msgs).filter(x => x && x.ts >= (meta.sessionAt || 0)).sort((a, b) => a.ts - b.ts).slice(-6)
+      .map(x => `${x.from === 'user' ? '👤' : x.from === 'agent' ? '🎧' : '🤖'} ${x.img ? '[photo] ' : ''}${String(x.text || '').slice(0, 140)}`).join('\n');
+    const r = await tgFetch('sendMessage', { chat_id: TG_CHAT,
+      text: `🎧 LIVE SUPPORT REQUEST\n\n👤 ${lite.name}\n🆔 UID: ${lite.uid}\n📧 ${lite.email}\n📱 ${lite.phone}\n📝 Topic: ${meta.topic || 'General'}\n\nRecent chat:\n${ctx || '—'}`,
+      reply_markup: { inline_keyboard: [[{ text: '✅ Accept chat', callback_data: `sup_acc_${fuid}` }, { text: '⏳ Busy', callback_data: `sup_rej_${fuid}` }]] } });
+    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ tgCard: r.result.message_id });
+    log('SUP', `request from ${lite.uid}`);
+  }
+  // 2) user cancelled while waiting
+  if (meta.cancelled && !meta.cancelNotified && await onceFlag(supRef(fuid, 'meta/cancelNotified'))) {
+    const lite = await supLite(fuid);
+    if (meta.tgCard) await tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: meta.tgCard, text: `🎧 Support request from ${lite.name} · UID ${lite.uid}\n\n❌ Cancelled by user` });
+  }
+  // 3) live → forward every unsent user message (photos too)
+  if (meta.status === 'live') {
+    let lite = null;
+    const keys = Object.keys(msgs).filter(k => msgs[k] && msgs[k].from === 'user' && !msgs[k].fwd && (msgs[k].ts || 0) >= (meta.reqAt || 0) - 1000)
+      .sort((a, b) => (msgs[a].ts || 0) - (msgs[b].ts || 0));
+    for (const k of keys) {
+      if (!(await onceFlag(supRef(fuid, `msgs/${k}/fwd`)))) continue;
+      lite = lite || await supLite(fuid);
+      await supForward(fuid, lite, msgs[k]);
+    }
+  }
+  // 4) user ended the chat
+  if (meta.status === 'closed' && meta.closedBy === 'user' && !meta.endNotified && await onceFlag(supRef(fuid, 'meta/endNotified'))) {
+    const lite = await supLite(fuid);
+    if (SUP.active === fuid) await supSetActive(null);
+    await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🔚 ${lite.name} · UID ${lite.uid} ended the support chat.` });
+  }
+}
+async function supAgentMsg(fuid, m) {
+  await supPush(fuid, { from: 'agent', ...m });
+  await supRef(fuid, 'meta').update({ lastAgentAt: Date.now() });
+  pushNotif(fuid, { title: '🎧 BIEXC Support replied', body: m.text ? String(m.text).slice(0, 90) : '📷 Photo', type: 'SUPPORT' }).catch(() => {});
+}
+async function handleSupCb(cb, act, fuid) {
+  if (!db) return tgAnswer(cb.id, 'Backend offline');
+  const lite = await supLite(fuid);
+  if (act === 'acc') {
+    const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'live'; c.acceptedAt = Date.now(); c.agent = 'BIEXC Support'; return c; });
+    if (!t.committed) return tgAnswer(cb.id, 'Already handled ✔', true);
+    await supPush(fuid, { from: 'sys', text: 'A support agent has joined the chat ✅' });
+    pushNotif(fuid, { title: '🎧 Agent connected', body: 'A BIEXC support agent has joined your chat.', type: 'SUPPORT' }).catch(() => {});
+    await supSetActive(fuid);
+    await tgAnswer(cb.id, '✅ Connected');
+    if (cb.message?.message_id) await tgFetch('editMessageReplyMarkup', { chat_id: TG_CHAT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Accepted — chatting now', callback_data: 'noop_done' }]] } });
+    await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🎧 Live chat started with ${lite.name} · UID ${lite.uid}\n\nJust type here — your text and photos go straight to the user.\nReply (swipe) to any of their messages to answer a specific user.\n/end — finish this chat · /chats — all open chats`,
+      reply_markup: { inline_keyboard: [[{ text: '🔚 End chat', callback_data: `sup_end_${fuid}` }]] } });
+    return supQueue(fuid);
+  }
+  if (act === 'rej') {
+    const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'bot'; c.busyAt = Date.now(); return c; });
+    if (!t.committed) return tgAnswer(cb.id, 'Already handled ✔', true);
+    await supPush(fuid, { from: 'sys', text: 'All our agents are busy right now. Please try again in a few minutes — our assistant can still help you meanwhile.' });
+    await tgAnswer(cb.id, 'Marked busy');
+    if (cb.message?.message_id) await tgFetch('editMessageReplyMarkup', { chat_id: TG_CHAT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '⏳ Marked busy', callback_data: 'noop_done' }]] } });
+    return;
+  }
+  if (act === 'end') return supEnd(fuid, cb.id);
+  if (act === 'sw') {
+    const st = (await supRef(fuid, 'meta/status').once('value')).val();
+    if (st !== 'live') return tgAnswer(cb.id, 'This chat is not live any more', true);
+    await supSetActive(fuid);
+    await tgAnswer(cb.id, `Now replying to ${lite.uid}`);
+    return tgFetch('sendMessage', { chat_id: TG_CHAT, text: `↩️ Now replying to ${lite.name} · UID ${lite.uid}. Type your message.` });
+  }
+}
+async function supEnd(fuid, cbId) {
+  const lite = await supLite(fuid);
+  const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status === 'closed') return; c.status = 'closed'; c.closedBy = 'agent'; c.closedAt = Date.now(); return c; });
+  if (SUP.active === fuid) await supSetActive(null);
+  if (!t.committed) { if (cbId) await tgAnswer(cbId, 'Already ended ✔'); return; }
+  await supPush(fuid, { from: 'sys', text: 'The agent has ended this chat. Thank you for contacting BIEXC Support 💛' });
+  if (cbId) await tgAnswer(cbId, 'Chat ended');
+  await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🔚 Chat with ${lite.name} · UID ${lite.uid} ended.` });
+}
+async function supList() {
+  const snap = await db.ref('users').once('value');
+  const rows = [];
+  snap.forEach(c => { const m = c.val()?.support?.meta; if (m && (m.status === 'live' || m.status === 'waiting')) rows.push({ fuid: c.key, m, u: c.val() }); });
+  if (!rows.length) return tgSend('🎧 No open support chats right now.');
+  const kb = rows.slice(0, 20).map(r => [{ text: `${r.m.status === 'live' ? '🟢' : '🟡'} ${(r.u.profile?.nickname || r.u.name || 'User').slice(0, 20)} · ${shownUID(r.fuid, r.u)}${SUP.active === r.fuid ? ' (active)' : ''}`, callback_data: r.m.status === 'live' ? `sup_sw_${r.fuid}` : `sup_acc_${r.fuid}` }]);
+  return tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🎧 Open support chats (${rows.length})\n🟢 live — tap to reply  ·  🟡 waiting — tap to accept`, reply_markup: { inline_keyboard: kb } });
+}
+async function supTgPhotoToDataUrl(photos) {
+  const list = [...photos].sort((a, b) => (a.file_size || 0) - (b.file_size || 0));
+  const pick = list.filter(p => (p.file_size || 0) <= 700_000).pop() || list[0];
+  const j = await (await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(pick.file_id)}`)).json();
+  if (!j.ok) return null;
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${j.result.file_path}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return `data:image/jpeg;base64,${buf.toString('base64')}`;
+}
+/** Admin message → user's in-app chat. Returns true when consumed. */
+async function supRouteAdmin(msg, text) {
+  if (!db || msg.from?.is_bot) return false;
+  if (text.startsWith('/')) {
+    if (/^\/chats?\b/i.test(text)) { await supList(); return true; }
+    if (/^\/end\b/i.test(text)) { if (SUP.active) await supEnd(SUP.active); else await tgSend('No active support chat.'); return true; }
+    return false;
+  }
+  let fuid = null;
+  const rt = msg.reply_to_message?.message_id;
+  if (rt) { fuid = (await db.ref(`botState/supMap/${rt}`).once('value')).val(); if (!fuid) return false; }
+  else { if (ASK && Date.now() - ASK.ts < ASK_TTL) return false; fuid = SUP.active; }
+  if (!fuid) return false;
+  const st = (await supRef(fuid, 'meta/status').once('value')).val();
+  if (st !== 'live') { if (!rt) { await supSetActive(null); return false; } await tgSend('⚠️ That chat is closed — the user did not get this message.'); return true; }
+  const caption = msg.caption || '';
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const img = await supTgPhotoToDataUrl(msg.photo).catch(() => null);
+    if (!img) { await tgSend('⚠️ Could not deliver that photo, please try again.'); return true; }
+    await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) });
+    return true;
+  }
+  if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    const img = await supTgPhotoToDataUrl([{ file_id: msg.document.file_id, file_size: msg.document.file_size }]).catch(() => null);
+    if (img) { await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) }); return true; }
+  }
+  if (text) { await supAgentMsg(fuid, { text: text.slice(0, 4000) }); return true; }
+  if (msg.sticker || msg.document || msg.video || msg.voice) { await tgSend('ℹ️ Only text and photos can be sent to the user.'); return true; }
+  return false;
+}
+
+// ─── KYC MOBILE OTP (WhatsApp) ──────────────────────────────────────
+const KYC_OTP = new Map(); // fuid -> { phone, code, exp, tries, last, sent[] }
+async function fuidFromIdToken(req) {
+  const t = String(req.body?.idToken || '');
+  if (!t) return null;
+  try { return (await admin.auth().verifyIdToken(t)).uid; } catch { return null; }
+}
+function mountKycOtp(app) {
+  app.post('/api/kyc-otp/send', async (req, res) => {
+    try {
+      if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const p = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
+      if (!/^[6-9]\d{9}$/.test(p)) return res.json({ ok: false, error: 'bad_phone' });
+      const now = Date.now();
+      const st = KYC_OTP.get(fuid) || { sent: [] };
+      if (st.last && now - st.last < 45_000) return res.json({ ok: false, error: 'too_soon', waitSec: Math.ceil((45_000 - (now - st.last)) / 1000) });
+      st.sent = (st.sent || []).filter(t => now - t < 3600_000);
+      if (st.sent.length >= 6) return res.json({ ok: false, error: 'rate_limited' });
+      if (!WA.status().linked) return res.json({ ok: false, error: 'whatsapp_not_linked' });
+      const phone = '91' + p;
+      if (!(await WA.isOnWhatsApp(phone))) return res.json({ ok: false, error: 'not_on_whatsapp' });
+      const code = String(crypto.randomInt(100000, 1000000));
+      await WA.sendText(phone, `🔐 *BIEXC* — your mobile verification code is *${code}*\n\nUse it to confirm this number for KYC. Valid for 10 minutes. Never share this code with anyone, not even BIEXC staff.`);
+      Object.assign(st, { phone: p, code, exp: now + 10 * 60_000, tries: 0, last: now }); st.sent.push(now);
+      KYC_OTP.set(fuid, st);
+      log('KYCOTP', `code sent → +91${p.slice(0, 2)}******${p.slice(-2)}`);
+      res.json({ ok: true, waitSec: 45 });
+    } catch (e) { log('KYCOTP', `send err ${e.message}`); res.json({ ok: false, error: 'send_failed' }); }
+  });
+  app.post('/api/kyc-otp/verify', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const p = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
+      const code = String(req.body?.code || '').replace(/\D/g, '');
+      const st = KYC_OTP.get(fuid);
+      if (!st || !st.code || st.phone !== p) return res.json({ ok: false, error: 'no_code' });
+      if (Date.now() > st.exp) { KYC_OTP.delete(fuid); return res.json({ ok: false, error: 'expired' }); }
+      if (st.tries >= 5) { KYC_OTP.delete(fuid); return res.json({ ok: false, error: 'too_many_tries' }); }
+      if (code !== st.code) { st.tries++; return res.json({ ok: false, error: 'invalid_code', left: 5 - st.tries }); }
+      KYC_OTP.delete(fuid);
+      await db.ref(`users/${fuid}/kycPhone`).set({ phone: '+91' + p, verified: true, ts: Date.now() });
+      log('KYCOTP', `verified ${fuid}`);
+      res.json({ ok: true, phone: '+91' + p });
+    } catch (e) { log('KYCOTP', `verify err ${e.message}`); res.json({ ok: false, error: 'verify_failed' }); }
+  });
+}
+
 if (db) {
   db.ref('users').on('child_changed', async (snap) => {
     if (!(await amIActive())) return;
     const v = snap.val() || {};
+    ensureUid(snap.key, v).catch(e => log('ERR', `uid ${e.message}`));
+    if (v.support) supQueue(snap.key);
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
@@ -773,6 +1024,8 @@ if (db) {
   db.ref('users').on('child_added', async (snap) => {
     if (!(await amIActive())) return;
     const v = snap.val() || {};
+    ensureUid(snap.key, v).catch(e => log('ERR', `uid ${e.message}`));
+    if (v.support) supQueue(snap.key);
     await migrateLegacyBalanceOnce(snap.key, v);
     await processPendingMap(snap.key, v, BOT_START_TIME - 10_000);
     await maybeForwardKycSubmission(snap.key, v).catch(e => log('ERR', `kyc ${e.message}`));
@@ -885,6 +1138,8 @@ async function handleCallback(cb, upd = null) {
   const data = cb.data || '';
 
   let m;
+  if (data === 'sup_list') { await tgAnswer(cb.id, '🎧'); return supList(); }
+  if ((m = data.match(/^sup_(acc|rej|end|sw)_(.+)$/))) return handleSupCb(cb, m[1], m[2]);
   if (data === 'noop_done') { await tgAnswer(cb.id, '✔ Already done — nothing more to do.'); return; }
   if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3], upd);
   // Trade/P2P callbacks (cbId starts with trade_) are completed by the app
@@ -1101,7 +1356,7 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
-  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }],
+  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }, { text: '🎧 Live chats', callback_data: 'sup_list' }],
 ] };
 
 // ════════════════════════════════════════════════════════════════════
@@ -1714,6 +1969,8 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
+  // Live support: admin text/photo → the user's in-app chat
+  if (await supRouteAdmin(msg, text).catch(e => { log('SUP', `route ${e.message}`); return false; })) return;
   if (!text) return;
   if (/^\/(start|menu|help)\b/i.test(text)) { ASK = null; return sendMenu(); }
   if (/^\/(whatsapp|wa)\b/i.test(text)) { ASK = null; return sendWaPanel(); }
@@ -2369,6 +2626,7 @@ BIEXC — t.me/biexc10`
 // ─── WHATSAPP OTP LOGIN (QR page, /api/otp/send, /api/otp/verify) ───
 mountOtp(app, { admin, db, log, adminKey: process.env.WA_ADMIN_KEY || '' });
 mountEmailOtp(app, { admin, db, log });
+mountKycOtp(app);
 if (db) {
   REF = createReferral({ admin, db, log, mutateBalance, pushHistory, pushNotif, tgSend });
   REF.mount(app);
@@ -2412,6 +2670,7 @@ if (RENDER_URL) {
   await claimInstanceLock();
   await dropWebhook('boot');            // guarantees getUpdates can run
   lastUpdateId = await loadLastUpdateId();
+  await supLoadActive();
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
   // If we boot after 9am IST, skip today's summary so restarts don't spam it.
   if (new Date(Date.now() + IST_OFF).getUTCHours() >= 9) lastSummaryDay = istDayKey();
