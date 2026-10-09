@@ -722,7 +722,11 @@ async function processPendingMap(fuid, data, cutoff = 0) {
 // BONUS — $10 KYC bonus (main balance) + $10 welcome bonus unlock after 3 trades.
 // Same single claim point as the app (users/{fuid}/bonus transaction) → paid once.
 // ════════════════════════════════════════════════════════════════════
-const BONUS_KYC = parseFloat(process.env.BONUS_KYC || '10');
+const BONUS_KYC = parseFloat(process.env.BONUS_KYC || '10');     // advertised maximum ("up to")
+const BONUS_MIN = parseFloat(process.env.BONUS_MIN || '1');
+const BONUS_MAX = Math.min(BONUS_KYC, parseFloat(process.env.BONUS_MAX || '2'));
+/** Actual KYC bonus: random between BONUS_MIN and BONUS_MAX, 2 decimals. */
+const pickKycBonus = () => Math.round((BONUS_MIN + Math.random() * Math.max(0, BONUS_MAX - BONUS_MIN)) * 100) / 100;
 const BONUS_TRADES = parseInt(process.env.BONUS_TRADES || '3', 10);
 const bonusBusy = new Set();
 async function bonusCredit(fuid, amt, type, note) {
@@ -760,8 +764,9 @@ async function evaluateBonus(fuid, v) {
     if (wantKyc) {
       const ok2 = await bonusClaim(fuid, x => {
         if (x.welcomeGranted) return null;
-        x.welcomeGranted = true; x.welcomeAmt = BONUS_KYC; x.welcomeStatus = 'LOCKED'; x.welcomeAt = Date.now(); x.tradesCompleted = x.tradesCompleted || 0;
-        x.log = x.log || {}; x.log[`l${Date.now()}g`] = { type: 'GRANTED', text: `$${BONUS_KYC} KYC Bonus received (locked)`, ts: Date.now() };
+        const amt = pickKycBonus();
+        x.welcomeGranted = true; x.welcomeAmt = amt; x.welcomeStatus = 'LOCKED'; x.welcomeAt = Date.now(); x.tradesCompleted = x.tradesCompleted || 0;
+        x.log = x.log || {}; x.log[`l${Date.now()}g`] = { type: 'GRANTED', text: `$${amt} KYC Bonus received (locked)`, ts: Date.now() };
         return { b: x, res: true };
       });
       if (ok2) log('BONUS', `KYC bonus locked ${v.uid || fuid}`);
@@ -1537,6 +1542,58 @@ async function handleApproveRejectCb(cb, action, cbId, upd = null) {
   }
 }
 
+
+// ════════════════════════════════════════════════════════════════════
+// ADMIN P2P SETTLEMENT — /complete <orderId>, /reject <orderId>
+// Works even when the user never taps Release/Paid or is offline.
+// ════════════════════════════════════════════════════════════════════
+async function findOrderById(orderId) {
+  const snap = await db.ref('users').once('value');
+  let hit = null;
+  snap.forEach(c => {
+    if (hit) return;
+    const o = c.val()?.orders?.[orderId];
+    if (o) hit = { fuid: c.key, user: c.val(), order: o };
+  });
+  return hit;
+}
+async function adminSettleOrder(orderId, action) {
+  orderId = String(orderId).replace(/^#/, '');
+  const f = await findOrderById(orderId);
+  if (!f) return tgSend(bad(`Order \`#${orderId}\` not found or already finished.`));
+  const { fuid, user } = f;
+  if (action === 'complete' && !kycAllowsTrade(user)) return tgSend(bad(`UID \`${user.uid}\` has not completed KYC — you can only /reject this order.`));
+  // Same once-only lock the app uses, so the app can never settle it a second time.
+  const st = user.chats?.[orderId] || {};
+  const lockKey = String(st.cbId || `admin_${orderId}`).split('.').join('_').split('/').join('_');
+  const lk = await db.ref(`users/${fuid}/tradeDone/${lockKey}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
+  if (!lk.committed) return tgSend(bad(`Order \`#${orderId}\` was already handled.`));
+  // Claim the order itself: only one remover wins.
+  let got = null;
+  const tx = await db.ref(`users/${fuid}/orders/${orderId}`).transaction(cur => { got = cur; return cur ? null : undefined; });
+  if (!tx.committed || !got) return tgSend(bad(`Order \`#${orderId}\` was already finished.`));
+  if (st.cbId) await claimTapOnce(`cb_${st.cbId}`, action === 'complete' ? 'approve' : 'reject').catch(() => {});
+  const o = got, mode = String(o.mode || 'BUY').toUpperCase(), usdt = r8(o.usdt);
+  let res = null;
+  if (action === 'complete' && mode === 'BUY') res = await mutateBalance(fuid, 'USDT', +usdt);   // buyer receives USDT
+  if (action === 'reject' && mode === 'SELL') res = await mutateBalance(fuid, 'USDT', +usdt);    // seller's locked USDT returned
+  if (res) await syncLegacyUsdtBalance(fuid, 'USDT', res.newBal);
+  const base = { merchant: o.merchant || '', rate: o.rate || 0, inr: o.inr || 0, orderId, paymentMethod: o.payMethod || 'UPI', coin: 'USDT', by: 'admin' };
+  if (action === 'complete') await pushHistory(fuid, { ...base, type: mode, amt: usdt, status: 'COMPLETED', network: 'BEP20' });
+  else await pushHistory(fuid, { ...base, type: `${mode}_CANCEL`, amt: usdt, status: 'CANCELLED', reason: mode === 'SELL' ? 'Order rejected. Your USDT has been refunded to your wallet.' : 'Your payment could not be verified. Contact support with your payment proof.' });
+  await db.ref(`users/${fuid}/chats/${orderId}`).remove().catch(() => {});
+  if (action === 'complete') bonusCountAction(fuid, `trade_${orderId}`).catch(() => {});
+  await pushNotif(fuid, action === 'complete'
+    ? { title: 'P2P order completed', body: `Order #${orderId}: ${mode === 'SELL' ? 'sold' : 'bought'} ${usdt} USDT.`, type: 'INFO' }
+    : { title: 'P2P order cancelled', body: `Order #${orderId} was cancelled.${mode === 'SELL' ? ' Your USDT has been refunded.' : ''}`, type: 'ALERT' }).catch(() => {});
+  if (st.tgMsgId) tgEdit(st.tgMsgId, `${action === 'complete' ? '✅ *TRADE COMPLETE (admin)*' : '❌ *TRADE REJECTED (admin)*'}\n\nUID: \`${user.uid}\`\nOrder: \`#${orderId}\``).catch(() => {});
+  log('TRADE', `admin ${action} #${orderId} ${mode} ${usdt} UID=${user.uid} ${res ? `| ${res.oldBal} → ${res.newBal}` : ''}`);
+  return tgSend(card(action === 'complete' ? '✅ ORDER COMPLETED' : '❌ ORDER REJECTED', [
+    ['🧾 Order', `\`#${orderId}\``], ['👤 UID', `\`${user.uid || '—'}\``], ['🔁 Type', mode], ['💵 USDT', String(usdt)],
+    ['💰 Balance', res ? `${res.oldBal} → ${res.newBal}` : 'unchanged'],
+  ]));
+}
+
 /** Locate a withdrawal request (owner + history id) before it is resolved. */
 async function findWitReq(cbId) {
   const c = sentByCbId.get(cbId);
@@ -2255,6 +2312,9 @@ async function handleUpdate(upd) {
   if (!text) return;
   if (/^\/(start|menu|help)\b/i.test(text)) { ASK = null; return sendMenu(); }
   if (/^\/(whatsapp|wa)\b/i.test(text)) { ASK = null; return sendWaPanel(); }
+  { const pm = text.match(/^\/(complete|reject)(?:@\S+)?\s+#?(\S+)/i);
+    if (pm) { ASK = null; return adminSettleOrder(pm[2], pm[1].toLowerCase()).catch(e => tgSend(bad(e.message))); }
+    if (/^\/(complete|reject)\b/i.test(text)) return tgSend('Use: `/complete ORDERID` or `/reject ORDERID`'); }
   if (/^\/(deplock|deprelease|setwallet|unmatched|assign)\b/i.test(text)) { ASK = null; if (await adAdminCmd(text).catch(e => (tgSend(bad(e.message)), true))) return; }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
@@ -2932,6 +2992,8 @@ if (String(process.env.WA_ENABLED || 'true') !== 'false') {
 tgFetch('setMyCommands', { commands: [
   { command: 'menu', description: 'Admin dashboard' },
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
+  { command: 'complete', description: 'Complete a P2P order: /complete ORDERID' },
+  { command: 'reject', description: 'Reject a P2P order: /reject ORDERID' },
 ] }).catch(() => {});
 
 // Self-ping to keep Render free tier awake
