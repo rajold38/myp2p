@@ -982,6 +982,221 @@ async function fuidFromIdToken(req) {
   if (!t) return null;
   try { return (await admin.auth().verifyIdToken(t)).uid; } catch { return null; }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// AUTO DEPOSIT — USDT BEP-20 only, one shared admin wallet, 60s window
+// ════════════════════════════════════════════════════════════════════
+const AD = {
+  USDT: '0x55d398326f99059ff775485246999027b3197955',
+  TOPIC: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+  RPCS: (process.env.BSC_RPC_URLS || 'https://bsc-dataseed.binance.org,https://bsc-rpc.publicnode.com').split(',').map(s => s.trim()).filter(Boolean),
+  CONF: 3, WINDOW: 60_000, MIN: parseFloat(process.env.AUTO_DEPOSIT_MIN || '10'),
+  DEFAULT_WALLET: (process.env.DEPOSIT_WALLET || '0x415c84ea67b273e17b3c03b010e7d5d9b20091d9').toLowerCase(),
+  rlStart: new Map(), rlCheck: new Map(), scanning: false,
+};
+async function adRpc(method, params) {
+  let lastErr;
+  for (const url of AD.RPCS) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), timeout: 12_000 });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error.message || 'rpc error');
+      return j.result;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('all RPCs failed');
+}
+const adBlock = async () => parseInt(await adRpc('eth_blockNumber', []), 16);
+async function adWallet() {
+  const v = (await db.ref('settings/depositAddress').once('value')).val();
+  return (/^0x[0-9a-fA-F]{40}$/.test(v || '') ? v : AD.DEFAULT_WALLET).toLowerCase();
+}
+function adParse(l) {
+  return {
+    txHash: l.transactionHash.toLowerCase(), logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16),
+    from: '0x' + l.topics[1].slice(26).toLowerCase(),
+    amt: Math.floor(Number(BigInt(l.data) / 10n ** 10n)) / 1e8, // 18 decimals → 8 dp
+  };
+}
+async function adLogs(wallet, fromBlock, toBlock) {
+  if (toBlock < fromBlock) return [];
+  const out = [];
+  for (let a = fromBlock; a <= toBlock; a += 2000) {
+    const b = Math.min(toBlock, a + 1999);
+    const logs = await adRpc('eth_getLogs', [{ address: AD.USDT, fromBlock: '0x' + a.toString(16), toBlock: '0x' + b.toString(16),
+      topics: [AD.TOPIC, null, '0x' + wallet.slice(2).padStart(64, '0')] }]);
+    for (const l of logs || []) if (!l.removed) out.push(adParse(l));
+  }
+  return out;
+}
+/** Credit one on-chain transfer exactly once (deposits/{tx}_{idx} claimed in a transaction). */
+async function adCredit(fuid, t, source) {
+  const key = `${t.txHash}_${t.logIndex}`;
+  const tx = await db.ref(`deposits/${key}`).transaction(cur => cur ? undefined : { fuid, amt: t.amt, txHash: t.txHash, logIndex: t.logIndex, from: t.from, block: t.block, source, ts: Date.now(), status: 'crediting' });
+  if (!tx.committed) return null;
+  const res = await mutateBalance(fuid, 'USDT', +t.amt);
+  if (res) await syncLegacyUsdtBalance(fuid, 'USDT', res.newBal);
+  const hid = await pushHistory(fuid, { type: 'DEPOSIT', coin: 'USDT', amt: t.amt, network: 'BEP-20', chain: 'BEP-20', txid: t.txHash, hash: t.txHash, hashAt: Date.now(), from: t.from, auto: true, status: 'COMPLETED', explorer: `https://bscscan.com/tx/${t.txHash}` });
+  await db.ref(`deposits/${key}`).update({ status: 'credited', hid });
+  await db.ref(`unmatchedDeposits/${key}`).remove().catch(() => {});
+  if (REF) REF.onDeposit(fuid, 'USDT', t.amt).catch(() => {});
+  await bonusCountAction(fuid, `dep_auto_${key}`).catch(() => {});
+  const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
+  await pushNotif(fuid, { title: 'Deposit received', body: `${t.amt} USDT (BEP-20) credited to your Funding account.`, type: 'INFO' }).catch(() => {});
+  log('AUTODEP', `CREDIT UID=${user.uid} fuid=${fuid} ${t.amt} USDT tx=${t.txHash} src=${source} | ${res?.oldBal} → ${res?.newBal}`);
+  tgSend(card('📥 AUTO DEPOSIT CREDITED', [['👤 UID', `\`${user.uid || '—'}\``], ['💰 Amount', `${t.amt} USDT · BEP-20`], ['🔗 TxID', `\`${t.txHash}\``], ['📊 Balance', `${res?.oldBal} → ${res?.newBal}`]])).catch(() => {});
+  return { ...t, hid, newBal: res?.newBal };
+}
+async function adUnmatched(t, reason) {
+  const key = `${t.txHash}_${t.logIndex}`;
+  if ((await db.ref(`deposits/${key}`).once('value')).exists()) return;
+  const tx = await db.ref(`unmatchedDeposits/${key}`).transaction(cur => cur ? undefined : { ...t, reason, status: 'pending_review', ts: Date.now() });
+  if (!tx.committed) return;
+  log('AUTODEP', `UNMATCHED ${t.amt} USDT tx=${t.txHash} (${reason})`);
+  tgSend(card('⚠️ UNMATCHED DEPOSIT', [['💰 Amount', `${t.amt} USDT · BEP-20`], ['📤 From', `\`${t.from}\``], ['🔗 TxID', `\`${t.txHash}\``], ['ℹ️ Reason', reason], ['✅ Credit', `\`/assign ${key} UID\``]])).catch(() => {});
+}
+/** Who owns a transfer: saved sender wallet, else a deposit window covering its block. */
+async function adOwner(t) {
+  const lock = (await db.ref('settings/depositLock').once('value')).val();
+  if (lock && lock.status === 'open' && t.block >= lock.startBlock) return lock.fuid;
+  const past = (await db.ref('depositWindows').orderByChild('endBlock').startAt(t.block).once('value')).val() || {};
+  for (const w of Object.values(past)) if (t.block >= w.startBlock && t.block <= w.endBlock) return w.fuid;
+  const byWallet = (await db.ref('depositWalletIndex/' + t.from).once('value')).val();
+  return byWallet || null;
+}
+async function adHandle(t) {
+  if ((await db.ref(`deposits/${t.txHash}_${t.logIndex}`).once('value')).exists()) return null;
+  const owner = await adOwner(t);
+  if (!owner) return adUnmatched(t, 'no open deposit window'), null;
+  if (t.amt < AD.MIN) return adUnmatched(t, `below minimum ${AD.MIN} USDT`), null;
+  return adCredit(owner, t, 'scan');
+}
+async function adCloseLock(lock, status) {
+  if (!lock) return;
+  let endBlock = lock.startBlock + 60;
+  try { endBlock = (await adBlock()) + 20; } catch {}
+  await db.ref(`depositWindows/${lock.id}`).set({ fuid: lock.fuid, startBlock: lock.startBlock, endBlock, startedAt: lock.startedAt, closedAt: Date.now(), status });
+  await db.ref('settings/depositLock').transaction(cur => (cur && cur.id === lock.id) ? null : cur);
+}
+async function adCleanup() {
+  const lock = (await db.ref('settings/depositLock').once('value')).val();
+  if (lock && Date.now() > lock.expiresAt) await adCloseLock(lock, 'expired');
+  const old = (await db.ref('depositWindows').orderByChild('closedAt').endAt(Date.now() - 24 * 3600_000).once('value')).val() || {};
+  for (const k of Object.keys(old)) db.ref(`depositWindows/${k}`).remove().catch(() => {});
+}
+async function adScan() {
+  if (AD.scanning) return; AD.scanning = true;
+  try {
+    const wallet = await adWallet();
+    const safe = (await adBlock()) - AD.CONF;
+    let from = (await db.ref('settings/lastScannedBlock').once('value')).val();
+    if (!from) from = safe - 200;
+    from = Math.max(from, safe - 20_000);
+    if (safe <= from) return;
+    for (const t of await adLogs(wallet, from + 1, safe)) await adHandle(t).catch(e => log('AUTODEP', `handle ${e.message}`));
+    await db.ref('settings/lastScannedBlock').set(safe);
+  } catch (e) { log('AUTODEP', `scan ${e.message}`); } finally { AD.scanning = false; }
+}
+function adLimited(map, fuid, ms) { const n = Date.now(), l = map.get(fuid) || 0; if (n - l < ms) return Math.ceil((ms - (n - l)) / 1000); map.set(fuid, n); return 0; }
+
+function mountAutoDeposit(app) {
+  app.post('/api/deposit/config', async (_req, res) => {
+    try { res.json({ ok: true, address: await adWallet(), min: AD.MIN, windowSec: AD.WINDOW / 1000 }); } catch { res.json({ ok: false }); }
+  });
+  app.post('/api/deposit/start', async (req, res) => {
+    try {
+      if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      let lock = (await db.ref('settings/depositLock').once('value')).val();
+      if (lock && lock.fuid === fuid && lock.status === 'open' && Date.now() < lock.expiresAt)
+        return res.json({ ok: true, expiresAt: lock.expiresAt, now: Date.now(), address: await adWallet() });
+      const wait = adLimited(AD.rlStart, fuid, 30_000);
+      if (wait) return res.json({ ok: false, error: 'too_soon', waitSec: wait });
+      if (lock && Date.now() > lock.expiresAt) { await adCloseLock(lock, 'expired'); lock = null; }
+      const startBlock = await adBlock();
+      const now = Date.now();
+      const mine = { id: `w${now}_${fuid.slice(0, 6)}`, fuid, startedAt: now, expiresAt: now + AD.WINDOW, startBlock, status: 'open' };
+      const tx = await db.ref('settings/depositLock').transaction(cur => (cur && cur.status === 'open' && Date.now() < cur.expiresAt) ? undefined : mine);
+      if (!tx.committed) {
+        AD.rlStart.delete(fuid);
+        const cur = tx.snapshot.val() || {};
+        return res.json({ ok: false, error: 'busy', waitSec: Math.max(1, Math.ceil(((cur.expiresAt || now) - Date.now()) / 1000)) });
+      }
+      log('AUTODEP', `window open fuid=${fuid} block=${startBlock}`);
+      res.json({ ok: true, expiresAt: mine.expiresAt, now, address: await adWallet() });
+    } catch (e) { log('AUTODEP', `start ${e.message}`); res.json({ ok: false, error: 'network' }); }
+  });
+  app.post('/api/deposit/check', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      if (adLimited(AD.rlCheck, fuid, 3_000)) return res.json({ ok: true, status: 'waiting' });
+      const lock = (await db.ref('settings/depositLock').once('value')).val();
+      if (!lock || lock.fuid !== fuid) return res.json({ ok: true, status: 'closed' });
+      if (Date.now() > lock.expiresAt) { await adCloseLock(lock, 'expired'); return res.json({ ok: true, status: 'closed' }); }
+      const safe = (await adBlock()) - AD.CONF;
+      const logs = await adLogs(await adWallet(), lock.startBlock, safe);
+      const credited = [];
+      for (const t of logs) {
+        if (t.amt < AD.MIN) { await adUnmatched(t, `below minimum ${AD.MIN} USDT`); continue; }
+        const c = await adCredit(fuid, t, 'window'); if (c) credited.push(c);
+      }
+      if (!credited.length) return res.json({ ok: true, status: 'waiting', expiresAt: lock.expiresAt, now: Date.now() });
+      await adCloseLock(lock, 'completed');
+      const total = r8(credited.reduce((s, c) => s + c.amt, 0));
+      res.json({ ok: true, status: 'credited', amount: total, txHash: credited[0].txHash, newBal: credited[credited.length - 1].newBal });
+    } catch (e) { log('AUTODEP', `check ${e.message}`); res.json({ ok: true, status: 'waiting' }); }
+  });
+  app.post('/api/deposit/cancel', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const lock = (await db.ref('settings/depositLock').once('value')).val();
+      if (lock && lock.fuid === fuid) await adCloseLock(lock, 'cancelled'); // owner only
+      res.json({ ok: true });
+    } catch { res.json({ ok: false }); }
+  });
+}
+function startAutoDepositJobs() {
+  setInterval(() => { amIActive().then(a => a && adCleanup()).catch(e => log('AUTODEP', `cleanup ${e.message}`)); }, 15_000);
+  setInterval(() => { amIActive().then(a => a && adScan()).catch(() => {}); }, 30_000);
+  log('INIT', `🪙 Auto deposit (USDT BEP-20) min=${AD.MIN} rpcs=${AD.RPCS.length}`);
+}
+/** Admin commands: /deplock, /deprelease, /setwallet <addr>, /unmatched, /assign <key> <UID> */
+async function adAdminCmd(text) {
+  let m;
+  if (/^\/deplock\b/i.test(text)) {
+    const l = (await db.ref('settings/depositLock').once('value')).val();
+    return tgSend(l ? card('🔒 DEPOSIT WINDOW', [['fuid', `\`${l.fuid}\``], ['Ends in', `${Math.max(0, Math.ceil((l.expiresAt - Date.now()) / 1000))}s`], ['Release', '/deprelease']]) : '🔓 No deposit window open.'), true;
+  }
+  if (/^\/deprelease\b/i.test(text)) {
+    const l = (await db.ref('settings/depositLock').once('value')).val();
+    if (l) await adCloseLock(l, 'released_by_admin');
+    return tgSend(l ? '🔓 Deposit window released.' : '🔓 Nothing to release.'), true;
+  }
+  if ((m = text.match(/^\/setwallet\s+(0x[0-9a-fA-F]{40})\s*$/i))) {
+    await db.ref('settings/depositAddress').set(m[1]);
+    return tgSend(`✅ Deposit wallet set to \`${m[1]}\``), true;
+  }
+  if (/^\/setwallet\b/i.test(text)) return tgSend(`Current wallet: \`${await adWallet()}\`\nUse: \`/setwallet 0x...\``), true;
+  if (/^\/unmatched\b/i.test(text)) {
+    const v = (await db.ref('unmatchedDeposits').orderByChild('status').equalTo('pending_review').limitToLast(15).once('value')).val() || {};
+    const keys = Object.keys(v);
+    if (!keys.length) return tgSend('✅ No unmatched deposits.'), true;
+    return tgSend(['⚠️ *Unmatched deposits*', ...keys.map(k => `• ${v[k].amt} USDT — \`/assign ${k} UID\``)].join('\n')), true;
+  }
+  if ((m = text.match(/^\/assign\s+(\S+)\s+(\S+)/i))) {
+    const t = (await db.ref(`unmatchedDeposits/${m[1]}`).once('value')).val();
+    if (!t) return tgSend(bad('Unmatched deposit not found.')), true;
+    const f = await findUserByUID(m[2]);
+    if (!f) return tgSend(bad(`UID \`${m[2]}\` not found.`)), true;
+    const c = await adCredit(f.fuid, t, 'admin');
+    return tgSend(c ? `✅ Credited ${t.amt} USDT to \`${m[2]}\`` : bad('Already credited.')), true;
+  }
+  return false;
+}
+
 function mountKycOtp(app) {
   app.post('/api/kyc-otp/send', async (req, res) => {
     try {
@@ -1279,8 +1494,11 @@ async function handleApproveRejectCb(cb, action, cbId, upd = null) {
   // Instant reply + buttons removed straight away (no waiting for the DB).
   tgAnswer(cb.id, action === 'approve' ? '✅ Approving…' : '❌ Rejecting…');
   setCbButtons(cb, action === 'approve' ? '⏳ APPROVING…' : '⏳ REJECTING…');
+  let witInfo = null;
+  if (action === 'approve' && cbId.startsWith('wit_')) witInfo = await findWitReq(cbId).catch(() => null);
   try {
     const done = await processApproveReject(cb, action, cbId);
+    if (witInfo) askWithdrawHash(witInfo).catch(e => log('WIT', `hash prompt ${e.message}`));
     if (upd) pushRecentUpdate(upd); // app updates its screen — once
     if (!done) setCbButtons(cb, '✔ ALREADY HANDLED');
   } catch (e) {
@@ -1296,6 +1514,30 @@ async function handleApproveRejectCb(cb, action, cbId, upd = null) {
     });
     await tgSend(bad(`Could not finish that — please tap again. (${e.message})`));
   }
+}
+
+/** Locate a withdrawal request (owner + history id) before it is resolved. */
+async function findWitReq(cbId) {
+  const c = sentByCbId.get(cbId);
+  if (c && c.hid) return { fuid: c.fuid, hid: c.hid, amt: c.amt, coin: c.coin || 'USDT' };
+  const snap = await db.ref('users').once('value');
+  let out = null;
+  snap.forEach(child => {
+    const map = child.val()?.pendingReqs?.wit || {};
+    for (const [k, r] of Object.entries(map)) {
+      if ((k === cbId || r?.cbId === cbId) && r?.hid) out = { fuid: child.key, hid: r.hid, amt: r.amt, coin: r.coin || 'USDT' };
+    }
+  });
+  return out;
+}
+
+/** After a withdrawal is approved, ask the admin for the on-chain TxID. */
+async function askWithdrawHash(w) {
+  const u = (await db.ref(`users/${w.fuid}`).once('value')).val() || {};
+  const uid = u.uid || '—';
+  ask('withash', { fuid: w.fuid, hid: w.hid, amt: w.amt, coin: w.coin, uid });
+  log('WIT', `asking hash UID=${uid} hid=${w.hid}`);
+  await tgSend(`🔗 *WITHDRAWAL APPROVED*\n\nUID: \`${uid}\`\nAmount: *${w.amt} ${w.coin}*\n\nNow send the *transaction hash (TxID)* as a message. It will show in the user's history.`, { reply_markup: cancelKb });
 }
 
 async function processApproveReject(cb, action, cbId) {
@@ -1328,13 +1570,6 @@ async function processApproveReject(cb, action, cbId) {
   const msgId = ctx.msgId || cb.message?.message_id;
   if (msgId) await tgEdit(msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req));
   sentByCbId.delete(cbId);
-  if (ctx.type === 'wit' && action === 'approve') {
-    const hid = (req && req.hid) || ctx.hid;
-    if (hid) {
-      ask('withash', { fuid: ctx.fuid, hid, amt: r.amt, coin: r.coin, uid: r.user?.uid });
-      await tgSend(`🔗 *Withdrawal approved* — ${r.amt} ${r.coin} (UID \`${r.user?.uid || '—'}\`)\n\nSend the *transaction hash (TxID)* now. It will show in the user's history.`, { reply_markup: cancelKb });
-    }
-  }
   return true;
 }
 
@@ -1992,11 +2227,14 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
+  // A pending withdrawal TxID request takes priority over live support routing.
+  if (ASK && ASK.kind === 'withash' && text && !text.startsWith('/') && Date.now() - ASK.ts < ASK_TTL) return handleAskReply(text);
   // Live support: admin text/photo → the user's in-app chat
   if (await supRouteAdmin(msg, text).catch(e => { log('SUP', `route ${e.message}`); return false; })) return;
   if (!text) return;
   if (/^\/(start|menu|help)\b/i.test(text)) { ASK = null; return sendMenu(); }
   if (/^\/(whatsapp|wa)\b/i.test(text)) { ASK = null; return sendWaPanel(); }
+  if (/^\/(deplock|deprelease|setwallet|unmatched|assign)\b/i.test(text)) { ASK = null; if (await adAdminCmd(text).catch(e => (tgSend(bad(e.message)), true))) return; }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
     ['🔑 Instance', `\`${INSTANCE_ID}\``],
@@ -2650,6 +2888,7 @@ BIEXC — t.me/biexc10`
 mountOtp(app, { admin, db, log, adminKey: process.env.WA_ADMIN_KEY || '' });
 mountEmailOtp(app, { admin, db, log });
 mountKycOtp(app);
+mountAutoDeposit(app);
 if (db) {
   REF = createReferral({ admin, db, log, mutateBalance, pushHistory, pushNotif, tgSend });
   REF.mount(app);
@@ -2700,6 +2939,7 @@ if (RENDER_URL) {
   await sendMenu().catch(() => {});
   setInterval(() => { dailySummaryTick(); }, 5 * 60_000);
   setInterval(() => { beatInstanceLock(); }, 20_000);
+  startAutoDepositJobs();
   startPollWatchdog();
   pollLoop().catch(e => {
     log('FATAL', `pollLoop died: ${e.message} — restarting in 2s`);
