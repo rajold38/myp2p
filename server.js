@@ -990,7 +990,7 @@ const AD = {
   USDT: '0x55d398326f99059ff775485246999027b3197955',
   TOPIC: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
   RPCS: (process.env.BSC_RPC_URLS || 'https://bsc-dataseed.binance.org,https://bsc-rpc.publicnode.com').split(',').map(s => s.trim()).filter(Boolean),
-  CONF: 3, WINDOW: 60_000, MIN: parseFloat(process.env.AUTO_DEPOSIT_MIN || '10'),
+  CONF: 3, WINDOW: 60_000, MIN: parseFloat(process.env.AUTO_DEPOSIT_MIN || '1'),
   DEFAULT_WALLET: (process.env.DEPOSIT_WALLET || '0x415c84ea67b273e17b3c03b010e7d5d9b20091d9').toLowerCase(),
   rlStart: new Map(), rlCheck: new Map(), scanning: false,
 };
@@ -1007,6 +1007,23 @@ async function adRpc(method, params) {
   throw lastErr || new Error('all RPCs failed');
 }
 const adBlock = async () => parseInt(await adRpc('eth_blockNumber', []), 16);
+const AD_TS = new Map();
+async function adBlockTs(n) {
+  if (AD_TS.has(n)) return AD_TS.get(n);
+  const b = await adRpc('eth_getBlockByNumber', ['0x' + n.toString(16), false]);
+  const ts = parseInt(b.timestamp, 16) * 1000;
+  if (AD_TS.size > 5000) AD_TS.clear();
+  AD_TS.set(n, ts); return ts;
+}
+/** Average BSC block time in ms (measured, cached for 10 min). */
+let AD_BT = { v: 3000, at: 0 };
+async function adBlockMs(latest) {
+  if (Date.now() - AD_BT.at < 600_000) return AD_BT.v;
+  try { const a = await adBlockTs(latest), b = await adBlockTs(latest - 200); AD_BT = { v: Math.max(200, (a - b) / 200), at: Date.now() }; } catch {}
+  return AD_BT.v;
+}
+const AD_GRACE = 30_000;   // a transfer up to 30s before "I Have Paid" belongs to that user
+const AD_HOLD = 90_000;    // the background scan leaves fresh transfers for a click first
 async function adWallet() {
   const v = (await db.ref('settings/depositAddress').once('value')).val();
   return (/^0x[0-9a-fA-F]{40}$/.test(v || '') ? v : AD.DEFAULT_WALLET).toLowerCase();
@@ -1057,10 +1074,11 @@ async function adUnmatched(t, reason) {
 }
 /** Who owns a transfer: saved sender wallet, else a deposit window covering its block. */
 async function adOwner(t) {
+  const ts = await adBlockTs(t.block).catch(() => 0);
   const lock = (await db.ref('settings/depositLock').once('value')).val();
-  if (lock && lock.status === 'open' && t.block >= lock.startBlock) return lock.fuid;
+  if (lock && lock.status === 'open' && t.block >= lock.startBlock && ts >= (lock.since || lock.startedAt)) return lock.fuid;
   const past = (await db.ref('depositWindows').orderByChild('endBlock').startAt(t.block).once('value')).val() || {};
-  for (const w of Object.values(past)) if (t.block >= w.startBlock && t.block <= w.endBlock) return w.fuid;
+  for (const w of Object.values(past)) if (t.block >= w.startBlock && t.block <= w.endBlock && ts >= (w.since || w.startedAt || 0)) return w.fuid;
   const byWallet = (await db.ref('depositWalletIndex/' + t.from).once('value')).val();
   return byWallet || null;
 }
@@ -1074,8 +1092,8 @@ async function adHandle(t) {
 async function adCloseLock(lock, status) {
   if (!lock) return;
   let endBlock = lock.startBlock + 60;
-  try { endBlock = (await adBlock()) + 20; } catch {}
-  await db.ref(`depositWindows/${lock.id}`).set({ fuid: lock.fuid, startBlock: lock.startBlock, endBlock, startedAt: lock.startedAt, closedAt: Date.now(), status });
+  try { const l = await adBlock(); endBlock = l + Math.ceil(20_000 / await adBlockMs(l)); } catch {}
+  await db.ref(`depositWindows/${lock.id}`).set({ fuid: lock.fuid, startBlock: lock.startBlock, endBlock, since: lock.since || lock.startedAt, startedAt: lock.startedAt, closedAt: Date.now(), status });
   await db.ref('settings/depositLock').transaction(cur => (cur && cur.id === lock.id) ? null : cur);
 }
 async function adCleanup() {
@@ -1088,7 +1106,8 @@ async function adScan() {
   if (AD.scanning) return; AD.scanning = true;
   try {
     const wallet = await adWallet();
-    const safe = (await adBlock()) - AD.CONF;
+    const latest = await adBlock();
+    const safe = latest - Math.max(AD.CONF, Math.ceil(AD_HOLD / await adBlockMs(latest)));
     let from = (await db.ref('settings/lastScannedBlock').once('value')).val();
     if (!from) from = safe - 200;
     from = Math.max(from, safe - 20_000);
@@ -1114,9 +1133,10 @@ function mountAutoDeposit(app) {
       const wait = adLimited(AD.rlStart, fuid, 30_000);
       if (wait) return res.json({ ok: false, error: 'too_soon', waitSec: wait });
       if (lock && Date.now() > lock.expiresAt) { await adCloseLock(lock, 'expired'); lock = null; }
-      const startBlock = await adBlock();
+      const latest = await adBlock();
       const now = Date.now();
-      const mine = { id: `w${now}_${fuid.slice(0, 6)}`, fuid, startedAt: now, expiresAt: now + AD.WINDOW, startBlock, status: 'open' };
+      const startBlock = Math.max(0, latest - Math.ceil((AD_GRACE + 15_000) / await adBlockMs(latest)));
+      const mine = { id: `w${now}_${fuid.slice(0, 6)}`, fuid, startedAt: now, since: now - AD_GRACE, expiresAt: now + AD.WINDOW, startBlock, status: 'open' };
       const tx = await db.ref('settings/depositLock').transaction(cur => (cur && cur.status === 'open' && Date.now() < cur.expiresAt) ? undefined : mine);
       if (!tx.committed) {
         AD.rlStart.delete(fuid);
@@ -1139,6 +1159,7 @@ function mountAutoDeposit(app) {
       const logs = await adLogs(await adWallet(), lock.startBlock, safe);
       const credited = [];
       for (const t of logs) {
+        if ((await adBlockTs(t.block).catch(() => Date.now())) < (lock.since || lock.startedAt)) continue; // older than 30s before the click
         if (t.amt < AD.MIN) { await adUnmatched(t, `below minimum ${AD.MIN} USDT`); continue; }
         const c = await adCredit(fuid, t, 'window'); if (c) credited.push(c);
       }
