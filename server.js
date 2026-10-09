@@ -156,6 +156,17 @@ async function updateHistoryStatus(fuid, hid, status) {
   } catch (e) { log('HIST', `status err ${e.message}`); }
 }
 
+/** Store the admin-entered withdrawal TxID on the matching history row. */
+async function setHistoryHash(fuid, hid, hash) {
+  const snap = await db.ref(`users/${fuid}/history`).once('value');
+  const jobs = [];
+  snap.forEach(c => {
+    const v = c.val() || {};
+    if (c.key === hid || v.hid === hid) jobs.push(db.ref(`users/${fuid}/history/${c.key}`).update({ hash, txid: hash, hashAt: Date.now() }));
+  });
+  await Promise.all(jobs);
+}
+
 /** In-app notification for one user — read by the app's bell icon
  *  (users/{fuid}/notifs → { title, body, type, ts, read }). */
 async function pushNotif(fuid, { title, body, type = 'INFO' }) {
@@ -417,6 +428,13 @@ async function handleAskReply(text) {
     const uid = t.includes('@') ? t : t.replace(/[^A-Za-z0-9_-]/g, '');
     if (!uid) { ask('uid'); return tgSend(bad('Send a valid UID, e.g. `AB12CD`'), { reply_markup: cancelKb }); }
     return sendUserDetailCard(null, uid);
+  }
+  if (a.kind === 'withash') {
+    const h = text.trim().replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9:_-]{10,200}$/.test(h)) { ASK = { ...a, ts: Date.now() }; return tgSend(bad('Send a valid transaction hash (TxID).'), { reply_markup: cancelKb }); }
+    await setHistoryHash(a.fuid, a.hid, h);
+    log('WIT', `hash saved UID=${a.uid} hid=${a.hid}`);
+    return tgSend(card('✅ HASH SAVED', [['👤 UID', `\`${a.uid || '—'}\``], ['💸 Amount', `${a.amt} ${a.coin}`], ['🔗 TxID', `\`${h}\``]]));
   }
   if (a.kind === 'search') return sendSearchResults(text.slice(0, 60));
   if (a.kind === 'coin') {
@@ -1310,6 +1328,13 @@ async function processApproveReject(cb, action, cbId) {
   const msgId = ctx.msgId || cb.message?.message_id;
   if (msgId) await tgEdit(msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req));
   sentByCbId.delete(cbId);
+  if (ctx.type === 'wit' && action === 'approve') {
+    const hid = (req && req.hid) || ctx.hid;
+    if (hid) {
+      ask('withash', { fuid: ctx.fuid, hid, amt: r.amt, coin: r.coin, uid: r.user?.uid });
+      await tgSend(`🔗 *Withdrawal approved* — ${r.amt} ${r.coin} (UID \`${r.user?.uid || '—'}\`)\n\nSend the *transaction hash (TxID)* now. It will show in the user's history.`, { reply_markup: cancelKb });
+    }
+  }
   return true;
 }
 
