@@ -1433,6 +1433,13 @@ async function handleCallback(cb, upd = null) {
 
   let m;
   if (data.startsWith('sup_')) return tgAnswer(cb.id, 'Customer care has moved to the separate support bot.', true);
+  if (data === 'rhb_no')  { await tgAnswer(cb.id, 'Cancelled'); return tgEdit(cb.message?.message_id, '✖ Balance reset cancelled.').catch(() => {}); }
+  if (data === 'rhb_yes') {
+    if (!(await claimTapOnce(`rhb_${cb.message?.message_id}`, 'yes').catch(() => ({ ok: true }))).ok) return tgAnswer(cb.id, 'Already done');
+    await tgAnswer(cb.id, 'Resetting…');
+    tgEdit(cb.message?.message_id, '⏳ Resetting all balances…').catch(() => {});
+    return resetAllBalances().catch(e => tgSend(bad(e.message)));
+  }
   if (data === 'noop_done') { await tgAnswer(cb.id, '✔ Already done — nothing more to do.'); return; }
   if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3], upd);
   // Trade/P2P callbacks (cbId starts with trade_) are completed by the app
@@ -1593,21 +1600,22 @@ async function findOrderById(orderId) {
   });
   return hit;
 }
-async function adminSettleOrder(orderId, action) {
+async function adminSettleOrder(orderId, action, quiet = false) {
+  const out = quiet ? (m => ({ ok: false, msg: m })) : tgSend;
   orderId = String(orderId).replace(/^#/, '');
   const f = await findOrderById(orderId);
-  if (!f) return tgSend(bad(`Order \`#${orderId}\` not found or already finished.`));
+  if (!f) return out(bad(`Order \`#${orderId}\` not found or already finished.`));
   const { fuid, user } = f;
-  if (action === 'complete' && !kycAllowsTrade(user)) return tgSend(bad(`UID \`${user.uid}\` has not completed KYC — you can only /reject this order.`));
+  if (action === 'complete' && !kycAllowsTrade(user)) return out(bad(`UID \`${user.uid}\` has not completed KYC — you can only /reject this order.`));
   // Same once-only lock the app uses, so the app can never settle it a second time.
   const st = user.chats?.[orderId] || {};
   const lockKey = String(st.cbId || `admin_${orderId}`).split('.').join('_').split('/').join('_');
   const lk = await db.ref(`users/${fuid}/tradeDone/${lockKey}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
-  if (!lk.committed) return tgSend(bad(`Order \`#${orderId}\` was already handled.`));
+  if (!lk.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
   // Claim the order itself: only one remover wins.
   let got = null;
   const tx = await db.ref(`users/${fuid}/orders/${orderId}`).transaction(cur => { got = cur; return cur ? null : undefined; });
-  if (!tx.committed || !got) return tgSend(bad(`Order \`#${orderId}\` was already finished.`));
+  if (!tx.committed || !got) return out(bad(`Order \`#${orderId}\` was already finished.`));
   if (st.cbId) await claimTapOnce(`cb_${st.cbId}`, action === 'complete' ? 'approve' : 'reject').catch(() => {});
   const o = got, mode = String(o.mode || 'BUY').toUpperCase(), usdt = r8(o.usdt);
   let res = null;
@@ -1624,10 +1632,56 @@ async function adminSettleOrder(orderId, action) {
     : { title: 'P2P order cancelled', body: `Order #${orderId} was cancelled.${mode === 'SELL' ? ' Your USDT has been refunded.' : ''}`, type: 'ALERT' }).catch(() => {});
   if (st.tgMsgId) tgEdit(st.tgMsgId, `${action === 'complete' ? '✅ *TRADE COMPLETE (admin)*' : '❌ *TRADE REJECTED (admin)*'}\n\nUID: \`${user.uid}\`\nOrder: \`#${orderId}\``).catch(() => {});
   log('TRADE', `admin ${action} #${orderId} ${mode} ${usdt} UID=${user.uid} ${res ? `| ${res.oldBal} → ${res.newBal}` : ''}`);
+  if (quiet) return { ok: true, refunded: !!res };
   return tgSend(card(action === 'complete' ? '✅ ORDER COMPLETED' : '❌ ORDER REJECTED', [
     ['🧾 Order', `\`#${orderId}\``], ['👤 UID', `\`${user.uid || '—'}\``], ['🔁 Type', mode], ['💵 USDT', String(usdt)],
     ['💰 Balance', res ? `${res.oldBal} → ${res.newBal}` : 'unchanged'],
   ]));
+}
+
+
+/** /cancelalltrades — reject every open P2P order (SELL USDT refunded once) and clear stuck chats. */
+async function cancelAllTrades() {
+  const snap = await db.ref('users').once('value');
+  const jobs = [];
+  snap.forEach(c => {
+    const u = c.val() || {};
+    for (const id of Object.keys(u.orders || {})) jobs.push({ fuid: c.key, id });
+    for (const id of Object.keys(u.chats || {})) if (!(u.orders || {})[id]) jobs.push({ fuid: c.key, id, chatOnly: true });
+  });
+  if (!jobs.length) return tgSend('✅ No pending trades.');
+  await tgSend(`⏳ Cancelling ${jobs.length} trade(s)…`);
+  let done = 0, refunded = 0, forced = 0;
+  for (const j of jobs) {
+    try {
+      if (!j.chatOnly) {
+        const r = await adminSettleOrder(j.id, 'reject', true);
+        if (r && r.ok) { done++; if (r.refunded) refunded++; continue; }
+        await db.ref(`users/${j.fuid}/orders/${j.id}`).remove();
+      }
+      await db.ref(`users/${j.fuid}/chats/${j.id}`).remove();
+      forced++;
+    } catch (e) { log('ERR', `cancelall ${j.id}: ${e.message}`); }
+  }
+  log('TRADE', `cancelalltrades: ${done} rejected, ${refunded} refunded, ${forced} force-cleared`);
+  return tgSend(card('🧹 ALL TRADES CANCELLED', [['Rejected', done], ['SELL refunds', refunded], ['Stuck cleared', forced]]));
+}
+
+/** /resethousebalance — after confirmation, set every coin balance of every user to 0. */
+async function resetAllBalances() {
+  const snap = await db.ref('users').once('value');
+  const upd = {}; let n = 0;
+  snap.forEach(c => {
+    const u = c.val(); if (!u || typeof u !== 'object') return;
+    n++;
+    for (const k of Object.keys(u.balances && typeof u.balances === 'object' ? u.balances : {})) upd[`users/${c.key}/balances/${k}`] = 0;
+    upd[`users/${c.key}/balances/USDT`] = 0;
+    if (u.balance !== undefined) upd[`users/${c.key}/balance`] = 0;
+  });
+  const keys = Object.keys(upd);
+  for (let i = 0; i < keys.length; i += 500) await db.ref().update(Object.fromEntries(keys.slice(i, i + 500).map(k => [k, upd[k]])));
+  log('ADMIN', `resethousebalance: ${n} users zeroed`);
+  return tgSend(card('🧹 BALANCES RESET', [['Users', n], ['All balances', '0']]));
 }
 
 /** Locate a withdrawal request (owner + history id) before it is resolved. */
@@ -2374,6 +2428,8 @@ async function handleUpdate(upd) {
     if (pm) { ASK = null; return adminSettleOrder(pm[2], pm[1].toLowerCase()).catch(e => tgSend(bad(e.message))); }
     if (/^\/(complete|reject)\b/i.test(text)) return tgSend('Use: `/complete ORDERID` or `/reject ORDERID`'); }
   if (/^\/(deplock|deprelease|setwallet|unmatched|assign)\b/i.test(text)) { ASK = null; if (await adAdminCmd(text).catch(e => (tgSend(bad(e.message)), true))) return; }
+  if (/^\/cancelalltrades?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return cancelAllTrades().catch(e => tgSend(bad(e.message))); }
+  if (/^\/resethousebalance(?:@\S+)?\s*$/i.test(text)) { ASK = null; return tgSend('⚠️ *Reset ALL user balances to 0?*\nThis cannot be undone.', { reply_markup: { inline_keyboard: [[{ text: '✅ Yes, reset all', callback_data: 'rhb_yes' }, { text: '✖ Cancel', callback_data: 'rhb_no' }]] } }); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
@@ -3087,6 +3143,8 @@ if (String(process.env.WA_ENABLED || 'true') !== 'false') {
 // Telegram "/" command list
 tgFetch('setMyCommands', { commands: [
   { command: 'menu', description: 'Admin dashboard' },
+  { command: 'cancelalltrades', description: 'Cancel every pending P2P trade' },
+  { command: 'resethousebalance', description: 'Set all user balances to 0 (asks to confirm)' },
   { command: 'activeuser', description: 'Users with non-zero balance' },
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
   { command: 'complete', description: 'Complete a P2P order: /complete ORDERID' },
