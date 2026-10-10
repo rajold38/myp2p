@@ -1435,7 +1435,13 @@ async function handleCallback(cb, upd = null) {
 
   let m;
   if (data.startsWith('sup_')) return tgAnswer(cb.id, 'Customer care has moved to the separate support bot.', true);
-  if (data === 'rhb_no')  { await tgAnswer(cb.id, 'Cancelled'); return tgEdit(cb.message?.message_id, '✖ Balance reset cancelled.').catch(() => {}); }
+  if (data === 'rhb_no')  { await tgAnswer(cb.id, 'Cancelled'); return tgEdit(cb.message?.message_id, '✖ Cancelled.').catch(() => {}); }
+  if (data === 'rnk_yes') {
+    if (!(await claimTapOnce(`rnk_${cb.message?.message_id}`, 'yes').catch(() => ({ ok: true }))).ok) return tgAnswer(cb.id, 'Already done');
+    await tgAnswer(cb.id, 'Deleting…');
+    tgEdit(cb.message?.message_id, '⏳ Deleting non-KYC accounts…').catch(() => {});
+    return resetNoKycUsers().catch(e => tgSend(bad(e.message)));
+  }
   if (data === 'rhb_yes') {
     if (!(await claimTapOnce(`rhb_${cb.message?.message_id}`, 'yes').catch(() => ({ ok: true }))).ok) return tgAnswer(cb.id, 'Already done');
     await tgAnswer(cb.id, 'Resetting…');
@@ -2072,6 +2078,36 @@ async function sendUserHistory(uid, limit = 15) {
     { reply_markup: { inline_keyboard: [[{ text: '👤 User card', callback_data: `userdetail_${uid}` }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
 }
 
+/** Users that have not finished KYC (Level 2 / approved). */
+async function listNoKycUsers() {
+  const snap = await db.ref('users').once('value');
+  const out = [];
+  snap.forEach(c => { const u = c.val(); if (u && typeof u === 'object' && !kycInfo(u).done) out.push({ fuid: c.key, uid: u.uid, user: u }); });
+  return out;
+}
+
+/** /resetnokyc — delete every non-KYC account (data + login) so the same email can sign up fresh. */
+async function resetNoKycUsers() {
+  const list = await listNoKycUsers();
+  if (!list.length) return tgSend('✅ No non-KYC users.');
+  const set = new Set(list.map(x => x.fuid));
+  const [refs, wallets] = await Promise.all([db.ref('referralCodes').once('value'), db.ref('depositWalletIndex').once('value')]);
+  const upd = {};
+  for (const x of list) { upd[`users/${x.fuid}`] = null; if (x.uid) upd[`uidIndex/${x.uid}`] = null; }
+  refs.forEach(c => { if (set.has(c.val())) upd[`referralCodes/${c.key}`] = null; });
+  wallets.forEach(c => { const v = c.val(); if (set.has(typeof v === 'object' && v ? v.fuid : v)) upd[`depositWalletIndex/${c.key}`] = null; });
+  const keys = Object.keys(upd);
+  for (let i = 0; i < keys.length; i += 500) await db.ref().update(Object.fromEntries(keys.slice(i, i + 500).map(k => [k, null])));
+  let authDel = 0, authFail = 0;
+  const ids = [...set];
+  for (let i = 0; i < ids.length; i += 1000) {
+    try { const r = await admin.auth().deleteUsers(ids.slice(i, i + 1000)); authDel += r.successCount; authFail += r.failureCount; }
+    catch (e) { authFail += Math.min(1000, ids.length - i); log('ERR', `resetnokyc auth: ${e.message}`); }
+  }
+  log('ADMIN', `resetnokyc: ${list.length} accounts deleted (auth ok ${authDel}, fail ${authFail})`);
+  return tgSend(card('🧹 NON-KYC ACCOUNTS RESET', [['Accounts deleted', list.length], ['Logins removed', authDel], ['Login errors', authFail]]));
+}
+
 async function handleActiveUsers() {
   const snap = await db.ref('users').once('value');
   const users = [];
@@ -2455,6 +2491,7 @@ async function handleUpdate(upd) {
     if (/^\/(complete|reject)\b/i.test(text)) return tgSend('Use: `/complete ORDERID` or `/reject ORDERID`'); }
   if (/^\/(deplock|deprelease|setwallet|unmatched|assign)\b/i.test(text)) { ASK = null; if (await adAdminCmd(text).catch(e => (tgSend(bad(e.message)), true))) return; }
   if (/^\/cancelalltrades?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return cancelAllTrades().catch(e => tgSend(bad(e.message))); }
+  if (/^\/resetnokyc(?:@\S+)?\s*$/i.test(text)) { ASK = null; return listNoKycUsers().then(l => l.length ? tgSend(`⚠️ *Delete ${l.length} non-KYC account(s)?*\nTheir data, balance and login will be removed. They can sign up again with the same email.\nThis cannot be undone.`, { reply_markup: { inline_keyboard: [[{ text: '✅ Yes, delete', callback_data: 'rnk_yes' }, { text: '✖ Cancel', callback_data: 'rhb_no' }]] } }) : tgSend('✅ No non-KYC users.')).catch(e => tgSend(bad(e.message))); }
   if (/^\/resethousebalance(?:@\S+)?\s*$/i.test(text)) { ASK = null; return tgSend('⚠️ *Reset ALL user balances to 0?*\nThis cannot be undone.', { reply_markup: { inline_keyboard: [[{ text: '✅ Yes, reset all', callback_data: 'rhb_yes' }, { text: '✖ Cancel', callback_data: 'rhb_no' }]] } }); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
@@ -3170,6 +3207,7 @@ if (String(process.env.WA_ENABLED || 'true') !== 'false') {
 tgFetch('setMyCommands', { commands: [
   { command: 'menu', description: 'Admin dashboard' },
   { command: 'cancelalltrades', description: 'Reject all pending deposits, withdrawals and P2P trades' },
+  { command: 'resetnokyc', description: 'Delete all non-KYC accounts (asks to confirm)' },
   { command: 'resethousebalance', description: 'Set all user balances to 0 (asks to confirm)' },
   { command: 'activeuser', description: 'Users with non-zero balance' },
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
