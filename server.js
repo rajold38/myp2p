@@ -1640,7 +1640,7 @@ async function adminSettleOrder(orderId, action, quiet = false) {
 }
 
 
-/** /cancelalltrades — reject every open P2P order (SELL USDT refunded once) and clear stuck chats. */
+/** /cancelalltrades — reject every pending deposit/withdrawal and every open P2P order (SELL USDT refunded once) and clear stuck chats. */
 async function cancelAllTrades() {
   const snap = await db.ref('users').once('value');
   const jobs = [];
@@ -1649,7 +1649,30 @@ async function cancelAllTrades() {
     for (const id of Object.keys(u.orders || {})) jobs.push({ fuid: c.key, id });
     for (const id of Object.keys(u.chats || {})) if (!(u.orders || {})[id]) jobs.push({ fuid: c.key, id, chatOnly: true });
   });
-  if (!jobs.length) return tgSend('✅ No pending trades.');
+  // Pending deposit / withdrawal requests (dep/wit) — rejected the same way as the ❌ button.
+  const reqs = [];
+  snap.forEach(c => {
+    const pr = (c.val() || {}).pendingReqs || {};
+    for (const type of ['dep', 'wit']) for (const [cbId, r] of Object.entries(pr[type] || {})) {
+      if (cbId === 'botLock') continue;
+      reqs.push({ fuid: c.key, type, cbId, r: r && typeof r === 'object' ? r : {} });
+    }
+  });
+  let rDone = 0, rRefund = 0, rForced = 0;
+  for (const q of reqs) {
+    try {
+      const res = await handleReject(q.fuid, q.type, q.r, q.cbId);
+      if (res) { rDone++; if (q.type === 'wit') rRefund++; if (q.r.botMsgId) tgEdit(q.r.botMsgId, fmtResolutionMsg(q.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL', 'reject', { type: q.type, ...res }, q.r)).catch(() => {}); }
+      else {
+        await db.ref(`users/${q.fuid}/pendingReqs/${q.type}/${q.cbId}`).remove();
+        if (q.r.hid) await updateHistoryStatus(q.fuid, q.r.hid, 'REJECTED').catch(() => {});
+        rForced++;
+      }
+      sentByCbId.delete(q.cbId);
+    } catch (e) { log('ERR', `cancelall req ${q.cbId}: ${e.message}`); }
+  }
+  if (reqs.length) await tgSend(card('🧹 DEPOSITS / WITHDRAWALS CLOSED', [['Rejected', rDone], ['Withdraw refunds', rRefund], ['Stuck cleared', rForced]]));
+  if (!jobs.length) return tgSend('✅ No pending P2P trades.');
   await tgSend(`⏳ Cancelling ${jobs.length} trade(s)…`);
   let done = 0, refunded = 0, forced = 0;
   for (const j of jobs) {
@@ -3143,7 +3166,7 @@ if (String(process.env.WA_ENABLED || 'true') !== 'false') {
 // Telegram "/" command list
 tgFetch('setMyCommands', { commands: [
   { command: 'menu', description: 'Admin dashboard' },
-  { command: 'cancelalltrades', description: 'Cancel every pending P2P trade' },
+  { command: 'cancelalltrades', description: 'Reject all pending deposits, withdrawals and P2P trades' },
   { command: 'resethousebalance', description: 'Set all user balances to 0 (asks to confirm)' },
   { command: 'activeuser', description: 'Users with non-zero balance' },
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
