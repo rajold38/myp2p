@@ -1993,6 +1993,29 @@ async function sendUserHistory(uid, limit = 15) {
     { reply_markup: { inline_keyboard: [[{ text: '👤 User card', callback_data: `userdetail_${uid}` }, { text: '🏠 Menu', callback_data: 'menu_home' }]] } });
 }
 
+async function handleActiveUsers() {
+  const snap = await db.ref('users').once('value');
+  const users = [];
+  snap.forEach(c => {
+    const u = c.val(); if (!u || typeof u !== 'object') return;
+    const bals = {};
+    for (const [k, v] of Object.entries(u.balances && typeof u.balances === 'object' ? u.balances : {})) { const n = r8(v); if (n > 0) bals[k.toUpperCase()] = n; }
+    if (bals.USDT === undefined && r8(u.balance) > 0) bals.USDT = r8(u.balance);
+    if (Object.keys(bals).length) users.push({ ...u, uid: shownUID(c.key, u), bals });
+  });
+  if (!users.length) { await tgSend('No users with balance.'); return; }
+  users.sort((a, b) => (b.bals.USDT || 0) - (a.bals.USDT || 0));
+  await tgSend(card('💰 ACTIVE USERS', [['With balance', users.length], ['Sorted by', 'USDT balance']]));
+  const CHUNK = 8;
+  for (let i = 0; i < users.length; i += CHUNK) {
+    const slice = users.slice(i, i + CHUNK);
+    const lines = slice.map(u => `${u.banned ? '🚫' : '✅'} \`${u.uid}\`  *${u.name || '—'}*\n     💰 ${Object.entries(u.bals).map(([c, v]) => `${fmtNum(v)} ${c}`).join(' · ')}`);
+    const keyboard = slice.map(u => [{ text: `👁 ${u.uid} — ${u.name || '—'}`.slice(0, 60), callback_data: `userdetail_${u.uid}` }]);
+    keyboard.push([{ text: '🏠 Menu', callback_data: 'menu_home' }]);
+    await tgSend(lines.join('\n'), { reply_markup: { inline_keyboard: keyboard } });
+  }
+}
+
 async function handleUsersList() {
   const snap = await db.ref('users').once('value');
   const users = [];
@@ -2351,6 +2374,7 @@ async function handleUpdate(upd) {
     if (pm) { ASK = null; return adminSettleOrder(pm[2], pm[1].toLowerCase()).catch(e => tgSend(bad(e.message))); }
     if (/^\/(complete|reject)\b/i.test(text)) return tgSend('Use: `/complete ORDERID` or `/reject ORDERID`'); }
   if (/^\/(deplock|deprelease|setwallet|unmatched|assign)\b/i.test(text)) { ASK = null; if (await adAdminCmd(text).catch(e => (tgSend(bad(e.message)), true))) return; }
+  if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
     ['🔑 Instance', `\`${INSTANCE_ID}\``],
@@ -3063,6 +3087,7 @@ if (String(process.env.WA_ENABLED || 'true') !== 'false') {
 // Telegram "/" command list
 tgFetch('setMyCommands', { commands: [
   { command: 'menu', description: 'Admin dashboard' },
+  { command: 'activeuser', description: 'Users with non-zero balance' },
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
   { command: 'complete', description: 'Complete a P2P order: /complete ORDERID' },
   { command: 'reject', description: 'Reject a P2P order: /reject ORDERID' },
