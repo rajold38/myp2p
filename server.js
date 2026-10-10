@@ -41,6 +41,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT             = Number(process.env.PORT) || Number(process.argv[process.argv.indexOf('--port')+1]) || 8080;
 const TG_TOKEN         = process.env.TG_TOKEN;
 const TG_CHAT          = process.env.TG_CHAT;
+const TG_TOKEN_SUPPORT = process.env.TG_TOKEN_SUPPORT;
+const TG_CHAT_SUPPORT = process.env.TG_CHAT_SUPPORT;
+const SUPPORT_ENABLED = !!(TG_TOKEN_SUPPORT && TG_CHAT_SUPPORT && TG_TOKEN_SUPPORT !== TG_TOKEN);
+const TG_API_SUP = `https://api.telegram.org/bot${TG_TOKEN_SUPPORT}`;
+const SUP_SCOPE = 'care_' + crypto.createHash('sha256').update(TG_TOKEN_SUPPORT || 'disabled').digest('hex').slice(0,16);
+const SUP_STATE = `botState/${SUP_SCOPE}`;
 const FIREBASE_DB_URL  = process.env.FIREBASE_DB_URL;
 const FIREBASE_SA_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
 const RENDER_URL       = process.env.RENDER_EXTERNAL_URL || '';
@@ -557,6 +563,32 @@ const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, 
 const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
 const tgAnswer = (cbId, text, alert = false) => tgFetch('answerCallbackQuery', { callback_query_id: cbId, text, show_alert: !!alert });
 
+async function tgFetchSup(endpoint, body) {
+  if(!SUPPORT_ENABLED)return {ok:false,description:'Customer-care bot is not configured'};
+  try {
+    const r = await fetch(`${TG_API_SUP}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    let data = await r.json();
+    // A name/email with _ * ` [ breaks Markdown → Telegram refuses the whole
+    // message (that is why some user cards never appeared). Retry as plain text.
+    if (!data.ok && body && body.parse_mode && /parse entities|can't find end/i.test(data.description || '')) {
+      const plain = { ...body }; delete plain.parse_mode;
+      if (typeof plain.text === 'string') plain.text = plain.text.replace(/[*`]/g, '');
+      if (typeof plain.caption === 'string') plain.caption = plain.caption.replace(/[*`]/g, '');
+      const r2 = await fetch(`${TG_API_SUP}/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(plain) });
+      data = await r2.json();
+    }
+    if (!data.ok) log('TG', `${endpoint} failed: ${data.description || JSON.stringify(data)}`);
+    return data;
+  } catch (e) { log('TG', `fetch err ${endpoint}: ${e.message}`); return { ok: false, error: e.message }; }
+}
+const tgSendSup   = (text, extra={}) => tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text, parse_mode: 'Markdown', ...extra });
+const tgEditSup   = (msgId, text, extra={}) => tgFetchSup('editMessageText', { chat_id: TG_CHAT_SUPPORT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
+const tgAnswerSup = (cbId, text, alert = false) => tgFetchSup('answerCallbackQuery', { callback_query_id: cbId, text, show_alert: !!alert });
+
 // ════════════════════════════════════════════════════════════════════
 // ONE-TAP GUARD — an Approve / Reject button can work ONLY ONCE.
 // Layer 1: in-memory Map, set synchronously → a double tap that arrives
@@ -816,8 +848,8 @@ const SUP = { active: null };
 const SUP_CHAIN = new Map();
 const supRef = (f, p = '') => db.ref(`users/${f}/support${p ? '/' + p : ''}`);
 const onceFlag = async (ref) => (await ref.transaction(c => (c ? undefined : Date.now()))).committed;
-async function supLoadActive() { try { SUP.active = (await db.ref('botState/supActive').once('value')).val() || null; } catch {} }
-async function supSetActive(f) { SUP.active = f || null; try { await db.ref('botState/supActive').set(f || null); } catch {} }
+async function supLoadActive() { try { SUP.active = (await db.ref(`${SUP_STATE}/active`).once('value')).val() || null; } catch {} }
+async function supSetActive(f) { SUP.active = f || null; try { await db.ref(`${SUP_STATE}/active`).set(f || null); } catch {} }
 async function supLite(fuid) {
   const g = async (k) => (await db.ref(`users/${fuid}/${k}`).once('value')).val();
   const [uid, name, email, phone, nick] = await Promise.all([g('uid'), g('name'), g('email'), g('phone'), g('profile/nickname')]);
@@ -834,11 +866,11 @@ function supQueue(fuid) {
 function supDataUrlToBuf(u) { const m = String(u || '').match(/^data:(image\/[\w+.-]+);base64,(.+)$/); return m ? { type: m[1], buf: Buffer.from(m[2], 'base64') } : null; }
 async function supSendPhoto(buf, type, caption, extra = {}) {
   const fd = new FormData();
-  fd.append('chat_id', String(TG_CHAT));
+  fd.append('chat_id', String(TG_CHAT_SUPPORT));
   if (caption) fd.append('caption', String(caption).slice(0, 1000));
   if (extra.reply_markup) fd.append('reply_markup', JSON.stringify(extra.reply_markup));
   fd.append('photo', new Blob([buf], { type: type || 'image/jpeg' }), 'photo.jpg');
-  try { return await (await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: fd })).json(); } catch (e) { return { ok: false, error: e.message }; }
+  try { return await (await fetch(`${TG_API_SUP}/sendPhoto`, { method: 'POST', body: fd })).json(); } catch (e) { return { ok: false, error: e.message }; }
 }
 async function supForward(fuid, lite, m) {
   const head = `💬 ${lite.name} · UID ${lite.uid}`;
@@ -846,46 +878,51 @@ async function supForward(fuid, lite, m) {
   let r;
   const ph = m.img && supDataUrlToBuf(m.img);
   if (ph) r = await supSendPhoto(ph.buf, ph.type, `${head}${m.text ? '\n\n' + m.text : ''}`, kb ? { reply_markup: kb } : {});
-  else r = await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `${head}\n\n${String(m.text || '').slice(0, 3500)}`, ...(kb ? { reply_markup: kb } : {}) });
+  else r = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `${head}\n\n${String(m.text || '').slice(0, 3500)}`, ...(kb ? { reply_markup: kb } : {}) });
   const mid = r?.result?.message_id;
-  if (mid) await db.ref(`botState/supMap/${mid}`).set(fuid).catch(() => {});
+  if (mid) await db.ref(`${SUP_STATE}/messages/${mid}`).set(fuid);
+  return !!mid;
 }
 async function supProcess(fuid) {
+  if(!SUPPORT_ENABLED)return;
+  const notifiedKey=`notified_${SUP_SCOPE}`,cardKey=`card_${SUP_SCOPE}`,cancelKey=`cancel_${SUP_SCOPE}`,endKey=`end_${SUP_SCOPE}`,fwdKey=`fwd_${SUP_SCOPE}`;
   const s = (await supRef(fuid).once('value')).val();
   if (!s || !s.meta) return;
   const meta = s.meta, msgs = s.msgs || {};
   // 1) new request → Accept / Busy card for the admin
-  if (meta.status === 'waiting' && !meta.notified && await onceFlag(supRef(fuid, 'meta/notified'))) {
+  if (['waiting','live'].includes(meta.status) && !meta[notifiedKey] && await onceFlag(supRef(fuid, `meta/${notifiedKey}`))) {
     const lite = await supLite(fuid);
     const ctx = Object.values(msgs).filter(x => x && x.ts >= (meta.sessionAt || 0)).sort((a, b) => a.ts - b.ts).slice(-6)
       .map(x => `${x.from === 'user' ? '👤' : x.from === 'agent' ? '🎧' : '🤖'} ${x.img ? '[photo] ' : ''}${String(x.text || '').slice(0, 140)}`).join('\n');
-    const r = await tgFetch('sendMessage', { chat_id: TG_CHAT,
+    const r = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT,
       text: `🎧 LIVE SUPPORT REQUEST\n\n👤 ${lite.name}\n🆔 UID: ${lite.uid}\n📧 ${lite.email}\n📱 ${lite.phone}\n📝 Topic: ${meta.topic || 'General'}\n\nRecent chat:\n${ctx || '—'}`,
-      reply_markup: { inline_keyboard: [[{ text: '✅ Accept chat', callback_data: `sup_acc_${fuid}` }, { text: '⏳ Busy', callback_data: `sup_rej_${fuid}` }]] } });
-    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ tgCard: r.result.message_id });
+      reply_markup: { inline_keyboard: [meta.status==='live' ? [{text:'Reply to user',callback_data:`sup_sw_${fuid}`},{text:'End chat',callback_data:`sup_end_${fuid}`}] : [{ text: '✅ Accept chat', callback_data: `sup_acc_${fuid}` }, { text: '⏳ Busy', callback_data: `sup_rej_${fuid}` }]] } });
+    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ [cardKey]: r.result.message_id });
+    else {await supRef(fuid, `meta/${notifiedKey}`).remove();return;}
     log('SUP', `request from ${lite.uid}`);
   }
   // 2) user cancelled while waiting
-  if (meta.cancelled && !meta.cancelNotified && await onceFlag(supRef(fuid, 'meta/cancelNotified'))) {
+  if (meta.cancelled && !meta[cancelKey] && await onceFlag(supRef(fuid, `meta/${cancelKey}`))) {
     const lite = await supLite(fuid);
-    if (meta.tgCard) await tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: meta.tgCard, text: `🎧 Support request from ${lite.name} · UID ${lite.uid}\n\n❌ Cancelled by user` });
+    if (meta[cardKey]) await tgFetchSup('editMessageText', { chat_id: TG_CHAT_SUPPORT, message_id: meta[cardKey], text: `🎧 Support request from ${lite.name} · UID ${lite.uid}\n\n❌ Cancelled by user` });
   }
   // 3) live → forward every unsent user message (photos too)
   if (meta.status === 'live') {
     let lite = null;
-    const keys = Object.keys(msgs).filter(k => msgs[k] && msgs[k].from === 'user' && !msgs[k].fwd && (msgs[k].ts || 0) >= (meta.reqAt || 0) - 1000)
+    const keys = Object.keys(msgs).filter(k => msgs[k] && msgs[k].from === 'user' && !msgs[k][fwdKey] && (msgs[k].ts || 0) >= (meta.reqAt || 0) - 1000)
       .sort((a, b) => (msgs[a].ts || 0) - (msgs[b].ts || 0));
     for (const k of keys) {
-      if (!(await onceFlag(supRef(fuid, `msgs/${k}/fwd`)))) continue;
+      if (!(await onceFlag(supRef(fuid, `msgs/${k}/${fwdKey}`)))) continue;
       lite = lite || await supLite(fuid);
-      await supForward(fuid, lite, msgs[k]);
+      const sent=await supForward(fuid, lite, msgs[k]);
+      if(!sent){await supRef(fuid, `msgs/${k}/${fwdKey}`).remove();break;}
     }
   }
   // 4) user ended the chat
-  if (meta.status === 'closed' && meta.closedBy === 'user' && !meta.endNotified && await onceFlag(supRef(fuid, 'meta/endNotified'))) {
+  if (meta.status === 'closed' && meta.closedBy === 'user' && !meta[endKey] && await onceFlag(supRef(fuid, `meta/${endKey}`))) {
     const lite = await supLite(fuid);
     if (SUP.active === fuid) await supSetActive(null);
-    await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🔚 ${lite.name} · UID ${lite.uid} ended the support chat.` });
+    await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🔚 ${lite.name} · UID ${lite.uid} ended the support chat.` });
   }
 }
 async function supAgentMsg(fuid, m) {
@@ -893,81 +930,81 @@ async function supAgentMsg(fuid, m) {
   await supRef(fuid, 'meta').update({ lastAgentAt: Date.now() });
 }
 async function handleSupCb(cb, act, fuid) {
-  if (!db) return tgAnswer(cb.id, 'Backend offline');
+  if (!db) return tgAnswerSup(cb.id, 'Backend offline');
   const lite = await supLite(fuid);
   if (act === 'acc') {
     const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'live'; c.acceptedAt = Date.now(); c.agent = 'Elina · BIEXC Support'; c.agentAvatar = 'elina'; return c; });
-    if (!t.committed) return tgAnswer(cb.id, 'Already handled ✔', true);
+    if (!t.committed) return tgAnswerSup(cb.id, 'Already handled ✔', true);
     await supPush(fuid, { from: 'sys', text: 'A support agent has joined the chat ✅' });
     await supSetActive(fuid);
-    await tgAnswer(cb.id, '✅ Connected');
-    if (cb.message?.message_id) await tgFetch('editMessageReplyMarkup', { chat_id: TG_CHAT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Accepted — chatting now', callback_data: 'noop_done' }]] } });
-    await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🎧 Live chat started with ${lite.name} · UID ${lite.uid}\n\nJust type here — your text and photos go straight to the user.\nReply (swipe) to any of their messages to answer a specific user.\n/end — finish this chat · /chats — all open chats`,
+    await tgAnswerSup(cb.id, '✅ Connected');
+    if (cb.message?.message_id) await tgFetchSup('editMessageReplyMarkup', { chat_id: TG_CHAT_SUPPORT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Accepted — chatting now', callback_data: 'noop_done' }]] } });
+    await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🎧 Live chat started with ${lite.name} · UID ${lite.uid}\n\nJust type here — your text and photos go straight to the user.\nReply (swipe) to any of their messages to answer a specific user.\n/end — finish this chat · /chats — all open chats`,
       reply_markup: { inline_keyboard: [[{ text: '🔚 End chat', callback_data: `sup_end_${fuid}` }]] } });
     return supQueue(fuid);
   }
   if (act === 'rej') {
     const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status !== 'waiting') return; c.status = 'bot'; c.busyAt = Date.now(); return c; });
-    if (!t.committed) return tgAnswer(cb.id, 'Already handled ✔', true);
+    if (!t.committed) return tgAnswerSup(cb.id, 'Already handled ✔', true);
     await supPush(fuid, { from: 'sys', text: 'All our agents are busy right now. Please try again in a few minutes — our assistant can still help you meanwhile.' });
-    await tgAnswer(cb.id, 'Marked busy');
-    if (cb.message?.message_id) await tgFetch('editMessageReplyMarkup', { chat_id: TG_CHAT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '⏳ Marked busy', callback_data: 'noop_done' }]] } });
+    await tgAnswerSup(cb.id, 'Marked busy');
+    if (cb.message?.message_id) await tgFetchSup('editMessageReplyMarkup', { chat_id: TG_CHAT_SUPPORT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '⏳ Marked busy', callback_data: 'noop_done' }]] } });
     return;
   }
   if (act === 'end') return supEnd(fuid, cb.id);
   if (act === 'sw') {
     const st = (await supRef(fuid, 'meta/status').once('value')).val();
-    if (st !== 'live') return tgAnswer(cb.id, 'This chat is not live any more', true);
+    if (st !== 'live') return tgAnswerSup(cb.id, 'This chat is not live any more', true);
     await supSetActive(fuid);
-    await tgAnswer(cb.id, `Now replying to ${lite.uid}`);
-    return tgFetch('sendMessage', { chat_id: TG_CHAT, text: `↩️ Now replying to ${lite.name} · UID ${lite.uid}. Type your message.` });
+    await tgAnswerSup(cb.id, `Now replying to ${lite.uid}`);
+    return tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `↩️ Now replying to ${lite.name} · UID ${lite.uid}. Type your message.` });
   }
 }
 async function supEnd(fuid, cbId) {
   const lite = await supLite(fuid);
   const t = await supRef(fuid, 'meta').transaction(c => { if (!c || c.status === 'closed') return; c.status = 'closed'; c.closedBy = 'agent'; c.closedAt = Date.now(); return c; });
   if (SUP.active === fuid) await supSetActive(null);
-  if (!t.committed) { if (cbId) await tgAnswer(cbId, 'Already ended ✔'); return; }
+  if (!t.committed) { if (cbId) await tgAnswerSup(cbId, 'Already ended ✔'); return; }
   await supPush(fuid, { from: 'sys', text: 'The agent has ended this chat. Thank you for contacting BIEXC Support 💛' });
-  if (cbId) await tgAnswer(cbId, 'Chat ended');
-  await tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🔚 Chat with ${lite.name} · UID ${lite.uid} ended.` });
+  if (cbId) await tgAnswerSup(cbId, 'Chat ended');
+  await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🔚 Chat with ${lite.name} · UID ${lite.uid} ended.` });
 }
 async function supList() {
   const snap = await db.ref('users').once('value');
   const rows = [];
   snap.forEach(c => { const m = c.val()?.support?.meta; if (m && (m.status === 'live' || m.status === 'waiting')) rows.push({ fuid: c.key, m, u: c.val() }); });
-  if (!rows.length) return tgSend('🎧 No open support chats right now.');
+  if (!rows.length) return tgSendSup('🎧 No open support chats right now.');
   const kb = rows.slice(0, 20).map(r => [{ text: `${r.m.status === 'live' ? '🟢' : '🟡'} ${(r.u.profile?.nickname || r.u.name || 'User').slice(0, 20)} · ${shownUID(r.fuid, r.u)}${SUP.active === r.fuid ? ' (active)' : ''}`, callback_data: r.m.status === 'live' ? `sup_sw_${r.fuid}` : `sup_acc_${r.fuid}` }]);
-  return tgFetch('sendMessage', { chat_id: TG_CHAT, text: `🎧 Open support chats (${rows.length})\n🟢 live — tap to reply  ·  🟡 waiting — tap to accept`, reply_markup: { inline_keyboard: kb } });
+  return tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🎧 Open support chats (${rows.length})\n🟢 live — tap to reply  ·  🟡 waiting — tap to accept`, reply_markup: { inline_keyboard: kb } });
 }
 async function supTgPhotoToDataUrl(photos) {
   const list = [...photos].sort((a, b) => (a.file_size || 0) - (b.file_size || 0));
   const pick = list.filter(p => (p.file_size || 0) <= 700_000).pop() || list[0];
-  const j = await (await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(pick.file_id)}`)).json();
+  const j = await (await fetch(`${TG_API_SUP}/getFile?file_id=${encodeURIComponent(pick.file_id)}`)).json();
   if (!j.ok) return null;
-  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${j.result.file_path}`);
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN_SUPPORT}/${j.result.file_path}`);
   const buf = Buffer.from(await r.arrayBuffer());
   return `data:image/jpeg;base64,${buf.toString('base64')}`;
 }
 /** Admin message → user's in-app chat. Returns true when consumed. */
 async function supRouteAdmin(msg, text) {
-  if (!db || msg.from?.is_bot) return false;
+  if (!db || msg.from?.is_bot || String(msg.chat?.id)!==String(TG_CHAT_SUPPORT)) return false;
   if (text.startsWith('/')) {
     if (/^\/chats?\b/i.test(text)) { await supList(); return true; }
-    if (/^\/end\b/i.test(text)) { if (SUP.active) await supEnd(SUP.active); else await tgSend('No active support chat.'); return true; }
+    if (/^\/end\b/i.test(text)) { if (SUP.active) await supEnd(SUP.active); else await tgSendSup('No active support chat.'); return true; }
     return false;
   }
   let fuid = null;
   const rt = msg.reply_to_message?.message_id;
-  if (rt) { fuid = (await db.ref(`botState/supMap/${rt}`).once('value')).val(); if (!fuid) return false; }
-  else { if (ASK && Date.now() - ASK.ts < ASK_TTL) return false; fuid = SUP.active; }
+  if (rt) { fuid = (await db.ref(`${SUP_STATE}/messages/${rt}`).once('value')).val(); if (!fuid) return false; }
+  else { fuid = SUP.active; }
   if (!fuid) return false;
   const st = (await supRef(fuid, 'meta/status').once('value')).val();
-  if (st !== 'live') { if (!rt) { await supSetActive(null); return false; } await tgSend('⚠️ That chat is closed — the user did not get this message.'); return true; }
+  if (st !== 'live') { if (!rt) { await supSetActive(null); return false; } await tgSendSup('⚠️ That chat is closed — the user did not get this message.'); return true; }
   const caption = msg.caption || '';
   if (Array.isArray(msg.photo) && msg.photo.length) {
     const img = await supTgPhotoToDataUrl(msg.photo).catch(() => null);
-    if (!img) { await tgSend('⚠️ Could not deliver that photo, please try again.'); return true; }
+    if (!img) { await tgSendSup('⚠️ Could not deliver that photo, please try again.'); return true; }
     await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) });
     return true;
   }
@@ -976,7 +1013,7 @@ async function supRouteAdmin(msg, text) {
     if (img) { await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) }); return true; }
   }
   if (text) { await supAgentMsg(fuid, { text: text.slice(0, 4000) }); return true; }
-  if (msg.sticker || msg.document || msg.video || msg.voice) { await tgSend('ℹ️ Only text and photos can be sent to the user.'); return true; }
+  if (msg.sticker || msg.document || msg.video || msg.voice) { await tgSendSup('ℹ️ Only text and photos can be sent to the user.'); return true; }
   return false;
 }
 
@@ -1395,8 +1432,7 @@ async function handleCallback(cb, upd = null) {
   const data = cb.data || '';
 
   let m;
-  if (data === 'sup_list') { await tgAnswer(cb.id, '🎧'); return supList(); }
-  if ((m = data.match(/^sup_(acc|rej|end|sw)_(.+)$/))) return handleSupCb(cb, m[1], m[2]);
+  if (data.startsWith('sup_')) return tgAnswer(cb.id, 'Customer care has moved to the separate support bot.', true);
   if (data === 'noop_done') { await tgAnswer(cb.id, '✔ Already done — nothing more to do.'); return; }
   if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3], upd);
   // Trade/P2P callbacks (cbId starts with trade_) are completed by the app
@@ -1692,7 +1728,7 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
-  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }, { text: '🎧 Live chats', callback_data: 'sup_list' }],
+  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }],
 ] };
 
 // ════════════════════════════════════════════════════════════════════
@@ -2307,8 +2343,7 @@ async function handleUpdate(upd) {
 
   // A pending withdrawal TxID request takes priority over live support routing.
   if (ASK && ASK.kind === 'withash' && text && !text.startsWith('/') && Date.now() - ASK.ts < ASK_TTL) return handleAskReply(text);
-  // Live support: admin text/photo → the user's in-app chat
-  if (await supRouteAdmin(msg, text).catch(e => { log('SUP', `route ${e.message}`); return false; })) return;
+  // Customer-care messages are exclusively handled by the separate bot.
   if (!text) return;
   if (/^\/(start|menu|help)\b/i.test(text)) { ASK = null; return sendMenu(); }
   if (/^\/(whatsapp|wa)\b/i.test(text)) { ASK = null; return sendWaPanel(); }
@@ -2397,6 +2432,43 @@ async function pollUpdates() {
     pollFailStreak++;
     log('POLL', `err ${e.message}`);
     await new Promise(r => setTimeout(r, Math.min(10_000, 1000 * pollFailStreak)));
+  }
+}
+
+
+// Independent customer-care update stream. Never enters the main update buffer.
+async function handleSupportUpdate(upd){
+  if(upd.callback_query){
+    const cb=upd.callback_query;
+    if(String(cb.message?.chat?.id)!==String(TG_CHAT_SUPPORT))return tgAnswerSup(cb.id,'Unauthorized');
+    const m=String(cb.data||'').match(/^sup_(acc|rej|end|sw)_(.+)$/);
+    if(m)return handleSupCb(cb,m[1],m[2]);
+    if(cb.data==='sup_list'){await tgAnswerSup(cb.id,'Open chats');return supList();}
+    return tgAnswerSup(cb.id,'Customer-care bot only');
+  }
+  const msg=upd.message;if(!msg||String(msg.chat?.id)!==String(TG_CHAT_SUPPORT)||msg.from?.is_bot)return;
+  const text=String(msg.text||'').trim();
+  if(/^\/(start|menu|help)(?:@\S+)?\b/i.test(text))return tgSendSup('BIEXC Customer Care\n\n/chats — waiting and live chats\n/end — close the active chat\nReply to a user message to answer that user.\n\nTrading, withdrawal and deposit commands remain on the main bot.',{parse_mode:undefined});
+  if(await supRouteAdmin(msg,text))return;
+  return tgSendSup(text.startsWith('/')?'Use the main bot for financial commands. /chats opens customer-care requests.':'Select a live chat with /chats before sending a reply.',{parse_mode:undefined});
+}
+async function supportPollLoop(){
+  if(!SUPPORT_ENABLED){log('SUP','Customer-care disabled: set different TG_TOKEN_SUPPORT and TG_CHAT_SUPPORT. Main bot remains active.');return;}
+  const clear=await tgFetchSup('deleteWebhook',{drop_pending_updates:false});if(!clear.ok){log('SUP','Cannot start customer-care polling. Check support bot configuration.');return;}
+  let offset=Number((await db.ref(`${SUP_STATE}/offset`).once('value')).val()||0),failures=0;
+  while(true){
+    if(!(await amIActive())){await new Promise(r=>setTimeout(r,15000));continue;}
+    const data=await tgFetchSup('getUpdates',{offset:offset+1,timeout:25,allowed_updates:['callback_query','message']});
+    if(!data.ok){
+      if([401,404,409].includes(data.error_code)){log('SUP','Support bot polling stopped: invalid token or another consumer. Main trading bot is unaffected.');return;}
+      failures++;await new Promise(r=>setTimeout(r,Math.min(30000,1000*2**Math.min(failures,5))));continue;
+    }
+    failures=0;
+    for(const upd of data.result||[]){
+      try{await handleSupportUpdate(upd);offset=upd.update_id;await db.ref(`${SUP_STATE}/offset`).set(offset);}
+      catch(e){log('SUP',`Support update failed: ${e.message}`);await new Promise(r=>setTimeout(r,2000));break;}
+    }
+    await new Promise(r=>setTimeout(r,40));
   }
 }
 
@@ -3015,7 +3087,8 @@ if (RENDER_URL) {
   await claimInstanceLock();
   await dropWebhook('boot');            // guarantees getUpdates can run
   lastUpdateId = await loadLastUpdateId();
-  await supLoadActive();
+  if(SUPPORT_ENABLED){await supLoadActive();supportPollLoop().catch(e=>log('SUP',`Customer-care stopped: ${e.message}`));}
+  else log('SUP','Configure TG_TOKEN_SUPPORT + TG_CHAT_SUPPORT for customer care.');
   log('INIT', `📍 Resumed from updateId=${lastUpdateId}`);
   // If we boot after 9am IST, skip today's summary so restarts don't spam it.
   if (new Date(Date.now() + IST_OFF).getUTCHours() >= 9) lastSummaryDay = istDayKey();
