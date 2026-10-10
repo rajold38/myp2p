@@ -461,7 +461,9 @@ async function handleAskReply(text) {
       ['👤 UID', `\`${a.uid}\``], ['📛 Name', found.user.name || '—'],
       ['🪙 Coin', a.coin], ['💵 Amount', fmtNum(amt)],
       ['💰 Balance', `${fmtNum(cur)} → ${fmtNum(after)}`],
-    ]), { reply_markup: { inline_keyboard: [[{ text: '✅ Confirm', callback_data: `cfm_${id}` }, { text: '✖ Cancel', callback_data: 'askcancel' }]] } });
+    ]) + (a.op === 'setbal' ? '' : '\n\n📜 *Show this in user\'s history?*'), { reply_markup: { inline_keyboard: a.op === 'setbal'
+      ? [[{ text: '✅ Confirm', callback_data: `cfm_${id}` }, { text: '✖ Cancel', callback_data: 'askcancel' }]]
+      : [[{ text: '✅ Yes, show in history', callback_data: `cfm_${id}` }], [{ text: '🙈 No, hide from history', callback_data: `cfmh_${id}` }], [{ text: '✖ Cancel', callback_data: 'askcancel' }]] } });
   }
   if (a.kind === 'msg') {
     const id = newConfirm({ op: 'msg', uid: a.uid, text });
@@ -475,11 +477,11 @@ async function handleAskReply(text) {
   }
 }
 
-async function runConfirm(id) {
+async function runConfirm(id, hideHist = false) {
   const c = CONFIRM.get(id); CONFIRM.delete(id);
   if (!c) return tgSend(bad('This confirmation expired — start again.'), { reply_markup: MENU_KB });
-  if (c.op === 'credit') { await adminCreditDebit(c.uid, c.amt, '+', 'ADMIN_CREDIT', c.coin); return sendUserDetailCard(null, c.uid); }
-  if (c.op === 'debit')  { await adminCreditDebit(c.uid, c.amt, '-', 'ADMIN_DEBIT', c.coin);  return sendUserDetailCard(null, c.uid); }
+  if (c.op === 'credit') { await adminCreditDebit(c.uid, c.amt, '+', 'ADMIN_CREDIT', c.coin, !hideHist); return sendUserDetailCard(null, c.uid); }
+  if (c.op === 'debit')  { await adminCreditDebit(c.uid, c.amt, '-', 'ADMIN_DEBIT', c.coin, !hideHist);  return sendUserDetailCard(null, c.uid); }
   if (c.op === 'setbal') { await handleSetBalance(c.uid, c.coin, c.amt); return sendUserDetailCard(null, c.uid); }
   if (c.op === 'msg')    { await handleAdminMessage(c.uid, c.text); return; }
   if (c.op === 'broadcast') return handleBroadcast(c.text);
@@ -1504,9 +1506,9 @@ async function handleCallback(cb, upd = null) {
     if (m[3] === '*') { ask('coin', { op: m[1], uid: m[2] }); return tgSend('⌨️ Type the coin symbol, e.g. `MATIC`', { reply_markup: cancelKb }); }
     return askAmount(m[1], m[2], m[3].toUpperCase());
   }
-  if ((m = data.match(/^cfm_(.+)$/)))       {
-    if (!CONFIRM.has(m[1])) { await tgAnswer(cb.id, '✔ Already done / expired'); setCbButtons(cb, '✔ DONE'); return; }
-    await tgAnswer(cb.id, '⏳ Working…'); setCbButtons(cb, '✔ DONE'); return runConfirm(m[1]);
+  if ((m = data.match(/^cfm(h?)_(.+)$/)))   {
+    if (!CONFIRM.has(m[2])) { await tgAnswer(cb.id, '✔ Already done / expired'); setCbButtons(cb, '✔ DONE'); return; }
+    await tgAnswer(cb.id, '⏳ Working…'); setCbButtons(cb, m[1] ? '✔ DONE · hidden from history' : '✔ DONE'); return runConfirm(m[2], !!m[1]);
   }
   if (data === 'askcancel')                 { ASK = null; await tgAnswer(cb.id, 'Cancelled'); return tgSend('✖ Cancelled.', { reply_markup: MENU_KB }); }
   if ((m = data.match(/^banask_(.+)$/))) {
@@ -2325,13 +2327,13 @@ async function closeAllP2PForUser(uid) {
   await tgSend(`✅ *P2P CLOSED*\n\n👤 \`${uid}\`\nCancelled: *${closed}*\nUSDT Refunded: *${refundedUsdt.toFixed(2)}*`);
 }
 
-async function adminCreditDebit(uid, amt, sign, type, coin = 'USDT') {
+async function adminCreditDebit(uid, amt, sign, type, coin = 'USDT', showHist = true) {
   const found = await findUserByUID(uid);
   if (!found) { await tgSend(`❌ UID \`${uid}\` not found.`); return; }
   const delta = sign === '+' ? +amt : -amt;
   const result = await mutateBalance(found.fuid, coin, delta);
   if (!result) { await tgSend(`❌ Insufficient ${coin} balance for ${uid}.`); return; }
-  await pushHistory(found.fuid, {
+  if (showHist) await pushHistory(found.fuid, {
     type, coin, amt, status: 'COMPLETED', uid: found.user.uid,
     sender: 'ADMIN', note: `${sign === '+' ? 'Credited' : 'Debited'} ${amt} ${coin}`,
   });
@@ -2341,6 +2343,7 @@ async function adminCreditDebit(uid, amt, sign, type, coin = 'USDT') {
     `📛 ${found.user.name || '—'}`,
     `${sign==='+'?'➕':'➖'} ${amt} ${coin}`,
     `💰 ${coin}: *${result.oldBal} → ${result.newBal}*`,
+    showHist ? '📜 Shown in history' : '🙈 Hidden from history',
   ].join('\n'));
 }
 
