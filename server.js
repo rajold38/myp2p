@@ -1892,8 +1892,6 @@ async function getP2PSettings(fresh = false) {
 }
 /** Hour in India (0-23). */
 function istHour(ts = Date.now()) { return new Date(ts + 5.5 * 3600e3).getUTCHours(); }
-/** Start of today in India, as a UTC timestamp. */
-function istDayStart(ts = Date.now()) { const d = new Date(ts + 5.5 * 3600e3); d.setUTCHours(0, 0, 0, 0); return d.getTime() - 5.5 * 3600e3; }
 async function sendP2PRates() {
   const s = await getP2PSettings(true);
   return tgSend(card('💱 P2P RATES', [
