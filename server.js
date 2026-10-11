@@ -101,40 +101,25 @@ const r8 = (n) => parseFloat(((+n) || 0).toFixed(8));
  *  commits, with no other await in between — so no caller can ever forget
  *  the legacy sync and the desync window is as small as physically possible. */
 async function mutateBalance(fuid, coin, delta) {
-  if (!fuid || !coin) return null;
-  const COIN = String(coin).toUpperCase();
-  const ref = db.ref(`users/${fuid}/balances/${COIN}`);
-  let outcome = null;
-  const tx = await ref.transaction(cur => {
-    const old = parseFloat(cur || 0) || 0;
-    const next = r8(old + delta);
-    if (next < 0) return; // abort — would overdraw
-    outcome = { oldBal: r8(old), newBal: next };
-    return next;
+  const COIN=String(coin||'').toUpperCase(); delta=Number(delta);
+  if(!fuid||!/^[A-Z0-9]{1,20}$/.test(COIN)||!Number.isFinite(delta))return null;
+  let outcome=null;
+  const tx=await db.ref(`users/${fuid}`).transaction(cur=>{
+    outcome=null;if(!cur)return;
+    const u={...cur},b={...(cur.balances||{})},old=Number(b[COIN]??(COIN==='USDT'?cur.balance:0)??0),next=r8(old+delta);
+    if(!Number.isFinite(old)||next<0)return;
+    b[COIN]=next;u.balances=b;if(COIN==='USDT')u.balance=next;
+    outcome={oldBal:r8(old),newBal:next};return u;
   });
-  if (!tx.committed) return null;
-  // Legacy mirror — single multi-path update, nothing awaited in between.
-  if (COIN === 'USDT') await writeLegacyUsdtMirror(fuid, outcome.newBal);
-  return outcome;
+  return tx.committed?outcome:null;
 }
 
 /** Set a coin balance to an exact value (admin commands).
  *  Also mirrors USDT to the legacy node in the same operation. */
 async function setBalance(fuid, coin, value) {
-  const COIN = String(coin).toUpperCase();
-  const v = r8(value);
-  const ref = db.ref(`users/${fuid}/balances/${COIN}`);
-  const prev = (await ref.once('value')).val() || 0;
-  if (COIN === 'USDT') {
-    // One atomic multi-path write for both nodes — they can never disagree.
-    await db.ref().update({
-      [`users/${fuid}/balances/USDT`]: v,
-      [`users/${fuid}/balance`]: v,
-    });
-  } else {
-    await ref.set(v);
-  }
-  return { oldBal: r8(prev), newBal: v };
+ const COIN=String(coin||'').toUpperCase(),v=Number(value);if(!fuid||!/^[A-Z0-9]{1,20}$/.test(COIN)||!Number.isFinite(v)||v<0)throw new Error('Invalid balance');
+ let result;const tx=await db.ref(`users/${fuid}`).transaction(cur=>{if(!cur)return;const u={...cur},b={...(cur.balances||{})};result={oldBal:r8(b[COIN]||0),newBal:r8(v)};b[COIN]=r8(v);u.balances=b;if(COIN==='USDT')u.balance=b[COIN];return u});
+ if(!tx.committed)throw new Error('Balance update failed');return result;
 }
 
 /** Push one history row. Shape: { hid, ts, date, type, coin, amt, status, ... } */
@@ -205,11 +190,9 @@ const istDayKey = (ts = Date.now()) => new Date(ts + IST_OFF).toISOString().slic
 
 /** Write the legacy `users/{fuid}/balance` mirror via a single multi-path
  *  update. Idempotent — safe to call twice with the same value. */
-async function writeLegacyUsdtMirror(fuid, newBal) {
-  if (!fuid) return;
-  try {
-    await db.ref().update({ [`users/${fuid}/balance`]: r8(newBal || 0) });
-  } catch (e) { log('LEGACY', `mirror err ${e.message}`); }
+async function writeLegacyUsdtMirror(fuid) {
+ if(!fuid)return;
+ await db.ref(`users/${fuid}`).transaction(cur=>{if(!cur||cur.balances?.USDT==null)return;if(cur.balance===cur.balances.USDT)return;return {...cur,balance:cur.balances.USDT}});
 }
 
 /** Keep legacy users/{fuid}/balance synced for old frontend screens.
@@ -250,10 +233,10 @@ async function migrateLegacyBalanceOnce(fuid, userVal) {
     }
     if (hasLegacy && (!hasMap || userVal.balances.USDT === undefined)) {
       const v = r8(userVal.balance);
-      // Both nodes written together so they start out in sync.
-      await db.ref().update({
-        [`users/${fuid}/balances/USDT`]: v,
-        [`users/${fuid}/balance`]: v,
+      await db.ref(`users/${fuid}`).transaction(cur=>{
+        if(!cur||cur.balances?.USDT!==undefined)return;
+        const confirmed=Number(cur.balance);if(!Number.isFinite(confirmed)||confirmed<0)return;
+        return {...cur,balances:{...(cur.balances||{}),USDT:r8(confirmed)},balance:r8(confirmed)};
       });
       MIGRATED_FUIDS.add(fuid);
       log('MIGRATE', `${fuid.slice(0,8)} legacy balance ${v} → balances.USDT`);
@@ -1113,22 +1096,29 @@ async function adLogs(wallet, fromBlock, toBlock) {
   return out;
 }
 /** Credit one on-chain transfer exactly once (deposits/{tx}_{idx} claimed in a transaction). */
-async function adCredit(fuid, t, source) {
-  const key = `${t.txHash}_${t.logIndex}`;
-  const tx = await db.ref(`deposits/${key}`).transaction(cur => cur ? undefined : { fuid, amt: t.amt, txHash: t.txHash, logIndex: t.logIndex, from: t.from, block: t.block, source, ts: Date.now(), status: 'crediting' });
-  if (!tx.committed) return null;
-  const res = await mutateBalance(fuid, 'USDT', +t.amt);
-  if (res) await syncLegacyUsdtBalance(fuid, 'USDT', res.newBal);
-  const hid = await pushHistory(fuid, { type: 'DEPOSIT', coin: 'USDT', amt: t.amt, network: 'BEP-20', chain: 'BEP-20', txid: t.txHash, hash: t.txHash, hashAt: Date.now(), from: t.from, auto: true, status: 'COMPLETED', explorer: `https://bscscan.com/tx/${t.txHash}` });
-  await db.ref(`deposits/${key}`).update({ status: 'credited', hid });
-  await db.ref(`unmatchedDeposits/${key}`).remove().catch(() => {});
-  if (REF) REF.onDeposit(fuid, 'USDT', t.amt).catch(() => {});
-  await bonusCountAction(fuid, `dep_auto_${key}`).catch(() => {});
-  const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
-  await pushNotif(fuid, { title: 'Deposit received', body: `${t.amt} USDT (BEP-20) credited to your Funding account.`, type: 'INFO' }).catch(() => {});
-  log('AUTODEP', `CREDIT UID=${user.uid} fuid=${fuid} ${t.amt} USDT tx=${t.txHash} src=${source} | ${res?.oldBal} → ${res?.newBal}`);
-  tgSend(card('📥 AUTO DEPOSIT CREDITED', [['👤 UID', `\`${user.uid || '—'}\``], ['💰 Amount', `${t.amt} USDT · BEP-20`], ['🔗 TxID', `\`${t.txHash}\``], ['📊 Balance', `${res?.oldBal} → ${res?.newBal}`]])).catch(() => {});
-  return { ...t, hid, newBal: res?.newBal };
+async function adCredit(fuid,t,source){
+ const amt=Number(t.amt),key=`${t.txHash}_${t.logIndex}`,ts=Date.now();
+ if(!Number.isFinite(amt)||amt<=0||!/^[A-Za-z0-9_-]+$/.test(key))throw new Error('Invalid transfer');
+ const claim=await db.ref(`deposits/${key}`).transaction(cur=>cur?undefined:{...t,fuid,source,ts,status:'crediting',atomicCreditVersion:1});
+ const existing=claim.snapshot.val();if(!existing||existing.fuid!==fuid||existing.status==='credited')return null;
+ // Never re-credit a pre-upgrade claim: its old balance-write outcome is unknown.
+ if(!claim.committed&&!existing.atomicCreditVersion)throw new Error('Legacy deposit claim requires review');
+ const hid='h_auto_'+key;let res=null;
+ const credit=await db.ref(`users/${fuid}`).transaction(cur=>{
+  res=null;if(!cur)return;
+  const receipt=cur.depositCredits?.[key];if(receipt){res={oldBal:receipt.oldBal,newBal:receipt.newBal};return cur;}
+  const old=Number(cur.balances?.USDT??cur.balance??0);if(!Number.isFinite(old))return;
+  const next=r8(old+amt);res={oldBal:old,newBal:next};
+  return {...cur,balances:{...(cur.balances||{}),USDT:next},balance:next,
+   depositCredits:{...(cur.depositCredits||{}),[key]:{...res,hid,amt,ts}},
+   history:{...(cur.history||{}),[hid]:{hid,ts,date:nowIST(),type:'DEPOSIT',coin:'USDT',amt,network:'BEP-20',txid:t.txHash,hash:t.txHash,hashAt:ts,from:t.from,auto:true,status:'COMPLETED'}}};
+ });
+ if(!credit.committed||!res)throw new Error('Deposit not credited; retry safely');
+ await db.ref(`deposits/${key}`).update({status:'credited',hid});
+ await db.ref(`unmatchedDeposits/${key}`).remove().catch(()=>{});
+ if(REF)REF.onDeposit(fuid,'USDT',amt).catch(()=>{});bonusCountAction(fuid,`dep_auto_${key}`).catch(()=>{});
+ pushNotif(fuid,{title:'Deposit received',body:`${amt} USDT credited.`,type:'INFO'}).catch(()=>{});
+ return {...t,hid,newBal:res.newBal};
 }
 async function adUnmatched(t, reason) {
   const key = `${t.txHash}_${t.logIndex}`;
@@ -1149,7 +1139,8 @@ async function adOwner(t) {
   return byWallet || null;
 }
 async function adHandle(t) {
-  if ((await db.ref(`deposits/${t.txHash}_${t.logIndex}`).once('value')).exists()) return null;
+  const prior=(await db.ref(`deposits/${t.txHash}_${t.logIndex}`).once('value')).val();
+  if(prior){if(prior.status==='crediting'&&prior.atomicCreditVersion===1)return adCredit(prior.fuid,prior,prior.source||'recovery');return null;}
   const owner = await adOwner(t);
   if (!owner) return adUnmatched(t, 'no open deposit window'), null;
   if (t.amt < AD.MIN) return adUnmatched(t, `below minimum ${AD.MIN} USDT`), null;
@@ -1171,6 +1162,8 @@ async function adCleanup() {
 async function adScan() {
   if (AD.scanning) return; AD.scanning = true;
   try {
+    const pending=(await db.ref('deposits').orderByChild('status').equalTo('crediting').limitToFirst(25).once('value')).val()||{};
+    for(const t of Object.values(pending)){if(t.atomicCreditVersion===1)await adCredit(t.fuid,t,t.source||'recovery').catch(e=>log('AUTODEP',`retry ${e.message}`));}
     const wallet = await adWallet();
     const latest = await adBlock();
     const safe = latest - Math.max(AD.CONF, Math.ceil(AD_HOLD / await adBlockMs(latest)));
@@ -1371,53 +1364,33 @@ async function claimPendingReq(fuid, type, cbId, action) {
   return v;
 }
 
-async function handleApprove(fuid, type, req, cbId) {
-  const claimed = await claimPendingReq(fuid, type, cbId, 'approve');
-  if (!claimed) { log('IDEMP', `approve skipped cbId=${cbId}`); return null; }
-
-  const coin = (claimed.coin || req.coin || 'USDT').toUpperCase();
-  const amt  = parseFloat(claimed.amt || req.amt || 0);
-  let result = null;
-  if (type === 'dep') {
-    // Deposit approved → credit the coin
-    result = await mutateBalance(fuid, coin, +amt);
-  } else {
-    // Withdrawal approved → balance already debited at request time; no change.
-    const bal = parseFloat((await db.ref(`users/${fuid}/balances/${coin}`).once('value')).val() || 0);
-    result = { oldBal: bal, newBal: bal };
-  }
-  if (result) await syncLegacyUsdtBalance(fuid, coin, result.newBal);
-  await updateHistoryStatus(fuid, claimed.hid, 'COMPLETED');
-  if (type === 'dep' && REF) REF.onDeposit(fuid, coin, amt).catch(() => {});
-  if (type === 'dep') await bonusCountAction(fuid, `dep_${cbId}`);
-  await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
-  const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
-  queueResolutionEmail({ type, action: 'approve', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
-  log('APPROVE', `UID=${user.uid} ${type.toUpperCase()} ${amt} ${coin} | ${result?.oldBal} → ${result?.newBal}`);
-  return { ...result, user, coin, amt };
+async function resolvePendingAtomic(fuid,type,cbId,action){
+ let result=null;const ts=Date.now();
+ const tx=await db.ref(`users/${fuid}`).transaction(cur=>{
+  result=null;if(!cur)return;const q=cur.pendingReqs?.[type]?.[cbId];if(!['dep','wit'].includes(type)||!['approve','reject'].includes(action)||!q)return;
+   // A previous version could claim then fail before moving money. Never guess its outcome.
+   if(q._resolved)return;
+  const coin=String(q.coin||'USDT').toUpperCase(),amt=Number(q.amt);
+  if(!Number.isFinite(amt)||amt<=0||!/^[A-Z0-9]{1,20}$/.test(coin))return;
+  const u={...cur},balances={...(cur.balances||{})},old=Number(balances[coin]??(coin==='USDT'?cur.balance:0)??0);
+  const delta=type==='dep'&&action==='approve'||type==='wit'&&action==='reject'?amt:0;
+  const next=r8(old+delta);if(!Number.isFinite(old)||next<0)return;
+  balances[coin]=next;u.balances=balances;if(coin==='USDT')u.balance=next;
+  const pending={...(cur.pendingReqs||{})};pending[type]={...(pending[type]||{})};delete pending[type][cbId];u.pendingReqs=pending;
+  const history={...(cur.history||{})};for(const [k,h] of Object.entries(history))if(k===q.hid||h?.hid===q.hid)history[k]={...h,status:action==='approve'?'COMPLETED':'REJECTED',resolvedAt:ts};u.history=history;
+  u.walletReceipts={...(cur.walletReceipts||{}),[cbId]:{action,coin,amt,ts}};
+  result={oldBal:r8(old),newBal:next,user:u,coin,amt,request:q};return u;
+ });return tx.committed?result:null;
 }
-
-async function handleReject(fuid, type, req, cbId) {
-  const claimed = await claimPendingReq(fuid, type, cbId, 'reject');
-  if (!claimed) { log('IDEMP', `reject skipped cbId=${cbId}`); return null; }
-
-  const coin = (claimed.coin || req.coin || 'USDT').toUpperCase();
-  const amt  = parseFloat(claimed.amt || req.amt || 0);
-  let result = null;
-  if (type === 'wit') {
-    // Withdrawal rejected → refund whatever coin was held
-    result = await mutateBalance(fuid, coin, +amt);
-  } else {
-    const bal = parseFloat((await db.ref(`users/${fuid}/balances/${coin}`).once('value')).val() || 0);
-    result = { oldBal: bal, newBal: bal };
-  }
-  if (result) await syncLegacyUsdtBalance(fuid, coin, result.newBal);
-  await updateHistoryStatus(fuid, claimed.hid, 'REJECTED');
-  await db.ref(`users/${fuid}/pendingReqs/${type}/${cbId}`).remove();
-  const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
-  queueResolutionEmail({ type, action: 'reject', user, uid: user.uid, amt, coin, oldBal: result?.oldBal, newBal: result?.newBal, network: claimed.network || claimed.chain || req?.network || req?.chain, txid: claimed.txid || req?.txid, address: claimed.address || claimed.addr || req?.address || req?.addr, hid: claimed.hid });
-  log('REJECT', `UID=${user.uid} ${type.toUpperCase()} ${amt} ${coin} ${type==='wit'?'refunded':''} | ${result?.oldBal} → ${result?.newBal}`);
-  return { ...result, user, coin, amt };
+async function handleApprove(fuid,type,req,cbId){
+ const result=await resolvePendingAtomic(fuid,type,cbId,'approve');if(!result)return null;
+ if(type==='dep'&&REF)REF.onDeposit(fuid,result.coin,result.amt).catch(()=>{});
+ if(type==='dep')bonusCountAction(fuid,`dep_${cbId}`).catch(()=>{});
+ queueResolutionEmail({type,action:'approve',...result,uid:result.user.uid,network:result.request.network||result.request.chain,txid:result.request.txid,address:result.request.address||result.request.addr,hid:result.request.hid});return result;
+}
+async function handleReject(fuid,type,req,cbId){
+ const result=await resolvePendingAtomic(fuid,type,cbId,'reject');if(!result)return null;
+ queueResolutionEmail({type,action:'reject',...result,uid:result.user.uid,network:result.request.network||result.request.chain,txid:result.request.txid,address:result.request.address||result.request.addr,hid:result.request.hid});return result;
 }
 
 function fmtResolutionMsg(label, action, ctx, req) {
@@ -1485,6 +1458,13 @@ async function handleCallback(cb, upd = null) {
         return;
       }
     }
+    const owner=await findTradeOwner(tradeCb);
+    const oid=owner&&Object.keys(owner.user.chats||{}).find(k=>owner.user.chats[k]?.cbId===tradeCb);
+    const guess=String(tradeCb).split('_')[1],orderId=oid||(owner?.user.orders?.[guess]?guess:null);
+    if(!owner||!orderId){await tgAnswer(cb.id,'Order unavailable — review before retrying.',true);return;}
+    // New protocol is declared by each atomically-created order, not account-wide.
+    // Existing installed clients retain their original hand-off and fallback.
+    if(owner.user.orders?.[orderId]?.walletProtocol!==5){
     const lock = await claimTapOnce(`cb_${tradeCb}`, action);
     if (!lock.ok) {
       await tgAnswer(cb.id, `⚠️ Already ${doneWord(lock.prev)} — this button works only once.`, true);
@@ -1512,6 +1492,16 @@ async function handleCallback(cb, upd = null) {
         log('TRADE', `fallback settle #${oid} ${action} → ${r && r.ok ? 'done' : 'skipped'}`);
       } catch (e) { log('TRADE', `fallback settle err ${e.message}`); }
     }, 30000);
+      return;
+    }
+    const result=await settleP2PAtomic(owner.fuid,orderId,action==='approve'?'complete':'reject');
+    if(!result?.ok){await tgAnswer(cb.id,result?.error||'Settlement needs review.',true);return;}
+    tgAnswer(cb.id,action==='approve'?'✅ Completed — funds settled':'❌ Rejected — funds settled');
+    setCbButtons(cb,action==='approve'?'✅ COMPLETED':'❌ REJECTED');
+    if(upd)pushRecentUpdate(upd);
+    if(action==='approve')bonusCountAction(owner.fuid,`trade_${orderId}`).catch(()=>{});
+    pushNotif(owner.fuid,{title:action==='approve'?'P2P completed':'P2P cancelled',body:`Order #${orderId} settled.`,type:'INFO'}).catch(()=>{});
+
     return;
   }
   if (/^(join|ignore)_support_/.test(data)) return; // handled by iframe support overlay
@@ -1669,45 +1659,32 @@ async function findOrderById(orderId) {
   });
   return hit;
 }
-async function adminSettleOrder(orderId, action, quiet = false) {
-  const out = quiet ? (m => ({ ok: false, msg: m })) : tgSend;
-  orderId = String(orderId).replace(/^#/, '');
-  const f = await findOrderById(orderId);
-  if (!f) return out(bad(`Order \`#${orderId}\` not found or already finished.`));
-  const { fuid, user } = f;
-  if (action === 'complete' && !kycAllowsTrade(user)) return out(bad(`UID \`${user.uid}\` has not completed KYC — you can only /reject this order.`));
-  // Same once-only lock the app uses, so the app can never settle it a second time.
-  const st = user.chats?.[orderId] || {};
-  const lockKey = String(st.cbId || `admin_${orderId}`).split('.').join('_').split('/').join('_');
-  const lk = await db.ref(`users/${fuid}/tradeDone/${lockKey}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
-  if (!lk.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
-  // Claim the order itself: only one remover wins.
-  let got = null;
-  const tx = await db.ref(`users/${fuid}/orders/${orderId}`).transaction(cur => { got = cur; return cur ? null : undefined; });
-  if (!tx.committed || !got) return out(bad(`Order \`#${orderId}\` was already finished.`));
-  if (st.cbId) await claimTapOnce(`cb_${st.cbId}`, action === 'complete' ? 'approve' : 'reject').catch(() => {});
-  const o = got, mode = String(o.mode || 'BUY').toUpperCase(), usdt = r8(o.usdt);
-  let res = null;
-  if (action === 'complete' && mode === 'BUY') res = await mutateBalance(fuid, 'USDT', +usdt);   // buyer receives USDT
-  if (action === 'reject' && mode === 'SELL') res = await mutateBalance(fuid, 'USDT', +usdt);    // seller's locked USDT returned
-  if (res) await syncLegacyUsdtBalance(fuid, 'USDT', res.newBal);
-  const base = { merchant: o.merchant || '', rate: o.rate || 0, inr: o.inr || 0, orderId, paymentMethod: o.payMethod || 'UPI', coin: 'USDT', by: 'admin' };
-  if (action === 'complete') await pushHistory(fuid, { ...base, type: mode, amt: usdt, status: 'COMPLETED', network: 'BEP20' });
-  else await pushHistory(fuid, { ...base, type: `${mode}_CANCEL`, amt: usdt, status: 'CANCELLED', reason: mode === 'SELL' ? 'Order rejected. Your USDT has been refunded to your wallet.' : 'Your payment could not be verified. Contact support with your payment proof.' });
-  await db.ref(`users/${fuid}/chats/${orderId}`).remove().catch(() => {});
-  if (action === 'complete') bonusCountAction(fuid, `trade_${orderId}`).catch(() => {});
-  await pushNotif(fuid, action === 'complete'
-    ? { title: 'P2P order completed', body: `Order #${orderId}: ${mode === 'SELL' ? 'sold' : 'bought'} ${usdt} USDT.`, type: 'INFO' }
-    : { title: 'P2P order cancelled', body: `Order #${orderId} was cancelled.${mode === 'SELL' ? ' Your USDT has been refunded.' : ''}`, type: 'ALERT' }).catch(() => {});
-  if (st.tgMsgId) tgEdit(st.tgMsgId, `${action === 'complete' ? '✅ *TRADE COMPLETE (admin)*' : '❌ *TRADE REJECTED (admin)*'}\n\nUID: \`${user.uid}\`\nOrder: \`#${orderId}\``).catch(() => {});
-  log('TRADE', `admin ${action} #${orderId} ${mode} ${usdt} UID=${user.uid} ${res ? `| ${res.oldBal} → ${res.newBal}` : ''}`);
-  if (quiet) return { ok: true, refunded: !!res };
-  return tgSend(card(action === 'complete' ? '✅ ORDER COMPLETED' : '❌ ORDER REJECTED', [
-    ['🧾 Order', `\`#${orderId}\``], ['👤 UID', `\`${user.uid || '—'}\``], ['🔁 Type', mode], ['💵 USDT', String(usdt)],
-    ['💰 Balance', res ? `${res.oldBal} → ${res.newBal}` : 'unchanged'],
-  ]));
+async function settleP2PAtomic(fuid,orderId,action){
+ if(!['complete','reject'].includes(action))return {ok:false,error:'Invalid decision'};orderId=String(orderId);let result=null,error='Order already finished';const ts=Date.now();
+ const tx=await db.ref(`users/${fuid}`).transaction(cur=>{
+  result=null;if(!cur)return;const o=cur.orders?.[orderId];if(!o)return;
+  if(action==='complete'&&!kycAllowsTrade(cur)){error='KYC required';return;}
+  const chat=cur.chats?.[orderId]||{},key=String(chat.cbId||`admin_${orderId}`).replace(/[./]/g,'_');
+  if(cur.tradeDone?.[key]||cur.tradeDone?.[orderId]){error='Legacy settlement lock needs review';return;}
+  const mode=String(o.mode||'BUY').toUpperCase(),amt=Number(o.usdt);
+  if(!['BUY','SELL'].includes(mode)||!Number.isFinite(amt)||amt<=0){error='Invalid order';return;}
+  const u={...cur},b={...(cur.balances||{})},old=Number(b.USDT??cur.balance??0);
+  const credit=mode==='BUY'&&action==='complete'||mode==='SELL'&&action!=='complete'?amt:0;
+  if(!Number.isFinite(old)){error='Invalid balance';return;}b.USDT=r8(old+credit);u.balances=b;u.balance=b.USDT;
+  u.orders={...cur.orders};delete u.orders[orderId];u.chats={...(cur.chats||{})};delete u.chats[orderId];
+  u.tradeDone={...(cur.tradeDone||{}),[key]:{action:action==='complete'?'approve':'reject',by:'server',ts},[orderId]:{action:action==='complete'?'approve':'reject',by:'server',ts}};
+  const hid='h_p2p_'+orderId;u.history={...(cur.history||{}),[hid]:{hid,ts,date:nowIST(),type:action==='complete'?mode:mode+'_CANCEL',status:action==='complete'?'COMPLETED':'CANCELLED',coin:'USDT',amt,orderId,merchant:o.merchant||'',rate:o.rate||0,inr:o.inr||0,paymentMethod:o.payMethod||'UPI',network:'BEP20',reason:action==='complete'?'':'Order cancelled; held SELL funds returned.'}};
+  result={ok:true,order:o,chat,user:u,oldBal:old,newBal:b.USDT};return u;
+ });return tx.committed?result:{ok:false,error};
 }
-
+async function adminSettleOrder(orderId,action,quiet=false){
+ orderId=String(orderId).replace(/^#/,'');const f=await findOrderById(orderId);if(!f)return quiet?{ok:false,error:'Order not found'}:tgSend(bad('Order not found or already finished'));
+ const r=await settleP2PAtomic(f.fuid,orderId,action);if(!r.ok)return quiet?r:tgSend(bad(r.error));
+ if(action==='complete')bonusCountAction(f.fuid,`trade_${orderId}`).catch(()=>{});
+ pushNotif(f.fuid,{title:action==='complete'?'P2P order completed':'P2P order cancelled',body:`Order #${orderId}: ${r.order.usdt} USDT.`,type:'INFO'}).catch(()=>{});
+ if(r.chat.tgMsgId)tgEdit(r.chat.tgMsgId,`${action==='complete'?'✅ TRADE COMPLETED':'❌ TRADE CANCELLED'}\nOrder #${orderId}\nUID ${r.user.uid}`).catch(()=>{});
+ return quiet?r:tgSend(card('P2P settlement',[['Order',orderId],['Balance',`${r.oldBal} → ${r.newBal}`]]));
+}
 
 /** /cancelalltrades — reject every pending deposit/withdrawal and every open P2P order (SELL USDT refunded once) and clear stuck chats. */
 async function cancelAllTrades() {
@@ -1733,14 +1710,13 @@ async function cancelAllTrades() {
       const res = await handleReject(q.fuid, q.type, q.r, q.cbId);
       if (res) { rDone++; if (q.type === 'wit') rRefund++; if (q.r.botMsgId) tgEdit(q.r.botMsgId, fmtResolutionMsg(q.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL', 'reject', { type: q.type, ...res }, q.r)).catch(() => {}); }
       else {
-        await db.ref(`users/${q.fuid}/pendingReqs/${q.type}/${q.cbId}`).remove();
-        if (q.r.hid) await updateHistoryStatus(q.fuid, q.r.hid, 'REJECTED').catch(() => {});
-        rForced++;
+        // Preserve unresolved money-bearing requests for manual reconciliation.
+        rForced++;log('REVIEW',`pending request ${q.fuid}/${q.type}/${q.cbId} retained; outcome unknown`);
       }
       sentByCbId.delete(q.cbId);
     } catch (e) { log('ERR', `cancelall req ${q.cbId}: ${e.message}`); }
   }
-  if (reqs.length) await tgSend(card('🧹 DEPOSITS / WITHDRAWALS CLOSED', [['Rejected', rDone], ['Withdraw refunds', rRefund], ['Stuck cleared', rForced]]));
+  if (reqs.length) await tgSend(card('🧹 DEPOSITS / WITHDRAWALS CLOSED', [['Rejected', rDone], ['Withdraw refunds', rRefund], ['Needs review (retained)', rForced]]));
   if (!jobs.length) return tgSend('✅ No pending P2P trades.');
   await tgSend(`⏳ Cancelling ${jobs.length} trade(s)…`);
   let done = 0, refunded = 0, forced = 0;
@@ -1749,14 +1725,14 @@ async function cancelAllTrades() {
       if (!j.chatOnly) {
         const r = await adminSettleOrder(j.id, 'reject', true);
         if (r && r.ok) { done++; if (r.refunded) refunded++; continue; }
-        await db.ref(`users/${j.fuid}/orders/${j.id}`).remove();
+        forced++;log('REVIEW',`order ${j.fuid}/${j.id} retained; settlement not committed`);continue;
       }
       await db.ref(`users/${j.fuid}/chats/${j.id}`).remove();
       forced++;
     } catch (e) { log('ERR', `cancelall ${j.id}: ${e.message}`); }
   }
   log('TRADE', `cancelalltrades: ${done} rejected, ${refunded} refunded, ${forced} force-cleared`);
-  return tgSend(card('🧹 ALL TRADES CANCELLED', [['Rejected', done], ['SELL refunds', refunded], ['Stuck cleared', forced]]));
+  return tgSend(card('🧹 ALL TRADES CANCELLED', [['Rejected', done], ['SELL refunds', refunded], ['Needs review (retained)', forced]]));
 }
 
 /** /resethousebalance — after confirmation, set every coin balance of every user to 0. */
