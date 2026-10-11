@@ -193,6 +193,7 @@ function card(title, rows = [], foot = '') {
 }
 const ok  = (title, rows) => card(`✅ ${title}`, rows);
 const bad = (msg) => `❌ ${msg}`;
+const good = (msg) => `✅ ${msg}`;
 
 /** IST midnight for a moment, and its YYYY-MM-DD key. */
 const IST_OFF = 5.5 * 3600_000;
@@ -429,6 +430,27 @@ async function sendSearchResults(q) {
 /** Plain text typed by the admin while the bot is waiting for an answer. */
 async function handleAskReply(text) {
   const a = ASK; ASK = null;
+  if (a.kind === 'mwd' || a.kind === 'plim') {
+    const n = Number(String(text).replace(/[^0-9.]/g, ''));
+    if (!Number.isFinite(n) || n < 0 || String(text).trim() === '') { ask(a.kind, { uid: a.uid }); return tgSend(bad('Send a number, e.g. `3`'), { reply_markup: cancelKb }); }
+    const found = await findUserByUID(a.uid);
+    if (!found) return tgSend(bad(`UID \`${a.uid}\` not found.`));
+    const key = a.kind === 'mwd' ? 'minWithdraw' : 'p2pDaily';
+    const val = a.kind === 'plim' ? Math.floor(n) : r8(n);
+    await db.ref(`users/${found.fuid}/limits/${key}`).set(val > 0 ? val : null);
+    log('ADMIN', `${key} UID=${a.uid} → ${val || 'default'}`);
+    await tgSend(good(a.kind === 'mwd'
+      ? `Min withdrawal for \`${a.uid}\` set to *$${val > 0 ? val : 10}*`
+      : `P2P daily limit for \`${a.uid}\` set to *${val > 0 ? val + ' / day' : 'Unlimited'}*`));
+    return sendUserDetailCard(null, a.uid);
+  }
+  if (a.kind === 'p2prate') {
+    const n = Number(String(text).replace(/[^0-9.]/g, ''));
+    if (!Number.isFinite(n) || n <= 0 || n > 10000) { ask('p2prate', { field: a.field }); return tgSend(bad('Send a valid rate, e.g. `97.50`'), { reply_markup: cancelKb }); }
+    await db.ref(`settings/p2p/${a.field}`).set(Math.round(n * 100) / 100);
+    P2P_CACHE.at = 0;
+    return sendP2PRates();
+  }
   if (a.kind === 'uid') {
     const t = text.trim();
     const uid = t.includes('@') ? t : t.replace(/[^A-Za-z0-9_-]/g, '');
@@ -1475,6 +1497,21 @@ async function handleCallback(cb, upd = null) {
     setCbButtons(cb, action === 'approve' ? '✅ APPROVED' : '❌ REJECTED');
     if (upd) pushRecentUpdate(upd);                  // hand it to the app — exactly once
     log('TRADE', `${action} ${tradeCb} → forwarded once`);
+    // Safety net: if the user's app is closed / offline the order would never
+    // settle and the balance would never update. Settle it server-side after 30s.
+    setTimeout(async () => {
+      try {
+        const owner = await findTradeOwner(tradeCb);
+        if (!owner) return;
+        const orders = owner.user.orders || {};
+        const chats = owner.user.chats || {};
+        let oid = Object.keys(chats).find(k => chats[k]?.cbId === tradeCb);
+        if (!oid) { const guess = String(tradeCb).split('_')[1]; if (orders[guess]) oid = guess; }
+        if (!oid || !orders[oid]) return;           // app already settled it
+        const r = await adminSettleOrder(oid, action === 'approve' ? 'complete' : 'reject', true);
+        log('TRADE', `fallback settle #${oid} ${action} → ${r && r.ok ? 'done' : 'skipped'}`);
+      } catch (e) { log('TRADE', `fallback settle err ${e.message}`); }
+    }, 30000);
     return;
   }
   if (/^(join|ignore)_support_/.test(data)) return; // handled by iframe support overlay
@@ -1523,6 +1560,30 @@ async function handleCallback(cb, upd = null) {
     return tgSend(`⚠️ Ban \`${m[1]}\`?`, { reply_markup: { inline_keyboard: [[{ text: '🚫 Yes, ban', callback_data: `cfm_${id}` }, { text: '✖ Cancel', callback_data: 'askcancel' }]] } });
   }
   if ((m = data.match(/^bal_(.+)$/)))       { await tgAnswer(cb.id, '💰 Loading…');     return handleBalances(m[1]); }
+  if ((m = data.match(/^mwd_(.+)$/))) {
+    await tgAnswer(cb.id, '💸');
+    ask('mwd', { uid: m[1] });
+    return tgSend(`💸 Send the *minimum withdrawal* (USD) for \`${m[1]}\`, e.g. \`25\`.\nSend \`0\` to reset to default ($10).`, { reply_markup: cancelKb });
+  }
+  if ((m = data.match(/^plim_(.+)$/))) {
+    await tgAnswer(cb.id, '🔢');
+    ask('plim', { uid: m[1] });
+    return tgSend(`🔢 Send the *P2P orders per day* limit for \`${m[1]}\`, e.g. \`3\`.\nSend \`0\` for unlimited.`, { reply_markup: cancelKb });
+  }
+  if (data === 'menu_p2prates') { await tgAnswer(cb.id, '💱'); return sendP2PRates(); }
+  if ((m = data.match(/^p2pr_(buyMin|buyMax|sellMin|sellMax)$/))) {
+    await tgAnswer(cb.id, '✏️');
+    ask('p2prate', { field: m[1] });
+    const lbl = { buyMin: 'BUY rate start', buyMax: 'BUY rate end', sellMin: 'SELL rate start', sellMax: 'SELL rate end' }[m[1]];
+    return tgSend(`✏️ Send the new *${lbl}* in ₹, e.g. \`97.50\``, { reply_markup: cancelKb });
+  }
+  if (data === 'p2pr_night') {
+    const cur = await getP2PSettings(true);
+    await db.ref('settings/p2p/nightOn').set(!(cur.nightOn !== false));
+    P2P_CACHE.at = 0;
+    await tgAnswer(cb.id, 'Updated');
+    return sendP2PRates();
+  }
   if ((m = data.match(/^msgprompt_(.+)$/))) {
     await tgAnswer(cb.id, '💬');
     ask('msg', { uid: m[1] });
@@ -1620,11 +1681,6 @@ async function adminSettleOrder(orderId, action, quiet = false) {
   const lockKey = String(st.cbId || `admin_${orderId}`).split('.').join('_').split('/').join('_');
   const lk = await db.ref(`users/${fuid}/tradeDone/${lockKey}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
   if (!lk.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
-  // Shared once-only lock with the P2P iframe (users/{uid}/tradeDone/{orderId}) — never credit an order twice.
-  if (lockKey !== orderId) {
-    const lk2 = await db.ref(`users/${fuid}/tradeDone/${orderId}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
-    if (!lk2.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
-  }
   // Claim the order itself: only one remover wins.
   let got = null;
   const tx = await db.ref(`users/${fuid}/orders/${orderId}`).transaction(cur => { got = cur; return cur ? null : undefined; });
@@ -1818,8 +1874,56 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
-  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }],
+  [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }, { text: '💱 P2P rates', callback_data: 'menu_p2prates' }],
 ] };
+
+// ════════════════════════════════════════════════════════════════════
+// P2P RATE SETTINGS + per-user limits (read by the app via /api/p2p/config)
+// ════════════════════════════════════════════════════════════════════
+const P2P_DEFAULTS = { buyMin: 97, buyMax: 99, sellMin: 101, sellMax: 108, nightOn: true };
+const P2P_CACHE = { at: 0, v: { ...P2P_DEFAULTS } };
+async function getP2PSettings(fresh = false) {
+  if (!fresh && Date.now() - P2P_CACHE.at < 30000) return P2P_CACHE.v;
+  try {
+    const v = (await db.ref('settings/p2p').once('value')).val() || {};
+    P2P_CACHE.v = { ...P2P_DEFAULTS, ...v }; P2P_CACHE.at = Date.now();
+  } catch (e) { log('P2P', `settings read err ${e.message}`); }
+  return P2P_CACHE.v;
+}
+/** Hour in India (0-23). */
+function istHour(ts = Date.now()) { return new Date(ts + 5.5 * 3600e3).getUTCHours(); }
+/** Start of today in India, as a UTC timestamp. */
+function istDayStart(ts = Date.now()) { const d = new Date(ts + 5.5 * 3600e3); d.setUTCHours(0, 0, 0, 0); return d.getTime() - 5.5 * 3600e3; }
+async function sendP2PRates() {
+  const s = await getP2PSettings(true);
+  return tgSend(card('💱 P2P RATES', [
+    ['🟢 BUY start', `₹${s.buyMin}`], ['🟢 BUY end', `₹${s.buyMax}`],
+    ['🔴 SELL start', `₹${s.sellMin}`], ['🔴 SELL end', `₹${s.sellMax}`],
+    ['🌙 Night mode (1–5 AM IST)', s.nightOn !== false ? 'ON · only 2–3 ads' : 'OFF'],
+    'Tap a value to change it 👇',
+  ]), { reply_markup: { inline_keyboard: [
+    [{ text: 'BUY start', callback_data: 'p2pr_buyMin' }, { text: 'BUY end', callback_data: 'p2pr_buyMax' }],
+    [{ text: 'SELL start', callback_data: 'p2pr_sellMin' }, { text: 'SELL end', callback_data: 'p2pr_sellMax' }],
+    [{ text: s.nightOn !== false ? '🌙 Night mode: ON' : '🌙 Night mode: OFF', callback_data: 'p2pr_night' }],
+    [{ text: '🏠 Menu', callback_data: 'menu_home' }],
+  ] } });
+}
+async function userLimitsInfo(fuid) {
+  const u = (await db.ref(`users/${fuid}`).once('value')).val() || {};
+  const p2pDaily = Math.floor(r8(u.limits?.p2pDaily)) || 0;
+  const minWithdraw = r8(u.limits?.minWithdraw) || 0;
+  const from = istDayStart();
+  let used = 0;
+  for (const h of Object.values(u.history || {})) {
+    const t = String(h?.type || '').toUpperCase();
+    if ((t === 'BUY' || t === 'SELL') && (h.ts || 0) >= from) used++;
+  }
+  for (const o of Object.values(u.orders || {})) {
+    const st = String(o?.status || '').toLowerCase();
+    if (o && !['completed', 'cancelled', 'canceled'].includes(st)) used++;
+  }
+  return { p2pDaily, minWithdraw, usedToday: used };
+}
 
 // ════════════════════════════════════════════════════════════════════
 // WHATSAPP PANEL — /whatsapp : linked account, or a QR to link it
@@ -2020,6 +2124,8 @@ async function sendUserDetailCard(cb, uid) {
     ['🎁 Refer code', u.refer?.code ? `\`${u.refer.code}\`` : '—'],
     ['🤝 Referred by', u.referral?.by ? `\`${u.referral.byUid || '—'}\` ${u.referral.byName || ''}${u.referral.rewarded ? ' · paid ✅' : ''}` : '—'],
     ['👥 Invited', `${Object.keys(u.refer?.invites || {}).length} · earned ${fmtNum(u.refer?.earned || 0)} USDT`],
+    ['💸 Min withdraw', `$${r8(u.limits?.minWithdraw) > 0 ? r8(u.limits.minWithdraw) : 10}`],
+    ['🔢 P2P daily limit', r8(u.limits?.p2pDaily) > 0 ? `${r8(u.limits.p2pDaily)} / day` : 'Unlimited'],
     ['📅 Joined', u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'],
     '', '💰 *Balances*', ...(balLines.length ? balLines : ['   (empty)']),
     '', '📊 *Last 3 transactions*', ...(last3.length ? last3 : ['   (none)']),
@@ -2042,6 +2148,8 @@ async function sendUserDetailCard(cb, uid) {
         ? { text: '✅ Unban', callback_data: `unban_${uid}` }
         : { text: '🚫 Ban',   callback_data: `banask_${uid}` },
       { text: '🔄 Close P2P', callback_data: `closep2p_${uid}` }],
+    [{ text: '💸 MWithdraw', callback_data: `mwd_${uid}` },
+     { text: '🔢 PLimit', callback_data: `plim_${uid}` }],
     [{ text: '↻ Refresh', callback_data: `userdetail_${uid}` },
      { text: '🆔 Other UID', callback_data: 'menu_find' },
      { text: '🏠 Menu',   callback_data: 'menu_home' }],
@@ -2694,6 +2802,22 @@ app.get('/health', (_req, res) => res.json({
 // The iframe can't talk to Telegram directly (we hold the single poll lock
 // and the bot token is server-only). These endpoints mimic the small subset
 // of the Bot API the iframe uses.
+app.get('/api/p2p/config', async (req, res) => {
+  try {
+    const s = await getP2PSettings();
+    const h = istHour();
+    const out = {
+      buyMin: Math.min(s.buyMin, s.buyMax), buyMax: Math.max(s.buyMin, s.buyMax),
+      sellMin: Math.min(s.sellMin, s.sellMax), sellMax: Math.max(s.sellMin, s.sellMax),
+      night: s.nightOn !== false && h >= 1 && h < 5,
+      nightCount: 2 + (new Date().getUTCDate() % 2),
+    };
+    const fuid = String(req.query.fuid || '').replace(/[^A-Za-z0-9_-]/g, '');
+    if (fuid) Object.assign(out, await userLimitsInfo(fuid));
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/tg/config', (_req, res) => {
   if (BACKEND_DISABLED) return res.json({ ok: false, error: 'backend_disabled' });
   res.json({ ok: true, chat_id: String(TG_CHAT) });
