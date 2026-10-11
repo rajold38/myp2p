@@ -1620,6 +1620,11 @@ async function adminSettleOrder(orderId, action, quiet = false) {
   const lockKey = String(st.cbId || `admin_${orderId}`).split('.').join('_').split('/').join('_');
   const lk = await db.ref(`users/${fuid}/tradeDone/${lockKey}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
   if (!lk.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
+  // Shared once-only lock with the P2P iframe (users/{uid}/tradeDone/{orderId}) — never credit an order twice.
+  if (lockKey !== orderId) {
+    const lk2 = await db.ref(`users/${fuid}/tradeDone/${orderId}`).transaction(cur => cur ? undefined : { action: action === 'complete' ? 'approve' : 'reject', by: 'admin', ts: Date.now() });
+    if (!lk2.committed) return out(bad(`Order \`#${orderId}\` was already handled.`));
+  }
   // Claim the order itself: only one remover wins.
   let got = null;
   const tx = await db.ref(`users/${fuid}/orders/${orderId}`).transaction(cur => { got = cur; return cur ? null : undefined; });
