@@ -490,6 +490,7 @@ async function runConfirm(id, hideHist = false) {
   if (c.op === 'setbal') { await handleSetBalance(c.uid, c.coin, c.amt); return sendUserDetailCard(null, c.uid); }
   if (c.op === 'msg')    { await handleAdminMessage(c.uid, c.text); return; }
   if (c.op === 'broadcast') return handleBroadcast(c.text);
+  if (c.op === 'allmail') return allMailRun(c.text);
   if (c.op === 'kycrevoke') return revokeKyc(c.uid);
   if (c.op === 'ban') return setBanned(c.uid, true);
 }
@@ -2541,6 +2542,61 @@ async function handleBroadcast(message) {
   ]));
 }
 
+// ── /allmail <text> — email every registered user (one by one, throttled) ──
+const ALLMAIL = { job: null };
+const ALLMAIL_GAP_MS = Number(process.env.ALLMAIL_GAP_MS || 700);
+async function allMailRecipients() {
+  const snap = await db.ref('users').once('value');
+  const seen = new Set(), list = [];
+  snap.forEach(c => {
+    const u = c.val() || {}, e = String(u.email || u.profile?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) || seen.has(e) || u.banned === true || u.frozen === true) return;
+    seen.add(e); list.push({ fuid: c.key, email: e, name: u.profile?.nickname || u.name || '' });
+  });
+  return list;
+}
+async function allMailPrompt(text) {
+  if (!text) return tgSend(bad('Usage: `/allmail your message here`\nFirst line becomes the subject if you write `Subject | message`.'));
+  if (ALLMAIL.job) return tgSend(bad(`Already sending (${ALLMAIL.job.sent}/${ALLMAIL.job.total}). Use /allmailstop first.`));
+  if (!RESEND_API_KEY && !mailer) return tgSend(bad('Mail is not configured on the server (RESEND_API_KEY or SMTP).'));
+  const list = await allMailRecipients();
+  const id = newConfirm({ op: 'allmail', text });
+  const mins = Math.ceil(list.length * ALLMAIL_GAP_MS / 60000);
+  return tgSend(card('📧 EMAIL ALL USERS?', [['👥 Recipients', `${list.length} emails`], ['⏱ Approx time', `${mins} min`], ['💬 Text', text.slice(0, 300)]]),
+    { reply_markup: { inline_keyboard: [[{ text: '✅ Send email to all', callback_data: `cfm_${id}` }, { text: '✖ Cancel', callback_data: 'askcancel' }]] } });
+}
+function allMailHtml(subject, body, name) {
+  const esc = v => String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return `<div style="background:#ffffff;padding:24px;font-family:Arial,sans-serif;color:#181a20"><div style="max-width:560px;margin:0 auto;border:1px solid #eaecef;border-radius:12px;padding:24px">
+<div style="font-size:20px;font-weight:800;color:#F0B90B;margin-bottom:16px">BIEXC</div>
+<div style="font-size:17px;font-weight:700;margin-bottom:12px">${esc(subject)}</div>
+<div style="font-size:14px;line-height:1.6">${name ? 'Hi ' + esc(name) + ',<br><br>' : ''}${esc(body).replace(/\n/g,'<br>')}</div>
+<div style="font-size:12px;color:#707a8a;margin-top:24px">You are receiving this because you have a BIEXC account.</div></div></div>`;
+}
+async function allMailRun(text) {
+  if (ALLMAIL.job) return tgSend(bad('Already sending — use /allmailstop first.'));
+  const parts = text.split('|');
+  const subject = (parts.length > 1 ? parts.shift() : 'Update from BIEXC').trim().slice(0, 120) || 'Update from BIEXC';
+  const body = parts.join('|').trim();
+  const list = await allMailRecipients();
+  const job = ALLMAIL.job = { total: list.length, sent: 0, failed: 0, stop: false };
+  log('ALLMAIL', `start ${list.length} recipients subject="${subject}"`);
+  await tgSend(`📧 Sending to ${list.length} users… I will report progress. /allmailstop to stop.`, { parse_mode: undefined });
+  (async () => {
+    let lastReport = Date.now(), lastErr = '';
+    for (const r of list) {
+      if (job.stop) break;
+      try { await sendMailAny({ to: r.email, subject, html: allMailHtml(subject, body, r.name), text: (r.name ? `Hi ${r.name},\n\n` : '') + body }); job.sent++; }
+      catch (e) { job.failed++; lastErr = e.message; if (/rate|429|quota|limit/i.test(e.message)) await new Promise(x => setTimeout(x, 5000)); }
+      if (Date.now() - lastReport > 60000) { lastReport = Date.now(); tgSend(`📧 Progress: ${job.sent} sent · ${job.failed} failed · ${job.total} total`, { parse_mode: undefined }).catch(() => {}); }
+      await new Promise(x => setTimeout(x, ALLMAIL_GAP_MS));
+    }
+    ALLMAIL.job = null;
+    log('ALLMAIL', `done sent=${job.sent} failed=${job.failed}`);
+    tgSend(`${job.stop ? '⏹ Stopped' : '✅ Done'} — ${job.sent} sent · ${job.failed} failed · ${job.total} total${lastErr ? '\nLast error: ' + lastErr.slice(0, 200) : ''}`, { parse_mode: undefined }).catch(() => {});
+  })().catch(e => { ALLMAIL.job = null; tgSend('Email job crashed: ' + e.message, { parse_mode: undefined }).catch(() => {}); });
+}
+
 // ── /broad — list all broadcasts with delete buttons ───────────────
 async function handleBroadList() {
   const snap = await db.ref('broadcast').once('value');
@@ -2595,6 +2651,9 @@ async function handleUpdate(upd) {
   if (/^\/cancelalltrades?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return cancelAllTrades().catch(e => tgSend(bad(e.message))); }
   if (/^\/resetnokyc(?:@\S+)?\s*$/i.test(text)) { ASK = null; return listNoKycUsers().then(l => l.length ? tgSend(`⚠️ *Delete ${l.length} non-KYC account(s)?*\nTheir data, balance and login will be removed. They can sign up again with the same email.\nThis cannot be undone.`, { reply_markup: { inline_keyboard: [[{ text: '✅ Yes, delete', callback_data: 'rnk_yes' }, { text: '✖ Cancel', callback_data: 'rhb_no' }]] } }) : tgSend('✅ No non-KYC users.')).catch(e => tgSend(bad(e.message))); }
   if (/^\/resethousebalance(?:@\S+)?\s*$/i.test(text)) { ASK = null; return tgSend('⚠️ *Reset ALL user balances to 0?*\nThis cannot be undone.', { reply_markup: { inline_keyboard: [[{ text: '✅ Yes, reset all', callback_data: 'rhb_yes' }, { text: '✖ Cancel', callback_data: 'rhb_no' }]] } }); }
+  { const am = text.match(/^\/allmail(?:@\S+)?(?:\s+([\s\S]+))?$/i);
+    if (am) { ASK = null; return allMailPrompt((am[1] || '').trim()).catch(e => tgSend(bad(e.message))); } }
+  if (/^\/allmailstop(?:@\S+)?\s*$/i.test(text)) { ASK = null; if (!ALLMAIL.job) return tgSend('No email sending in progress.'); ALLMAIL.job.stop = true; return tgSend('⏹ Stopping — no more emails will be sent.'); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
