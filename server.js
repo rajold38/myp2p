@@ -1571,6 +1571,21 @@ async function handleCallback(cb, upd = null) {
     ask('mwd', { uid: m[1] });
     return tgSend(`💸 Send the *minimum withdrawal* (USD) for \`${m[1]}\`, e.g. \`25\`.\nSend \`0\` to reset to default ($10).`, { reply_markup: cancelKb });
   }
+  if ((m = data.match(/^p2pblk([bs]?)_(.+)$/))) {
+    const side = m[1]; // '' = both, 'b' = buy only, 's' = sell only
+    const uid = m[2];
+    const found = await findUserByUID(uid);
+    if (!found) { await tgAnswer(cb.id, 'Not found'); return tgSend(bad(`UID \`${uid}\` not found.`)); }
+    const key = side === 'b' ? 'p2pBlockBuy' : side === 's' ? 'p2pBlockSell' : 'p2pBlocked';
+    const r = db.ref(`users/${found.fuid}/limits/${key}`);
+    const next = !((await r.once('value')).val() === true);
+    await r.set(next ? true : null);
+    const lbl = side === 'b' ? 'P2P BUY' : side === 's' ? 'P2P SELL' : 'P2P (Buy+Sell)';
+    log('ADMIN', `${key} UID=${uid} → ${next}`);
+    await tgAnswer(cb.id, next ? `${lbl} blocked` : `${lbl} unblocked`);
+    await tgSend(good(`${lbl} for \`${uid}\` is now *${next ? 'BLOCKED' : 'ALLOWED'}*`));
+    return sendUserDetailCard(null, uid);
+  }
   if ((m = data.match(/^plim_(.+)$/))) {
     await tgAnswer(cb.id, '🔢');
     ask('plim', { uid: m[1] });
@@ -1912,7 +1927,7 @@ async function userLimitsInfo(fuid) {
     const st = String(o?.status || '').toLowerCase();
     if (o && !['completed', 'cancelled', 'canceled'].includes(st)) used++;
   }
-  return { p2pDaily, minWithdraw, usedToday: used };
+  return { p2pDaily, minWithdraw, usedToday: used, p2pBlocked: u.limits?.p2pBlocked === true, p2pBlockBuy: u.limits?.p2pBlockBuy === true, p2pBlockSell: u.limits?.p2pBlockSell === true };
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -2115,6 +2130,7 @@ async function sendUserDetailCard(cb, uid) {
     ['🤝 Referred by', u.referral?.by ? `\`${u.referral.byUid || '—'}\` ${u.referral.byName || ''}${u.referral.rewarded ? ' · paid ✅' : ''}` : '—'],
     ['👥 Invited', `${Object.keys(u.refer?.invites || {}).length} · earned ${fmtNum(u.refer?.earned || 0)} USDT`],
     ['💸 Min withdraw', `$${r8(u.limits?.minWithdraw) > 0 ? r8(u.limits.minWithdraw) : 10}`],
+    ['⛔ P2P status', u.limits?.p2pBlocked ? 'BLOCKED (Buy+Sell)' : (u.limits?.p2pBlockBuy || u.limits?.p2pBlockSell) ? `Partial: ${[u.limits?.p2pBlockBuy && 'Buy', u.limits?.p2pBlockSell && 'Sell'].filter(Boolean).join(' + ')} blocked` : 'Allowed'],
     ['🔢 P2P daily limit', r8(u.limits?.p2pDaily) > 0 ? `${r8(u.limits.p2pDaily)} / day` : 'Unlimited'],
     ['📅 Joined', u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'],
     '', '💰 *Balances*', ...(balLines.length ? balLines : ['   (empty)']),
@@ -2140,6 +2156,15 @@ async function sendUserDetailCard(cb, uid) {
       { text: '🔄 Close P2P', callback_data: `closep2p_${uid}` }],
     [{ text: '💸 MWithdraw', callback_data: `mwd_${uid}` },
      { text: '🔢 PLimit', callback_data: `plim_${uid}` }],
+    [ u.limits?.p2pBlockBuy
+        ? { text: '✅ Buy allowed', callback_data: `p2pblkb_${uid}` }
+        : { text: '⛔ Block Buy', callback_data: `p2pblkb_${uid}` },
+      u.limits?.p2pBlockSell
+        ? { text: '✅ Sell allowed', callback_data: `p2pblks_${uid}` }
+        : { text: '⛔ Block Sell', callback_data: `p2pblks_${uid}` },
+      u.limits?.p2pBlocked
+        ? { text: '✅ Both allowed', callback_data: `p2pblk_${uid}` }
+        : { text: '⛔ Block Both', callback_data: `p2pblk_${uid}` }],
     [{ text: '↻ Refresh', callback_data: `userdetail_${uid}` },
      { text: '🆔 Other UID', callback_data: 'menu_find' },
      { text: '🏠 Menu',   callback_data: 'menu_home' }],
