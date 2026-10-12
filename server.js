@@ -896,6 +896,19 @@ async function supProcess(fuid) {
   const s = (await supRef(fuid).once('value')).val();
   if (!s || !s.meta) return;
   const meta = s.meta, msgs = s.msgs || {};
+  // V31: scoped flags from an EARLIER session must not block a new request.
+  // The app clears only unscoped flags, so without this a user's 2nd+ live
+  // request never reached the support bot and stayed on "Connecting…" forever.
+  // Each flag remembers which request (reqAt / closedAt) it belongs to, so phone
+  // clock differences cannot cause duplicate cards.
+  {
+    const reqAt = Number(meta.reqAt || 0), closedAt = Number(meta.closedAt || 0), reset = {};
+    const stale = (k, mark) => meta[k] && (meta[k + '_r'] != null ? Number(meta[k + '_r']) !== mark : Number(meta[k]) < mark);
+    if (['waiting','live'].includes(meta.status) && stale(notifiedKey, reqAt)) { reset[notifiedKey] = null; reset[notifiedKey + '_r'] = null; reset[cardKey] = null; }
+    if (stale(cancelKey, reqAt)) { reset[cancelKey] = null; reset[cancelKey + '_r'] = null; }
+    if (meta.status === 'closed' && stale(endKey, closedAt)) { reset[endKey] = null; reset[endKey + '_r'] = null; }
+    if (Object.keys(reset).length) { await supRef(fuid, 'meta').update(reset); Object.keys(reset).forEach(k => { meta[k] = null; }); log('SUP', `new session for ${fuid} — cleared old flags`); }
+  }
   // 1) new request → Accept / Busy card for the admin
   if (['waiting','live'].includes(meta.status) && !meta[notifiedKey] && await onceFlag(supRef(fuid, `meta/${notifiedKey}`))) {
     const lite = await supLite(fuid);
@@ -904,12 +917,13 @@ async function supProcess(fuid) {
     const r = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT,
       text: `🎧 LIVE SUPPORT REQUEST\n\n👤 ${lite.name}\n🆔 UID: ${lite.uid}\n📧 ${lite.email}\n📱 ${lite.phone}\n📝 Topic: ${meta.topic || 'General'}\n\nRecent chat:\n${ctx || '—'}`,
       reply_markup: { inline_keyboard: [meta.status==='live' ? [{text:'Reply to user',callback_data:`sup_sw_${fuid}`},{text:'End chat',callback_data:`sup_end_${fuid}`}] : [{ text: '✅ Accept chat', callback_data: `sup_acc_${fuid}` }, { text: '⏳ Busy', callback_data: `sup_rej_${fuid}` }]] } });
-    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ [cardKey]: r.result.message_id });
+    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ [cardKey]: r.result.message_id, [notifiedKey + '_r']: Number(meta.reqAt || 0) });
     else {await supRef(fuid, `meta/${notifiedKey}`).remove();return;}
     log('SUP', `request from ${lite.uid}`);
   }
   // 2) user cancelled while waiting
   if (meta.cancelled && !meta[cancelKey] && await onceFlag(supRef(fuid, `meta/${cancelKey}`))) {
+    await supRef(fuid, 'meta').update({ [cancelKey + '_r']: Number(meta.reqAt || 0) });
     const lite = await supLite(fuid);
     if (meta[cardKey]) await tgFetchSup('editMessageText', { chat_id: TG_CHAT_SUPPORT, message_id: meta[cardKey], text: `🎧 Support request from ${lite.name} · UID ${lite.uid}\n\n❌ Cancelled by user` });
   }
@@ -927,6 +941,7 @@ async function supProcess(fuid) {
   }
   // 4) user ended the chat
   if (meta.status === 'closed' && meta.closedBy === 'user' && !meta[endKey] && await onceFlag(supRef(fuid, `meta/${endKey}`))) {
+    await supRef(fuid, 'meta').update({ [endKey + '_r']: Number(meta.closedAt || 0) });
     const lite = await supLite(fuid);
     if (SUP.active === fuid) await supSetActive(null);
     await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🔚 ${lite.name} · UID ${lite.uid} ended the support chat.` });
