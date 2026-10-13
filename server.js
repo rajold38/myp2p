@@ -1631,6 +1631,7 @@ async function handleCallback(cb, upd = null) {
   }
   if (data === 'menu_users')   { await tgAnswer(cb.id, '👥'); return handleUsersList(); }
   if (data === 'menu_stats')   { await tgAnswer(cb.id, '📊'); return handleStats(); }
+  if (data === 'menu_today')   { await tgAnswer(cb.id, '📅'); return handleToday(); }
   if (data === 'menu_pending') { await tgAnswer(cb.id, '⏳'); return handleTrades(); }
   if (data === 'menu_today')   { await tgAnswer(cb.id, '📈'); return sendDailySummary(); }
   if (data === 'menu_broad')   { await tgAnswer(cb.id, '📢'); return handleBroadList(); }
@@ -1879,6 +1880,7 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '🆔 Open user by UID', callback_data: 'menu_find' }],
   [{ text: '🔎 Search by name', callback_data: 'menu_search' }, { text: '👥 All users', callback_data: 'menu_users' }],
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
+  [{ text: '📅 Today', callback_data: 'menu_today' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
   [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }, { text: '💱 P2P rates', callback_data: 'menu_p2prates' }],
@@ -2332,6 +2334,82 @@ async function handleStats() {
   ]] } });
 }
 
+// ── /today — detailed report for the current IST day (12am–12am) ─────
+async function handleToday() {
+  const wait = await tgSend('⏳ Counting today\'s activity…');
+  try {
+    const dayStart = istDayStart();
+    const snap = await db.ref('users').once('value');
+    const t = {
+      newUsers: 0,
+      buyN: 0, buyUsdt: 0, buyInr: 0,
+      sellN: 0, sellUsdt: 0, sellInr: 0,
+      p2pCancel: 0, p2pActive: 0,
+      depN: 0, depUsdt: 0, depPendN: 0, depPendUsdt: 0,
+      witN: 0, witUsdt: 0, witPendN: 0, witPendUsdt: 0, witRejN: 0,
+      creditN: 0, creditUsdt: 0, debitN: 0, debitUsdt: 0,
+    };
+    snap.forEach(c => {
+      const u = c.val() || {}; if (!u.uid) return;
+      if ((u.createdAt || 0) >= dayStart) t.newUsers++;
+      for (const o of Object.values(u.orders || {})) {
+        const st = String(o?.status || '').toLowerCase();
+        if (st && !['completed', 'cancelled', 'canceled'].includes(st) && (o.ts || o.createdAt || 0) >= dayStart) t.p2pActive++;
+      }
+      for (const [kind, pre] of [['dep', 'depPend'], ['wit', 'witPend']]) {
+        for (const [k, v] of Object.entries((u.pendingReqs || {})[kind] || {})) {
+          if (k === 'botLock' || !v) continue;
+          if ((v.ts || v.createdAt || 0) < dayStart) continue;
+          t[`${pre}N`]++; t[`${pre}Usdt`] += r8(v.amt);
+        }
+      }
+      for (const h of Object.values(u.history || {})) {
+        if (!h || (h.ts || 0) < dayStart) continue;
+        const ty = String(h.type || '').toUpperCase();
+        const amt = r8(h.amt);
+        const done = h.status === 'COMPLETED';
+        if (ty === 'BUY' && done) { t.buyN++; t.buyUsdt += amt; t.buyInr += r8(h.inr); }
+        else if (ty === 'SELL' && done) { t.sellN++; t.sellUsdt += amt; t.sellInr += r8(h.inr); }
+        else if (ty === 'BUY_CANCEL' || ty === 'SELL_CANCEL') t.p2pCancel++;
+        else if (/DEPOSIT/.test(ty) && done) { t.depN++; t.depUsdt += amt; }
+        else if (/WITHDRAW/.test(ty)) {
+          if (done) { t.witN++; t.witUsdt += amt; }
+          else if (h.status === 'REJECTED') t.witRejN++;
+        }
+        else if (ty === 'ADMIN_CREDIT' && done) { t.creditN++; t.creditUsdt += amt; }
+        else if (ty === 'ADMIN_DEBIT' && done) { t.debitN++; t.debitUsdt += amt; }
+      }
+    });
+    const p2pN = t.buyN + t.sellN, p2pUsdt = t.buyUsdt + t.sellUsdt, p2pInr = t.buyInr + t.sellInr;
+    const istNow = new Date(Date.now() + IST_OFF).toISOString().slice(11, 16);
+    if (wait?.ok) await tgDeleteMsg(wait.result.message_id);
+    await tgSend(card(`📅 TODAY'S REPORT — ${istDayKey()} (IST)`, [
+      ['🕛 Period', `12:00 AM → ${istNow} IST (resets at midnight)`],
+      '────────────────',
+      ['🟢 P2P BUY', `${t.buyN} orders · ${fmtNum(t.buyUsdt)} USDT · ₹${fmtNum(t.buyInr)}`],
+      ['🔴 P2P SELL', `${t.sellN} orders · ${fmtNum(t.sellUsdt)} USDT · ₹${fmtNum(t.sellInr)}`],
+      ['🔁 P2P total', `${p2pN} orders · ${fmtNum(p2pUsdt)} USDT · ₹${fmtNum(p2pInr)}`],
+      ['⏳ P2P active now', t.p2pActive],
+      ['✖ P2P cancelled', t.p2pCancel],
+      '────────────────',
+      ['📥 Deposits done', `${t.depN} · ${fmtNum(t.depUsdt)} USDT`],
+      ['📥 Deposits pending', `${t.depPendN} · ${fmtNum(t.depPendUsdt)} USDT`],
+      ['📤 Withdrawals done', `${t.witN} · ${fmtNum(t.witUsdt)} USDT`],
+      ['📤 Withdrawals pending', `${t.witPendN} · ${fmtNum(t.witPendUsdt)} USDT`],
+      ['📤 Withdrawals rejected', t.witRejN],
+      '────────────────',
+      ['👑 Admin credit', `${t.creditN} · ${fmtNum(t.creditUsdt)} USDT`],
+      ['👑 Admin debit', `${t.debitN} · ${fmtNum(t.debitUsdt)} USDT`],
+      ['🆕 New users', t.newUsers],
+    ]), { reply_markup: { inline_keyboard: [[
+      { text: '↻ Refresh', callback_data: 'menu_today' }, { text: '🏠 Menu', callback_data: 'menu_home' },
+    ]] } });
+  } catch (e) {
+    if (wait?.ok) await tgDeleteMsg(wait.result.message_id);
+    await tgSend(bad(`Report failed: ${e.message}`));
+  }
+}
+
 // ── Daily summary + live alerts ──────────────────────────────────────
 const BIG_AMOUNT = parseFloat(process.env.BIG_AMOUNT || '1000');
 let lastSummaryDay = null;
@@ -2680,6 +2758,7 @@ async function handleUpdate(upd) {
     if (am) { ASK = null; return allMailPrompt((am[1] || '').trim()).catch(e => tgSend(bad(e.message))); } }
   if (/^\/allmailstop(?:@\S+)?\s*$/i.test(text)) { ASK = null; if (!ALLMAIL.job) return tgSend('No email sending in progress.'); ALLMAIL.job.stop = true; return tgSend('⏹ Stopping — no more emails will be sent.'); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
+  if (/^\/today(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleToday().catch(e => tgSend(bad(e.message))); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
     ['🔑 Instance', `\`${INSTANCE_ID}\``],
