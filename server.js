@@ -429,7 +429,8 @@ async function handleAskReply(text) {
   }
   if (a.kind === 'p2prate') {
     const n = Number(String(text).replace(/[^0-9.]/g, ''));
-    if (!Number.isFinite(n) || n <= 0 || n > 10000) { ask('p2prate', { field: a.field }); return tgSend(bad('Send a valid rate, e.g. `97.50`'), { reply_markup: cancelKb }); }
+    const isLim = /Lim/.test(a.field);
+    if (!Number.isFinite(n) || n <= 0 || n > (isLim ? 1000000 : 10000)) { ask('p2prate', { field: a.field }); return tgSend(bad('Send a valid rate, e.g. `97.50`'), { reply_markup: cancelKb }); }
     await db.ref(`settings/p2p/${a.field}`).set(Math.round(n * 100) / 100);
     P2P_CACHE.at = 0;
     return sendP2PRates();
@@ -1592,11 +1593,11 @@ async function handleCallback(cb, upd = null) {
     return tgSend(`🔢 Send the *P2P orders per day* limit for \`${m[1]}\`, e.g. \`3\`.\nSend \`0\` for unlimited.`, { reply_markup: cancelKb });
   }
   if (data === 'menu_p2prates') { await tgAnswer(cb.id, '💱'); return sendP2PRates(); }
-  if ((m = data.match(/^p2pr_(buyMin|buyMax|sellMin|sellMax)$/))) {
+  if ((m = data.match(/^p2pr_(buyMin|buyMax|sellMin|sellMax|buyLimMin|buyLimMax|sellLimMin|sellLimMax)$/))) {
     await tgAnswer(cb.id, '✏️');
     ask('p2prate', { field: m[1] });
-    const lbl = { buyMin: 'BUY rate start', buyMax: 'BUY rate end', sellMin: 'SELL rate start', sellMax: 'SELL rate end' }[m[1]];
-    return tgSend(`✏️ Send the new *${lbl}* in ₹, e.g. \`97.50\``, { reply_markup: cancelKb });
+    const lbl = { buyMin: 'BUY rate start', buyMax: 'BUY rate end', sellMin: 'SELL rate start', sellMax: 'SELL rate end', buyLimMin: 'BUY minimum-limit start', buyLimMax: 'BUY minimum-limit end', sellLimMin: 'SELL minimum-limit start', sellLimMax: 'SELL minimum-limit end' }[m[1]];
+    return tgSend(`✏️ Send the new *${lbl}* in ₹, e.g. \`${/Lim/.test(m[1]) ? '2500' : '97.50'}\``, { reply_markup: cancelKb });
   }
   if (data === 'p2pr_night') {
     const cur = await getP2PSettings(true);
@@ -1889,7 +1890,7 @@ const MENU_KB = { inline_keyboard: [
 // ════════════════════════════════════════════════════════════════════
 // P2P RATE SETTINGS + per-user limits (read by the app via /api/p2p/config)
 // ════════════════════════════════════════════════════════════════════
-const P2P_DEFAULTS = { buyMin: 97, buyMax: 99, sellMin: 101, sellMax: 108, nightOn: true };
+const P2P_DEFAULTS = { buyMin: 97, buyMax: 99, sellMin: 101, sellMax: 108, buyLimMin: 500, buyLimMax: 1500, sellLimMin: 1000, sellLimMax: 4000, nightOn: true };
 const P2P_CACHE = { at: 0, v: { ...P2P_DEFAULTS } };
 async function getP2PSettings(fresh = false) {
   if (!fresh && Date.now() - P2P_CACHE.at < 30000) return P2P_CACHE.v;
@@ -1906,11 +1907,14 @@ async function sendP2PRates() {
   return tgSend(card('💱 P2P RATES', [
     ['🟢 BUY start', `₹${s.buyMin}`], ['🟢 BUY end', `₹${s.buyMax}`],
     ['🔴 SELL start', `₹${s.sellMin}`], ['🔴 SELL end', `₹${s.sellMax}`],
+    ['🟢 BUY min limit', `₹${s.buyLimMin} – ₹${s.buyLimMax}`], ['🔴 SELL min limit', `₹${s.sellLimMin} – ₹${s.sellLimMax}`],
     ['🌙 Night mode (1–5 AM IST)', s.nightOn !== false ? 'ON · only 2–3 ads' : 'OFF'],
     'Tap a value to change it 👇',
   ]), { reply_markup: { inline_keyboard: [
     [{ text: 'BUY start', callback_data: 'p2pr_buyMin' }, { text: 'BUY end', callback_data: 'p2pr_buyMax' }],
     [{ text: 'SELL start', callback_data: 'p2pr_sellMin' }, { text: 'SELL end', callback_data: 'p2pr_sellMax' }],
+    [{ text: 'BUY min-limit start', callback_data: 'p2pr_buyLimMin' }, { text: 'BUY min-limit end', callback_data: 'p2pr_buyLimMax' }],
+    [{ text: 'SELL min-limit start', callback_data: 'p2pr_sellLimMin' }, { text: 'SELL min-limit end', callback_data: 'p2pr_sellLimMax' }],
     [{ text: s.nightOn !== false ? '🌙 Night mode: ON' : '🌙 Night mode: OFF', callback_data: 'p2pr_night' }],
     [{ text: '🏠 Menu', callback_data: 'menu_home' }],
   ] } });
@@ -2961,6 +2965,8 @@ app.get('/api/p2p/config', async (req, res) => {
     const out = {
       buyMin: Math.min(s.buyMin, s.buyMax), buyMax: Math.max(s.buyMin, s.buyMax),
       sellMin: Math.min(s.sellMin, s.sellMax), sellMax: Math.max(s.sellMin, s.sellMax),
+      buyLimMin: Math.min(s.buyLimMin, s.buyLimMax), buyLimMax: Math.max(s.buyLimMin, s.buyLimMax),
+      sellLimMin: Math.min(s.sellLimMin, s.sellLimMax), sellLimMax: Math.max(s.sellLimMin, s.sellLimMax),
       night: s.nightOn !== false && h >= 1 && h < 5,
       nightCount: 2 + (new Date().getUTCDate() % 2),
     };
