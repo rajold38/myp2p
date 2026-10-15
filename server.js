@@ -781,45 +781,88 @@ async function bonusClaim(fuid, fn) {
   const tx = await db.ref(`users/${fuid}/bonus`).transaction(cur => { res = null; const b = cur || {}; const o = fn(b); if (!o) return; res = o.res; return o.b; });
   return tx.committed ? res : null;
 }
-async function bonusCountAction(fuid, id) {
-  const key = String(id).replace(/[.#$\[\]\/]/g, '_').slice(0, 80);
-  await bonusClaim(fuid, x => {
-    if (!x.welcomeGranted || x.welcomeStatus !== 'LOCKED') return null;
-    x.trades = x.trades || {}; if (x.trades[key]) return null;
-    x.trades[key] = Date.now(); x.tradesCompleted = (x.tradesCompleted || 0) + 1;
-    x.log = x.log || {}; x.log[`l${Date.now()}d`] = { type: 'TRADE', text: `Deposit approved (${Math.min(x.tradesCompleted, BONUS_TRADES)}/${BONUS_TRADES})`, ts: Date.now() };
-    return { b: x, res: true };
-  }).catch(() => {});
+// REFERRAL BONUS (v38) — every referred user (old + new) gets a locked $REF_BONUS.
+// It is NOT in balances.USDT, so it can never be withdrawn or sold in P2P.
+// Unlocks into main balance after REF_BUYS completed P2P BUY orders made
+// after the grant. Counted from history, so every settlement path counts.
+// The old KYC/welcome locked bonus is removed (already-paid bonuses stay).
+const REF_BONUS = parseFloat(process.env.REF_BONUS || '20');
+const REF_BUYS = parseInt(process.env.REF_BUYS || '2', 10);
+const isReferred = v => !!(v && (v.referral?.by || v.referredBy));
+function countRefBuys(v, since) {
+  const ids = new Set();
+  for (const h of Object.values(v?.history || {})) {
+    if (!h || !h.orderId) continue;
+    if (String(h.type || '').toUpperCase() !== 'BUY') continue;
+    if (String(h.status || '').toUpperCase() !== 'COMPLETED') continue;
+    if ((Number(h.ts) || 0) < since) continue;
+    ids.add(String(h.orderId));
+  }
+  return ids.size;
 }
+const bonusNoteQ = [];
+const bonusNote = line => { bonusNoteQ.push(line); };
+setInterval(() => {
+  if (!bonusNoteQ.length) return;
+  const lines = bonusNoteQ.splice(0, 40);
+  tgSend(`🎁 REFERRAL BONUS\n\n${lines.join('\n')}${bonusNoteQ.length ? `\n\n…${bonusNoteQ.length} more in next message` : ''}`, { parse_mode: undefined }).catch(() => {});
+}, 20000);
+async function bonusCountAction() { /* v38: counting is read from history in evaluateBonus */ }
 async function evaluateBonus(fuid, v) {
   if (!v || bonusBusy.has(fuid)) return;
   const b = v.bonus || {};
-  const kycDone = (v.kycLevels?.level || 0) >= 2 || v.kycStatus === 'APPROVED';
-  const BONUS_START = Date.UTC(2026, 9, 3);
-  const kycAt = v.kycApprovedAt || v.kycLevels?.approvedAt || v.kycLevels?.l2At || 0;
-  const wantKyc = kycDone && !b.welcomeGranted && (v.createdAt >= BONUS_START || kycAt >= BONUS_START);
-  const wantUnlock = b.welcomeGranted && b.welcomeStatus === 'LOCKED' && (b.tradesCompleted || 0) >= BONUS_TRADES;
-  if (!wantKyc && !wantUnlock) return;
+  const ref = isReferred(v), isRef = b.kind === 'REFERRAL';
+  const who = `${v.uid || fuid}${v.name ? ' ' + v.name : ''}`;
+  const oldLocked = !isRef && b.welcomeGranted && b.welcomeStatus === 'LOCKED';
+  const wantGrant = ref && !isRef;
+  const wantRemove = !ref && oldLocked;
+  const locked = isRef && b.welcomeStatus === 'LOCKED';
+  const buys = locked ? countRefBuys(v, b.welcomeAt || 0) : 0;
+  const wantUnlock = locked && buys >= REF_BUYS;
+  const wantProgress = locked && !wantUnlock && buys > (b.tradesCompleted || 0);
+  if (!wantGrant && !wantRemove && !wantUnlock && !wantProgress) return;
   bonusBusy.add(fuid);
   try {
-    if (wantKyc) {
-      const ok2 = await bonusClaim(fuid, x => {
-        if (x.welcomeGranted) return null;
-        const amt = pickKycBonus();
-        x.welcomeGranted = true; x.welcomeAmt = amt; x.welcomeStatus = 'LOCKED'; x.welcomeAt = Date.now(); x.tradesCompleted = x.tradesCompleted || 0;
-        x.log = x.log || {}; x.log[`l${Date.now()}g`] = { type: 'GRANTED', text: `$${amt} KYC Bonus received (locked)`, ts: Date.now() };
-        return { b: x, res: true };
+    if (wantGrant || wantRemove) {
+      let removedAmt = 0;
+      const r = await bonusClaim(fuid, x => {
+        if (x.kind === 'REFERRAL') return null;
+        const now = Date.now(), log = { ...(x.log || {}) };
+        const prevLocked = x.welcomeGranted && x.welcomeStatus === 'LOCKED';
+        removedAmt = prevLocked ? (Number(x.welcomeAmt) || 0) : 0;
+        if (prevLocked) log[`l${now}r`] = { type: 'REMOVED', text: `Old $${removedAmt} welcome bonus removed`, ts: now };
+        if (!ref) {
+          if (!prevLocked) return null;
+          return { b: { ...x, welcomeStatus: 'REMOVED', removedAt: now, log }, res: 'removed' };
+        }
+        log[`l${now}g`] = { type: 'GRANTED', text: `$${REF_BONUS} referral bonus received (locked)`, ts: now + 1 };
+        const legacyWelcome = x.welcomeGranted ? { amt: Number(x.welcomeAmt) || 0, status: prevLocked ? 'REMOVED' : (x.welcomeStatus || '') } : null;
+        return { b: { kycGranted: x.kycGranted || null, kycAmt: x.kycAmt || null, kycAt: x.kycAt || null, legacyWelcome,
+          kind: 'REFERRAL', welcomeGranted: true, welcomeAmt: REF_BONUS, welcomeStatus: 'LOCKED', welcomeAt: now, need: REF_BUYS, tradesCompleted: 0, log }, res: 'granted' };
       });
-      if (ok2) log('BONUS', `KYC bonus locked ${v.uid || fuid}`);
+      if (r === 'granted') { log('BONUS', `referral bonus locked ${who}`); bonusNote(`🔒 $${REF_BONUS} locked bonus → ${who}${removedAmt ? ` (old $${removedAmt} removed)` : ''}`); }
+      if (r === 'removed') { log('BONUS', `old bonus removed ${who}`); bonusNote(`🗑 Old $${removedAmt} locked bonus removed → ${who}`); }
+    }
+    if (wantProgress) {
+      const n = await bonusClaim(fuid, x => {
+        if (x.kind !== 'REFERRAL' || x.welcomeStatus !== 'LOCKED' || (x.tradesCompleted || 0) >= buys) return null;
+        const now = Date.now();
+        return { b: { ...x, tradesCompleted: buys, log: { ...(x.log || {}), [`l${now}t`]: { type: 'TRADE', text: `P2P Buy completed (${buys}/${REF_BUYS})`, ts: now } } }, res: buys };
+      });
+      if (n) bonusNote(`📈 ${who}: ${n}/${REF_BUYS} P2P buys done`);
     }
     if (wantUnlock) {
-      const amt = await bonusClaim(fuid, x => {
-        if (!x.welcomeGranted || x.welcomeStatus !== 'LOCKED' || (x.tradesCompleted || 0) < BONUS_TRADES) return null;
-        x.welcomeStatus = 'UNLOCKED'; x.unlockedAt = Date.now(); x.unlockedBy = 'server';
-        x.log = x.log || {}; x.log[`l${Date.now()}u`] = { type: 'UNLOCKED', text: `Unlocked — $${x.welcomeAmt || 10} moved to main balance`, ts: Date.now() };
-        return { b: x, res: x.welcomeAmt || 10 };
+      // v39: never auto-credit. Mark CLAIMABLE; user taps Claim in Assets.
+      const ok = await bonusClaim(fuid, x => {
+        if (x.kind !== 'REFERRAL' || x.welcomeStatus !== 'LOCKED') return null;
+        const now = Date.now();
+        return { b: { ...x, welcomeStatus: 'CLAIMABLE', tradesCompleted: buys, claimableAt: now,
+          log: { ...(x.log || {}), [`l${now}c`]: { type: 'CLAIMABLE', text: `${REF_BUYS} P2P buys done — bonus ready to claim`, ts: now } } }, res: true };
       });
-      if (amt) { await bonusCredit(fuid, amt, 'WELCOME_BONUS', `Welcome Bonus unlocked after ${BONUS_TRADES} trades`); log('BONUS', `welcome unlock +${amt} ${v.uid || fuid}`); }
+      if (ok) {
+        bonusNote(`🟢 ${who}: ${REF_BUYS}/${REF_BUYS} buys — $${Number(b.welcomeAmt) || REF_BONUS} ready to claim`);
+        pushNotif(fuid, { title: 'Bonus ready to claim', body: `Open Assets and tap Claim to get your $${Number(b.welcomeAmt) || REF_BONUS} bonus.`, type: 'INFO' }).catch(() => {});
+      }
     }
   } catch (e) { log('BONUS', `err ${e.message}`); }
   finally { bonusBusy.delete(fuid); }
@@ -1195,6 +1238,37 @@ async function adScan() {
 function adLimited(map, fuid, ms) { const n = Date.now(), l = map.get(fuid) || 0; if (n - l < ms) return Math.ceil((ms - (n - l)) / 1000); map.set(fuid, n); return 0; }
 
 function mountAutoDeposit(app) {
+  app.post('/api/bonus/claim', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      let out = null, why = 'not_eligible';
+      const tx = await db.ref(`users/${fuid}`).transaction(cur => {
+        out = null; why = 'not_eligible'; if (!cur) return cur;
+        const x = cur.bonus || {};
+        if (x.kind !== 'REFERRAL' || !isReferred(cur)) return;
+        if (x.welcomeStatus === 'UNLOCKED') { why = 'already_claimed'; return; }
+        if (x.welcomeStatus !== 'LOCKED' && x.welcomeStatus !== 'CLAIMABLE') return;
+        const n = countRefBuys(cur, x.welcomeAt || 0);
+        if (n < REF_BUYS) { why = 'need_trades'; out = { n }; return; }
+        const amt = Number(x.welcomeAmt) || REF_BONUS;
+        const bal = { ...(cur.balances || {}) }, old = Number(bal.USDT ?? cur.balance ?? 0);
+        if (!Number.isFinite(old)) return;
+        bal.USDT = r8(old + amt);
+        const now = Date.now(), hid = `h_bonus_referral_${now}`;
+        out = { amt, old, nb: bal.USDT };
+        return { ...cur, balances: bal, balance: bal.USDT,
+          bonus: { ...x, welcomeStatus: 'UNLOCKED', tradesCompleted: n, unlockedAt: now, claimedAt: now, unlockedBy: 'claim',
+            log: { ...(x.log || {}), [`l${now}u`]: { type: 'UNLOCKED', text: `Claimed — $${amt} added to main balance`, ts: now } } },
+          history: { ...(cur.history || {}), [hid]: { hid, ts: now, date: nowIST(), type: 'REFERRAL_BONUS', coin: 'USDT', amt, status: 'COMPLETED', note: `Referral bonus claimed after ${REF_BUYS} P2P buys` } } };
+      });
+      if (!tx.committed || !out || out.amt == null) return res.json({ ok: false, error: why, done: out?.n || 0, need: REF_BUYS });
+      const v = tx.snapshot.val() || {};
+      log('BONUS', `referral claim +${out.amt} ${fuid}`);
+      bonusNote(`✅ $${out.amt} claimed → ${v.uid || fuid}${v.name ? ' ' + v.name : ''} · balance ${out.old} → ${out.nb}`);
+      res.json({ ok: true, amt: out.amt, balance: out.nb });
+    } catch (e) { log('BONUS', `claim err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
   app.post('/api/deposit/config', async (_req, res) => {
     try { res.json({ ok: true, address: await adWallet(), min: AD.MIN, windowSec: AD.WINDOW / 1000 }); } catch { res.json({ ok: false }); }
   });
@@ -1599,6 +1673,12 @@ async function handleCallback(cb, upd = null) {
     const lbl = { buyMin: 'BUY rate start', buyMax: 'BUY rate end', sellMin: 'SELL rate start', sellMax: 'SELL rate end', buyLimMin: 'BUY minimum-limit start', buyLimMax: 'BUY minimum-limit end', sellLimMin: 'SELL minimum-limit start', sellLimMax: 'SELL minimum-limit end' }[m[1]];
     return tgSend(`✏️ Send the new *${lbl}* in ₹, e.g. \`${/Lim/.test(m[1]) ? '2500' : '97.50'}\``, { reply_markup: cancelKb });
   }
+  if (data === 'p2pr_reset') {
+    await db.ref('settings/p2p').set({ ...P2P_DEFAULTS });
+    P2P_CACHE.at = 0;
+    await tgAnswer(cb.id, '♻️ Reset done');
+    return sendP2PRates();
+  }
   if (data === 'p2pr_night') {
     const cur = await getP2PSettings(true);
     await db.ref('settings/p2p/nightOn').set(!(cur.nightOn !== false));
@@ -1916,13 +1996,14 @@ async function sendP2PRates() {
     [{ text: 'BUY min-limit start', callback_data: 'p2pr_buyLimMin' }, { text: 'BUY min-limit end', callback_data: 'p2pr_buyLimMax' }],
     [{ text: 'SELL min-limit start', callback_data: 'p2pr_sellLimMin' }, { text: 'SELL min-limit end', callback_data: 'p2pr_sellLimMax' }],
     [{ text: s.nightOn !== false ? '🌙 Night mode: ON' : '🌙 Night mode: OFF', callback_data: 'p2pr_night' }],
+    [{ text: '♻️ Reset all to default', callback_data: 'p2pr_reset' }],
     [{ text: '🏠 Menu', callback_data: 'menu_home' }],
   ] } });
 }
 async function userLimitsInfo(fuid) {
   const u = (await db.ref(`users/${fuid}`).once('value')).val() || {};
   const p2pDaily = Math.floor(r8(u.limits?.p2pDaily)) || 0;
-  const minWithdraw = r8(u.limits?.minWithdraw) || 0;
+  const minWithdraw = r8(u.limits?.minWithdraw) || (isReferred(u) ? 20 : 10);
   const from = istDayStart();
   let used = 0;
   for (const h of Object.values(u.history || {})) {
@@ -2135,7 +2216,7 @@ async function sendUserDetailCard(cb, uid) {
     ['🎁 Refer code', u.refer?.code ? `\`${u.refer.code}\`` : '—'],
     ['🤝 Referred by', u.referral?.by ? `\`${u.referral.byUid || '—'}\` ${u.referral.byName || ''}${u.referral.rewarded ? ' · paid ✅' : ''}` : '—'],
     ['👥 Invited', `${Object.keys(u.refer?.invites || {}).length} · earned ${fmtNum(u.refer?.earned || 0)} USDT`],
-    ['💸 Min withdraw', `$${r8(u.limits?.minWithdraw) > 0 ? r8(u.limits.minWithdraw) : 10}`],
+    ['💸 Min withdraw', `$${r8(u.limits?.minWithdraw) > 0 ? r8(u.limits.minWithdraw) : (isReferred(u) ? '20 (referral default)' : 10)}`],
     ['⛔ P2P status', u.limits?.p2pBlocked ? 'BLOCKED (Buy+Sell)' : (u.limits?.p2pBlockBuy || u.limits?.p2pBlockSell) ? `Partial: ${[u.limits?.p2pBlockBuy && 'Buy', u.limits?.p2pBlockSell && 'Sell'].filter(Boolean).join(' + ')} blocked` : 'Allowed'],
     ['🔢 P2P daily limit', r8(u.limits?.p2pDaily) > 0 ? `${r8(u.limits.p2pDaily)} / day` : 'Unlimited'],
     ['📅 Joined', u.createdAt ? new Date(u.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'],
