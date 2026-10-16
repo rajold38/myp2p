@@ -2170,12 +2170,16 @@ async function sendKycDetails(uid) {
       : { text: '✅ Approve KYC', callback_data: `kycok_${uid}` },
     { text: '👤 Back to user', callback_data: `userdetail_${uid}` }]] } });
   for (const [label, doc] of [['Aadhaar', d.aadhaar], ['PAN', d.pan]]) {
-    const img = doc?.img;
-    if (typeof img !== 'string' || !img.startsWith('data:image')) continue;
-    try {
-      const buf = Buffer.from(img.replace(/^data:image\/\w+;base64,/, ''), 'base64');
-      await tgSendPhotoBuf(buf, `🪪 ${label} — ${b.name || u.name || ''} (${u.uid || uid})`);
-    } catch (e) { log('KYC', `photo err ${e.message}`); }
+    if (!doc || typeof doc !== 'object') continue;
+    // Send front, then back (older submissions may have front only).
+    const sides = [['front', doc.img], ['back', doc.backImg]];
+    for (const [side, img] of sides) {
+      if (typeof img !== 'string' || !img.startsWith('data:image')) continue;
+      try {
+        const buf = Buffer.from(img.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+        await tgSendPhotoBuf(buf, `🪪 ${label} (${side === 'back' ? 'Back' : 'Front'}) — ${b.name || u.name || ''} (${u.uid || uid})`);
+      } catch (e) { log('KYC', `photo err ${e.message}`); }
+    }
   }
 }
 
