@@ -1269,6 +1269,25 @@ function mountAutoDeposit(app) {
       res.json({ ok: true, amt: out.amt, balance: out.nb });
     } catch (e) { log('BONUS', `claim err ${e.message}`); res.json({ ok: false, error: 'server' }); }
   });
+
+  // ─── QR LOGIN: phone approves → laptop gets custom token ───
+  app.post('/api/qr/approve', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const qrId = String(req.body?.qrId || '');
+      if (!/^qr_[0-9]+_[a-z0-9]{6,20}$/i.test(qrId)) return res.json({ ok: false, error: 'bad_id' });
+      const ref = db.ref(`qrLogin/${qrId}`);
+      const snap = await ref.get();
+      const v = snap.val();
+      if (!v || v.status !== 'pending') return res.json({ ok: false, error: 'expired' });
+      if (Date.now() - (Number(v.ts) || 0) > 5 * 60 * 1000) { await ref.remove().catch(() => {}); return res.json({ ok: false, error: 'expired' }); }
+      const token = await admin.auth().createCustomToken(fuid);
+      await ref.update({ status: 'confirmed', token, uid: fuid, confirmedAt: Date.now() });
+      log('QR', `login approved for ${fuid}`);
+      res.json({ ok: true });
+    } catch (e) { log('QR', `approve err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
   app.post('/api/deposit/config', async (_req, res) => {
     try { res.json({ ok: true, address: await adWallet(), min: AD.MIN, windowSec: AD.WINDOW / 1000 }); } catch { res.json({ ok: false }); }
   });
