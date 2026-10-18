@@ -1270,20 +1270,82 @@ function mountAutoDeposit(app) {
     } catch (e) { log('BONUS', `claim err ${e.message}`); res.json({ ok: false, error: 'server' }); }
   });
 
-  // ─── QR LOGIN: phone approves → laptop gets custom token ───
+  // ─── QR LOGIN v2: server creates session, laptop polls with secret, phone approves ───
+  const QR_TTL = 3 * 60 * 1000 + 30_000;
+  const QR_TOK = new Map();   // qrId -> { token, exp }  (memory only; never written to the database)
+  const QR_RL = new Map();    // ip -> [timestamps]
+  const qrHash = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');
+  const qrIdOk = (id) => /^qr_[0-9]+_[a-z0-9]{6,20}$/i.test(id);
+  const qrIp = (req) => String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+  setInterval(() => { const n = Date.now(); for (const [k, v] of QR_TOK) if (v.exp < n) QR_TOK.delete(k); for (const [k, v] of QR_RL) { const f = v.filter(t => n - t < 60_000); f.length ? QR_RL.set(k, f) : QR_RL.delete(k); } }, 60_000).unref?.();
+  async function qrSecretOk(v, secret) {
+    if (!v || !v.sh || !secret) return false;
+    const a = Buffer.from(String(v.sh)), b = Buffer.from(qrHash(secret));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+  app.post('/api/qr/new', async (req, res) => {
+    try {
+      const ip = qrIp(req), n = Date.now(), hits = (QR_RL.get(ip) || []).filter(t => n - t < 60_000);
+      if (hits.length >= 12) return res.json({ ok: false, error: 'too_many' });
+      hits.push(n); QR_RL.set(ip, hits);
+      let rnd = ''; for (let j = 0; j < 14; j++) rnd += 'abcdefghijklmnopqrstuvwxyz0123456789'[crypto.randomInt(36)];
+      const qrId = `qr_${n}_${rnd}`, secret = crypto.randomBytes(24).toString('hex');
+      await db.ref(`qrLogin/${qrId}`).set({ status: 'pending', ts: n, sh: qrHash(secret), v: 2 });
+      res.json({ ok: true, qrId, secret, ttl: 180_000 });
+    } catch (e) { log('QR', `new err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
+  app.post('/api/qr/poll', async (req, res) => {
+    try {
+      const qrId = String(req.body?.qrId || ''), secret = String(req.body?.secret || '');
+      if (!qrIdOk(qrId)) return res.json({ ok: false, error: 'bad_id' });
+      const ref = db.ref(`qrLogin/${qrId}`), v = (await ref.get()).val();
+      if (!v) return res.json({ ok: true, status: 'expired' });
+      if (!(await qrSecretOk(v, secret))) return res.json({ ok: false, error: 'bad_secret' });
+      if (Date.now() - (Number(v.ts) || 0) > QR_TTL) { await ref.remove().catch(() => {}); QR_TOK.delete(qrId); return res.json({ ok: true, status: 'expired' }); }
+      if (v.status === 'confirmed') {
+        const t = QR_TOK.get(qrId); QR_TOK.delete(qrId); await ref.remove().catch(() => {});
+        if (!t) return res.json({ ok: true, status: 'expired' });
+        return res.json({ ok: true, status: 'confirmed', token: t.token });
+      }
+      if (v.status === 'cancelled') { await ref.remove().catch(() => {}); return res.json({ ok: true, status: 'cancelled' }); }
+      res.json({ ok: true, status: v.status === 'scanned' ? 'scanned' : 'pending' });
+    } catch (e) { log('QR', `poll err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
+  app.post('/api/qr/scan', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const qrId = String(req.body?.qrId || '');
+      if (!qrIdOk(qrId)) return res.json({ ok: false, error: 'bad_id' });
+      const cancel = req.body?.cancel === true;
+      const tx = await db.ref(`qrLogin/${qrId}`).transaction(cur => {
+        if (!cur || (cur.status !== 'pending' && cur.status !== 'scanned')) return;
+        if (Date.now() - (Number(cur.ts) || 0) > QR_TTL) return;
+        if (cur.by && cur.by !== fuid) return;
+        return { ...cur, status: cancel ? 'cancelled' : 'scanned', by: fuid, scannedAt: Date.now() };
+      });
+      res.json(tx.committed ? { ok: true } : { ok: false, error: 'expired' });
+    } catch (e) { log('QR', `scan err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
+  // Phone approves → laptop gets a custom token (v2 via /api/qr/poll, legacy nodes via database listener)
   app.post('/api/qr/approve', async (req, res) => {
     try {
       const fuid = await fuidFromIdToken(req);
       if (!fuid) return res.json({ ok: false, error: 'auth' });
       const qrId = String(req.body?.qrId || '');
-      if (!/^qr_[0-9]+_[a-z0-9]{6,20}$/i.test(qrId)) return res.json({ ok: false, error: 'bad_id' });
+      if (!qrIdOk(qrId)) return res.json({ ok: false, error: 'bad_id' });
       const ref = db.ref(`qrLogin/${qrId}`);
-      const snap = await ref.get();
-      const v = snap.val();
-      if (!v || v.status !== 'pending') return res.json({ ok: false, error: 'expired' });
-      if (Date.now() - (Number(v.ts) || 0) > 5 * 60 * 1000) { await ref.remove().catch(() => {}); return res.json({ ok: false, error: 'expired' }); }
+      const v = (await ref.get()).val();
+      if (!v || (v.status !== 'pending' && v.status !== 'scanned')) return res.json({ ok: false, error: 'expired' });
+      if (v.by && v.by !== fuid) return res.json({ ok: false, error: 'expired' });
+      if (Date.now() - (Number(v.ts) || 0) > (v.v === 2 ? QR_TTL : 5 * 60 * 1000)) { await ref.remove().catch(() => {}); return res.json({ ok: false, error: 'expired' }); }
       const token = await admin.auth().createCustomToken(fuid);
-      await ref.update({ status: 'confirmed', token, uid: fuid, confirmedAt: Date.now() });
+      if (v.v === 2) {
+        QR_TOK.set(qrId, { token, exp: Date.now() + 120_000 });
+        await ref.update({ status: 'confirmed', by: fuid, confirmedAt: Date.now() });
+      } else {
+        await ref.update({ status: 'confirmed', token, uid: fuid, confirmedAt: Date.now() });
+      }
       log('QR', `login approved for ${fuid}`);
       res.json({ ok: true });
     } catch (e) { log('QR', `approve err ${e.message}`); res.json({ ok: false, error: 'server' }); }
