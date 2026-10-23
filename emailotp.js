@@ -37,20 +37,18 @@ const gen = () => String(crypto.randomInt(100000, 1000000));
 const copyBase = () => String(process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
 
 // ── BIEXC logo shown in the email header ─────────────────────────────
-// Two ways to set it (either one works, LOGO_URL wins):
-//   LOGO_URL=https://yourdomain.com/logo.png      a public image link
-//   LOGO_FILE=logo.png                            a file inside the repo
-// With no LOGO_FILE, logo.png / logo.jpg in the project root is picked up
-// automatically and sent *inside* the email (no hosting needed).
+// Order: LOGO_URL env → the server's own /mail/logo.png (serves repo logo.png)
+// → logo.png inside the email (inline) → gold "B" badge.
 const LOGO_CID = 'biexc-logo';
-const LOGO_DEFAULT_URL = 'https://id-preview--189dcad7-b984-44c6-8cec-f4a956f21376.lovable.app/__l5e/assets-v1/1296e733-46a8-4585-8a72-d61d45688e7c/biexc-logo.png';
 const LOGO_MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
 let _logo;                                        // undefined = not looked yet
 
 function logoAsset() {
   if (_logo !== undefined) return _logo;
-  const external = String(process.env.LOGO_URL || LOGO_DEFAULT_URL).trim();
+  const external = String(process.env.LOGO_URL || '').trim();
   if (/^https?:\/\//i.test(external)) return (_logo = { src: external, attachment: null });
+  const base = copyBase();
+  if (/^https:\/\//i.test(base)) return (_logo = { src: base + '/mail/logo.png', attachment: null });
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [process.env.LOGO_FILE, 'logo.png', 'logo.jpg', 'logo.jpeg', 'assets/logo.png']
     .filter(Boolean)
@@ -63,130 +61,74 @@ function logoAsset() {
       if (!buf.length || buf.length > 400_000) continue;   // keep the mail light
       return (_logo = {
         src: `cid:${LOGO_CID}`,
-        attachment: {
-          content: buf.toString('base64'),
-          filename: path.basename(file),
-          contentDisposition: 'inline',
-          cid: LOGO_CID,
-        },
+        attachment: { content: buf.toString('base64'), filename: path.basename(file), contentDisposition: 'inline', cid: LOGO_CID },
       });
     } catch { /* bad logo file — fall back to the letter badge */ }
   }
   return (_logo = null);
 }
 
+// ── Email design: BIEXC "Clean White" (same look as deposit/withdraw mails).
+// Light-only colour scheme so it stays white even when the phone is in dark mode.
+const F = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
+const MONO = "'SF Mono',Menlo,Consolas,'Courier New',monospace";
+const WHITE = 'background-color:#ffffff;background-image:linear-gradient(#ffffff,#ffffff);';
+const escH = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
 function mailHtml(code, purpose, name, base) {
   const isSignup = purpose === 'signup';
   const isReset = purpose === 'reset';
-  const title = isReset ? 'Reset your password' : isSignup ? 'Verify your email address' : 'Confirm it\u2019s you';
-  const preheader = isReset ? 'Use this code to set a new password for your BIEXC account.' : isSignup
-    ? 'One quick step left \u2014 enter this code to finish creating your BIEXC account.'
-    : 'A sign-in was requested for your account. Use this secure code to continue.';
-  const greet = name ? `Hi ${name},` : 'Hello,';
-  const bodyLine = isReset
-    ? 'We received a request to reset the password of your BIEXC account. Enter the 6-digit code below in the app, then choose your new password.'
-    : isSignup
-    ? 'You\u2019re just one step away from your new BIEXC account. Enter the 6-digit code below to verify this email address and finish signing up.'
-    : 'We noticed a sign-in attempt to your BIEXC account. Enter the 6-digit code below to continue \u2014 this confirms it\u2019s really you.';
+  const title = isReset ? 'Reset your password' : isSignup ? 'Verify your email' : 'Your verification code';
+  const what = isReset ? 'reset the password of your BIEXC account. Enter it in the app, then choose a new password'
+    : isSignup ? 'finish creating your BIEXC account' : 'finish signing in to BIEXC';
+  const greet = name ? `Hi ${escH(name)},<br><br>` : '';
   const pair = String(code).replace(/(\d{3})(\d{3})/, '$1 $2');
-
-  // Logo: real image when available, gold "B" badge otherwise.
   const logo = logoAsset();
   const logoTile = logo
-    ? `<img src="${logo.src}" width="42" height="42" alt="BIEXC" style="display:block;width:42px;height:42px;border-radius:11px;border:0;outline:none;-ms-interpolation-mode:bicubic">`
-    : `<div style="width:42px;height:42px;border-radius:11px;background:#f5b51b;text-align:center;font-size:23px;font-weight:900;line-height:42px;color:#0b0d12;font-family:Arial,Helvetica,sans-serif;letter-spacing:-1px">B</div>`;
-
-  // White digit cards on a soft panel (no dark blocks anywhere).
-  const digits = String(code).split('').map(d =>
-    `<td style="width:46px;padding:0 4px"><div style="background:#ffffff;border:1px solid #e2e6ec;border-radius:12px;padding:15px 0;text-align:center;color:#0b0d12;font-size:28px;line-height:1;font-weight:800;font-family:Arial,Helvetica,sans-serif;box-shadow:0 2px 6px rgba(10,12,18,.06)">${d}</div></td>`
-  ).join('');
-
-  // "Tap to copy" bar pinned at the very top of the message body.
-  const copyBar = base ? `
-    <tr><td style="padding:24px 32px 0">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-radius:12px">
-        <tr><td align="center" bgcolor="#f5b51b" style="background:#f5b51b;border-radius:12px">
-          <a href="${base}/copy?c=${code}" target="_blank" style="display:block;padding:15px 12px;font-size:15px;font-weight:800;color:#0b0d12;text-decoration:none;font-family:Arial,Helvetica,sans-serif;letter-spacing:.2px">&#128203;&nbsp; Tap to copy code &nbsp;&bull;&nbsp; ${pair}</a>
-        </td></tr>
-      </table>
-      <div style="font-size:11.5px;color:#9aa0aa;text-align:center;padding-top:8px;font-family:Arial,Helvetica,sans-serif">Opens a page that copies the code straight to your clipboard</div>
-    </td></tr>` : '';
+    ? `<img src="${logo.src}" width="26" height="26" alt="" style="display:block;width:26px;height:26px;border:0;outline:none;">`
+    : `<div style="width:26px;height:26px;border-radius:6px;background:#F0B90B;text-align:center;font-size:15px;font-weight:900;line-height:26px;color:#1E2329;font-family:${F}">B</div>`;
+  const copyBtn = base ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:20px;"><tr><td style="background-color:#F0B90B;border-radius:8px;"><a href="${base}/copy?c=${code}" target="_blank" style="display:inline-block;padding:12px 24px;font-size:14px;font-weight:700;color:#1E2329;text-decoration:none;font-family:${F};">Tap to copy code</a></td></tr></table>` : '';
+  const note = isReset
+    ? 'Didn\u2019t ask for this? Ignore this email \u2014 your password stays the same.'
+    : 'Never share this code. BIEXC staff will never ask for it.';
 
   return `<!doctype html>
-<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml">
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="x-apple-disable-message-reformatting">
+<meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light only">
 <title>${title}</title>
+<style>:root{color-scheme:light only;supported-color-schemes:light only;}
+body,table,td,div,p,a,span{color-scheme:light only;}
+@media (prefers-color-scheme:dark){body,.bx-page{background:#f5f5f5 !important;}.bx-card,.bx-body{background:#ffffff !important;}.bx-foot{background:#fafafa !important;}.bx-t{color:#1E2329 !important;}.bx-s{color:#474D57 !important;}.bx-m{color:#707A8A !important;}}
+[data-ogsc] .bx-t{color:#1E2329 !important;}[data-ogsc] .bx-s{color:#474D57 !important;}[data-ogsb] .bx-card,[data-ogsb] .bx-body{background:#ffffff !important;}[data-ogsb] .bx-page{background:#f5f5f5 !important;}
+@media (max-width:520px){.bx-pad,.bx-foot,.bx-head{padding-left:18px !important;padding-right:18px !important;}.bx-h1{font-size:20px !important;}.bx-code{font-size:28px !important;letter-spacing:6px !important;}}
+a{text-decoration:none;}</style>
 </head>
-<body style="margin:0;padding:0;background:#eceef1;color:#15171a;font-family:Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased">
-<div style="display:none;max-height:0;overflow:hidden;opacity:0">${preheader}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
-
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;background:#eceef1">
-<tr><td align="center" style="padding:36px 12px 28px">
-
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(10,12,18,.08)">
-
-    <!-- Header (light) -->
-    <tr><td style="background:#ffffff;padding:26px 32px 22px;text-align:center">
-      <table role="presentation" cellpadding="0" cellspacing="0" align="center"><tr>
-        <td style="width:42px;height:42px">${logoTile}</td>
-        <td style="padding-left:12px;text-align:left">
-          <div style="font-size:20px;font-weight:900;color:#0b0d12;letter-spacing:3px;font-family:Arial,Helvetica,sans-serif">BIEXC</div>
-          <div style="font-size:10px;color:#8a9099;letter-spacing:2px;padding-top:2px">SECURE CRYPTO EXCHANGE</div>
-        </td>
+<body class="bx-page" style="margin:0;padding:0;background-color:#f5f5f5;font-family:${F};-webkit-font-smoothing:antialiased;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;">${isReset ? 'Your BIEXC reset code is ' : 'Your BIEXC code is '}${pair}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="bx-page" style="background-color:#f5f5f5;"><tr><td align="center" style="padding:28px 12px;">
+  <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" class="bx-card" style="max-width:560px;width:100%;${WHITE}border:1px solid #eaecef;border-radius:12px;overflow:hidden;">
+    <tr><td class="bx-body bx-head" style="${WHITE}padding:18px 28px;border-bottom:3px solid #F0B90B;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td style="vertical-align:middle;padding-right:9px;">${logoTile}</td>
+        <td class="bx-t" style="vertical-align:middle;font-size:19px;font-weight:800;letter-spacing:2.5px;color:#1E2329;font-family:${F};">BIEXC</td>
       </tr></table>
     </td></tr>
-    <tr><td style="height:4px;background:#f5b51b;font-size:0">&nbsp;</td></tr>
-${copyBar}
-
-    <!-- Body -->
-    <tr><td style="padding:26px 32px 8px">
-      <div style="font-size:13px;font-weight:700;color:#c9930f;letter-spacing:2px;text-transform:uppercase;padding-bottom:8px">${isReset ? 'Password reset' : isSignup ? 'Account verification' : 'Sign-in confirmation'}</div>
-      <h1 style="font-size:26px;line-height:1.25;margin:0 0 12px;color:#0b0d12;font-weight:800;font-family:Arial,Helvetica,sans-serif">${title}</h1>
-      <p style="font-size:15px;line-height:1.65;margin:0;color:#5c6370;font-family:Arial,Helvetica,sans-serif">${greet} ${bodyLine}</p>
+    <tr><td class="bx-body bx-pad" style="${WHITE}padding:28px;">
+      <div class="bx-t bx-h1" style="font-size:22px;font-weight:700;line-height:1.3;color:#1E2329;margin:0 0 10px;">${title}</div>
+      <div class="bx-s" style="font-size:14px;line-height:1.65;color:#474D57;">${greet}Use this code to ${what}. It expires in 10 minutes.</div>
+      <div class="bx-t bx-code" style="margin:24px 0 4px;font-size:34px;font-weight:700;letter-spacing:8px;color:#1E2329;font-family:${MONO};">${pair}</div>
+      ${copyBtn}
+      <div class="bx-m" style="margin-top:20px;font-size:12px;color:#707A8A;">${note}</div>
     </td></tr>
-
-    <!-- Code panel (white cards on light panel) -->
-    <tr><td style="padding:22px 32px 0">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#f4f6f9" style="background:#f4f6f9;border:1px solid #e9ecf1;border-radius:14px">
-        <tr><td align="center" style="padding:20px 12px 4px">
-          <table role="presentation" cellpadding="0" cellspacing="0" align="center" selectall="true"><tr>${digits}</tr></table>
-        </td></tr>
-        <tr><td align="center" style="padding:16px 12px 20px">
-          <table role="presentation" cellpadding="0" cellspacing="0"><tr>
-            <td style="background:#ffffff;border:1px solid #e7dcbb;border-radius:100px;padding:8px 16px;font-size:12.5px;color:#7a6224;font-weight:700;font-family:Arial,Helvetica,sans-serif">&#9202;&nbsp; Expires in 10 minutes</td>
-          </tr></table>
-        </td></tr>
-      </table>
-    </td></tr>
-
-    <!-- Security note -->
-    <tr><td style="padding:24px 32px 8px">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border:1px solid #e9ecf1;border-radius:12px">
-        <tr><td style="padding:16px 18px 4px;font-size:12px;font-weight:800;color:#0b0d12;letter-spacing:1px;font-family:Arial,Helvetica,sans-serif">KEEP YOUR ACCOUNT SAFE</td></tr>
-        <tr><td style="padding:0 18px 14px">
-          <p style="font-size:13px;line-height:1.7;margin:8px 0 0;color:#5c6370;font-family:Arial,Helvetica,sans-serif">&#9679;&nbsp; Never share this code with anyone &mdash; not even BIEXC support.<br>&#9679;&nbsp; BIEXC staff will <strong style="color:#3a404b">never</strong> call, email or message you asking for it.<br>&#9679;&nbsp; Didn\u2019t request this? Ignore this email or reset your password to secure your account.</p>
-        </td></tr>
-      </table>
-    </td></tr>
-    <tr><td style="padding:14px 32px 32px">
-      <p style="font-size:12px;line-height:1.6;color:#9aa0aa;margin:0;font-family:Arial,Helvetica,sans-serif">This code was sent because someone tried to ${isReset ? 'reset the password of a BIEXC account' : isSignup ? 'create a BIEXC account' : 'sign in to a BIEXC account'} with this email address. If it was you, you\u2019re all set.</p>
-    </td></tr>
-
-    <!-- Footer (light) -->
-    <tr><td style="background:#f7f8fa;border-top:1px solid #eceef2;padding:24px 32px;text-align:center">
-      <div style="font-size:12px;font-weight:900;color:#0b0d12;letter-spacing:2px;font-family:Arial,Helvetica,sans-serif;padding-bottom:6px">BIEXC</div>
-      <div style="font-size:11px;color:#7c828c;line-height:1.7;font-family:Arial,Helvetica,sans-serif">
-        This is an automated security message &mdash; please do not reply.<br>
-        Need help? Contact support from the Help section in the BIEXC app.<br>
-        &copy; 2026 BIEXC. All rights reserved.
-      </div>
+    <tr><td class="bx-foot" style="background-color:#fafafa;padding:16px 28px;font-size:11.5px;line-height:1.7;color:#929AA5;font-family:${F};">
+      <span class="bx-m" style="color:#929AA5;">Stay safe: BIEXC will never ask for your password or verification code.<br>
+      Need help? Open <b style="color:#707A8A;">Customer Care</b> in the BIEXC app &middot; &copy; ${new Date().getFullYear()} BIEXC</span>
     </td></tr>
   </table>
-
-</td></tr>
-</table>
+</td></tr></table>
 </body></html>`;
 }
 
@@ -262,7 +204,7 @@ async function sendMail(to, code, purpose, name) {
       to: [to],
       subject: purpose === 'reset' ? `${code} is your BIEXC password reset code` : `${code} is your BIEXC verification code`,
       html: mailHtml(code, purpose, name, copyBase()),
-      text: `${code} is your BIEXC verification code.\n\nIt expires in 10 minutes. Never share this code with anyone — BIEXC staff will never ask for it.\n\nIf you didn't request it, ignore this email.`,
+      text: `${code} is your BIEXC ${purpose === 'reset' ? 'password reset' : 'verification'} code.\n\nIt expires in 10 minutes. Never share this code with anyone — BIEXC staff will never ask for it.\n\nIf you didn't request it, ignore this email.`,
       headers: { 'X-Entity-Ref-ID': `otp-${purpose}-${Date.now()}` },
       ...(logo?.attachment ? { attachments: [logo.attachment] } : {})
     })
