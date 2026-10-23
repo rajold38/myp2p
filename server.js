@@ -3690,7 +3690,7 @@ async function sendUserTxMail(key, user, mail) {
   const k = tapKey(`mail_${key}`);
   if (db) { const tx = await db.ref(`mailLog/${k}`).transaction(c => c ? undefined : { ts: Date.now(), to, by: INSTANCE_ID }); if (!tx.committed) return false; }
   try {
-    const info = await sendMailAny({ to, subject: mail.subject, html: mailHtml({ ...mail, uid }), text: `${mail.subject}\n\n${mail.message}\n\n${mail.amount ? 'Amount: ' + mail.amount + '\n\n' : ''}BIEXC — t.me/biexc10` });
+    const info = await sendMailAny({ to, subject: mail.subject, html: mailHtml({ ...mail, uid }), text: `${mail.subject}\n\n${mail.message}\n\n${mail.amount ? 'Amount: ' + mail.amount + '\n\n' : ''}BIEXC — Need help? Open Customer Care in the BIEXC app.` });
     noteServerMail(to, mailCat(mail.subject));
     log('MAIL', `✅ sent ${key} UID=${uid} → ${to} msg=${info.messageId || 'ok'}`);
     return true;
@@ -3817,7 +3817,7 @@ ${mail.message}
 
 Amount: ${mail.amount}
 
-BIEXC — t.me/biexc10`
+BIEXC — Need help? Open Customer Care in the BIEXC app.`
     });
     log('MAIL', `✅ sent ${label} ${mail.status} UID=${uid} → ${to} msg=${info.messageId || 'ok'}`);
     noteServerMail(to, ctx.type);
@@ -3864,12 +3864,13 @@ function mailShell({ title, preheader, inner }) {
   // footer
   h += '<tr><td class="bx-foot" style="background-color:#fafafa;padding:16px 28px;font-size:11.5px;line-height:1.7;color:#929AA5;font-family:' + MF + ';">';
   h += '<span class="bx-m" style="color:#929AA5;">Stay safe: BIEXC will never ask for your password or verification code.<br>';
-  h += 'Need help? <a href="https://t.me/biexc10" style="color:#C99400;">t.me/biexc10</a> · © ' + new Date().getFullYear() + ' BIEXC</span></td></tr>';
+  h += 'Need help? Open <b style="color:#707A8A;">Customer Care</b> in the BIEXC app · © ' + new Date().getFullYear() + ' BIEXC</span></td></tr>';
   h += '</table></td></tr></table></body></html>';
   return h;
 }
 const mH1 = (t) => '<div class="bx-t bx-h1" style="font-size:22px;font-weight:700;line-height:1.3;color:#1E2329;margin:0 0 10px;">' + mEsc(t) + '</div>';
-const mP = (t) => '<div class="bx-s" style="font-size:14px;line-height:1.65;color:#474D57;margin:0;">' + mEsc(t).replace(/\n/g, '<br>') + '</div>';
+const noTg = (t) => String(t == null ? '' : t).replace(/(contact\s+)?support\s+at\s+(https?:\/\/)?t\.me\/biexc10/gi, 'contact Customer Care in the BIEXC app').replace(/(https?:\/\/)?t\.me\/biexc10/gi, 'Customer Care in the BIEXC app');
+const mP = (t) => '<div class="bx-s" style="font-size:14px;line-height:1.65;color:#474D57;margin:0;">' + mEsc(noTg(t)).replace(/\n/g, '<br>') + '</div>';
 const mBtn = (text, href) => '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:24px;"><tr><td style="background-color:#F0B90B;border-radius:8px;"><a href="' + mEsc(href) + '" style="display:inline-block;padding:12px 26px;font-size:14px;font-weight:700;color:#1E2329;text-decoration:none;font-family:' + MF + ';">' + mEsc(text) + '</a></td></tr></table>';
 const mCode = (code) => '<div class="bx-t bx-code" style="margin:24px 0 10px;font-size:34px;font-weight:700;letter-spacing:8px;color:#1E2329;font-family:' + MM + ';">' + mEsc(String(code).replace(/\D/g, '').replace(/^(\d{3})(\d{3})$/, '$1 $2') || code) + '</div>';
 function mRows(rows) {
@@ -3934,7 +3935,7 @@ function otpMailHtml({ code, purpose, minutes } = {}) {
 function resetMailHtml({ code, link, minutes } = {}) {
   let inner = mH1('Reset your password');
   inner += mP('We received a request to reset the password for your BIEXC account. ' + (code ? 'Enter this code in the app to choose a new password.' : 'Tap the button below to choose a new one.') + ' It expires in ' + (minutes || (code ? 10 : 60)) + ' minutes.');
-  inner += code ? mCode(code) : mBtn('Reset password', link || 'https://t.me/biexc10');
+  inner += code ? mCode(code) : (link ? mBtn('Reset password', link) : '');
   inner += '<div class="bx-m" style="margin-top:20px;font-size:12px;color:#707A8A;">Didn\'t ask for this? Ignore this email — your password stays the same.</div>';
   return mailShell({ title: 'Reset your BIEXC password', preheader: code ? 'Your BIEXC reset code is ' + code : 'Reset your BIEXC password', inner });
 }
@@ -3946,7 +3947,10 @@ function allMailHtml(subject, body, name) {
   return mailShell({ title: subject, preheader: String(body || '').slice(0, 90), inner });
 }
 
-app.get('/mail/logo.png', (_req, res) => { res.set('Content-Type', 'image/png'); res.set('Cache-Control', 'public, max-age=31536000, immutable'); res.send(MAIL_LOGO_PNG); });
+// Email logo: the repo's own logo.png when present, built-in BIEXC mark otherwise.
+let MAIL_LOGO_FILE = null;
+try { const p = path.join(__dirname, 'logo.png'); const b = fs.existsSync(p) ? fs.readFileSync(p) : null; if (b && b.length && b.length < 400_000) MAIL_LOGO_FILE = b; } catch {}
+app.get('/mail/logo.png', (_req, res) => { res.set('Content-Type', 'image/png'); res.set('Cache-Control', 'public, max-age=86400'); res.send(MAIL_LOGO_FILE || MAIL_LOGO_PNG); });
 
 app.get('/api/mail-status', (_req, res) => {
   res.json({
@@ -3999,11 +4003,11 @@ app.post('/api/send-mail', async (req, res) => {
       html: mailHtml({ subject, message: message || '', amount: amount || '', status: status || '', uid: uid || '', label: '', coin: '' }),
       text: `${subject}
 
-${message || ''}
+${noTg(message || '')}
 
 ${amount ? 'Amount: ' + amount : ''}
 
-BIEXC — t.me/biexc10`
+BIEXC — Need help? Open Customer Care in the BIEXC app.`
     });
     log('MAIL', `sent → ${to_email} | ${String(subject).slice(0, 60)}`);
     res.json({ ok: true });
