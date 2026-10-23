@@ -2965,14 +2965,6 @@ async function allMailPrompt(text) {
   return tgSend(card('📧 EMAIL ALL USERS?', [['👥 Recipients', `${list.length} emails`], ['⏱ Approx time', `${mins} min`], ['💬 Text', text.slice(0, 300)]]),
     { reply_markup: { inline_keyboard: [[{ text: '✅ Send email to all', callback_data: `cfm_${id}` }, { text: '✖ Cancel', callback_data: 'askcancel' }]] } });
 }
-function allMailHtml(subject, body, name) {
-  const esc = v => String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  return `<div style="background:#ffffff;padding:24px;font-family:Arial,sans-serif;color:#181a20"><div style="max-width:560px;margin:0 auto;border:1px solid #eaecef;border-radius:12px;padding:24px">
-<div style="font-size:20px;font-weight:800;color:#F0B90B;margin-bottom:16px">BIEXC</div>
-<div style="font-size:17px;font-weight:700;margin-bottom:12px">${esc(subject)}</div>
-<div style="font-size:14px;line-height:1.6">${name ? 'Hi ' + esc(name) + ',<br><br>' : ''}${esc(body).replace(/\n/g,'<br>')}</div>
-<div style="font-size:12px;color:#707a8a;margin-top:24px">You are receiving this because you have a BIEXC account.</div></div></div>`;
-}
 async function allMailRun(text) {
   if (ALLMAIL.job) return tgSend(bad('Already sending — use /allmailstop first.'));
   const parts = text.split('|');
@@ -3838,166 +3830,123 @@ BIEXC — t.me/biexc10`
   }
 }
 
+// ─── BIEXC EMAIL DESIGN (Style A · Clean White) ───────────────────────────
+// Always white: light-only colour scheme for every mail client that honours it.
+const MAIL_LOGO_PNG = Buffer.from('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', 'base64');
+const MAIL_BASE_URL = String(RENDER_URL || 'https://p2p-telegram-bot.onrender.com').replace(/\/$/, '');
+const MAIL_LOGO_URL = MAIL_BASE_URL + '/mail/logo.png';
+const mEsc = (v) => String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const MF = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
+const MM = "'SF Mono',Menlo,Consolas,'Courier New',monospace";
+const MW = 'background-color:#ffffff;background-image:linear-gradient(#ffffff,#ffffff);';
+
+function mailShell({ title, preheader, inner }) {
+  let h = '<!doctype html><html lang="en" xmlns="http://www.w3.org/1999/xhtml"><head>';
+  h += '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+  h += '<meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light only">';
+  h += '<title>' + mEsc(title) + '</title>';
+  h += '<style>:root{color-scheme:light only;supported-color-schemes:light only;}';
+  h += 'body,table,td,div,p,a,span{color-scheme:light only;}';
+  h += '@media (prefers-color-scheme:dark){body,.bx-page{background:#f5f5f5 !important;}.bx-card,.bx-body{background:#ffffff !important;}.bx-foot{background:#fafafa !important;}.bx-t{color:#1E2329 !important;}.bx-s{color:#474D57 !important;}.bx-m{color:#707A8A !important;}}';
+  h += '[data-ogsc] .bx-t{color:#1E2329 !important;}[data-ogsc] .bx-s{color:#474D57 !important;}[data-ogsb] .bx-card,[data-ogsb] .bx-body{background:#ffffff !important;}[data-ogsb] .bx-page{background:#f5f5f5 !important;}';
+  h += '@media (max-width:520px){.bx-pad{padding:22px 18px !important;}.bx-amt{font-size:26px !important;}.bx-h1{font-size:20px !important;}.bx-code{font-size:28px !important;letter-spacing:6px !important;}.bx-foot{padding:16px 18px !important;}.bx-head{padding:16px 18px !important;}}';
+  h += 'a{text-decoration:none;}</style></head>';
+  h += '<body class="bx-page" style="margin:0;padding:0;background-color:#f5f5f5;font-family:' + MF + ';-webkit-font-smoothing:antialiased;">';
+  h += '<div style="display:none;max-height:0;overflow:hidden;opacity:0;">' + mEsc(preheader || title) + '</div>';
+  h += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="bx-page" style="background-color:#f5f5f5;"><tr><td align="center" style="padding:28px 12px;">';
+  h += '<table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" class="bx-card" style="max-width:560px;width:100%;' + MW + 'border:1px solid #eaecef;border-radius:12px;overflow:hidden;">';
+  // header
+  h += '<tr><td class="bx-body bx-head" style="' + MW + 'padding:18px 28px;border-bottom:3px solid #F0B90B;"><table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>';
+  h += '<td style="vertical-align:middle;padding-right:9px;"><img src="' + MAIL_LOGO_URL + '" width="26" height="26" alt="" style="display:block;border:0;width:26px;height:26px;"></td>';
+  h += '<td class="bx-t" style="vertical-align:middle;font-size:19px;font-weight:800;letter-spacing:2.5px;color:#1E2329;font-family:' + MF + ';">BIEXC</td></tr></table></td></tr>';
+  // body
+  h += '<tr><td class="bx-body bx-pad" style="' + MW + 'padding:28px;">' + inner + '</td></tr>';
+  // footer
+  h += '<tr><td class="bx-foot" style="background-color:#fafafa;padding:16px 28px;font-size:11.5px;line-height:1.7;color:#929AA5;font-family:' + MF + ';">';
+  h += '<span class="bx-m" style="color:#929AA5;">Stay safe: BIEXC will never ask for your password or verification code.<br>';
+  h += 'Need help? <a href="https://t.me/biexc10" style="color:#C99400;">t.me/biexc10</a> · © ' + new Date().getFullYear() + ' BIEXC</span></td></tr>';
+  h += '</table></td></tr></table></body></html>';
+  return h;
+}
+const mH1 = (t) => '<div class="bx-t bx-h1" style="font-size:22px;font-weight:700;line-height:1.3;color:#1E2329;margin:0 0 10px;">' + mEsc(t) + '</div>';
+const mP = (t) => '<div class="bx-s" style="font-size:14px;line-height:1.65;color:#474D57;margin:0;">' + mEsc(t).replace(/\n/g, '<br>') + '</div>';
+const mBtn = (text, href) => '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:24px;"><tr><td style="background-color:#F0B90B;border-radius:8px;"><a href="' + mEsc(href) + '" style="display:inline-block;padding:12px 26px;font-size:14px;font-weight:700;color:#1E2329;text-decoration:none;font-family:' + MF + ';">' + mEsc(text) + '</a></td></tr></table>';
+const mCode = (code) => '<div class="bx-t bx-code" style="margin:24px 0 10px;font-size:34px;font-weight:700;letter-spacing:8px;color:#1E2329;font-family:' + MM + ';">' + mEsc(String(code).replace(/\D/g, '').replace(/^(\d{3})(\d{3})$/, '$1 $2') || code) + '</div>';
+function mRows(rows) {
+  const r = rows.filter(x => x && x[1] !== undefined && x[1] !== null && String(x[1]) !== '');
+  if (!r.length) return '';
+  return '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:10px;font-size:13px;">' + r.map(([k, v, opt]) => {
+    const o = opt || {};
+    if (o.block) return '<tr><td colspan="2" style="padding:10px 0;border-top:1px solid #f0f1f2;"><div class="bx-m" style="color:#707A8A;font-size:12px;margin-bottom:4px;">' + mEsc(k) + '</div><div class="bx-t" style="color:#1E2329;font-size:12.5px;font-weight:600;font-family:' + MM + ';word-break:break-all;line-height:1.5;">' + mEsc(v) + '</div></td></tr>';
+    return '<tr><td class="bx-m" style="padding:10px 0;border-top:1px solid #f0f1f2;color:#707A8A;vertical-align:top;">' + mEsc(k) + '</td><td class="bx-t" style="padding:10px 0;border-top:1px solid #f0f1f2;text-align:right;color:' + (o.color || '#1E2329') + ';font-weight:600;' + (o.mono ? 'font-family:' + MM + ';' : '') + 'word-break:break-all;">' + mEsc(v) + '</td></tr>';
+  }).join('') + '</table>';
+}
+function explorerUrl(txid, network) {
+  const t = String(txid || '').trim(), n = String(network || '').toUpperCase();
+  if (/^0x[0-9a-fA-F]{64}$/.test(t)) return /ERC|ETH/.test(n) && !/BEP|BSC/.test(n) ? 'https://etherscan.io/tx/' + t : 'https://bscscan.com/tx/' + t;
+  if (/^[0-9a-fA-F]{64}$/.test(t) && /TRC|TRON/.test(n)) return 'https://tronscan.org/#/transaction/' + t;
+  return '';
+}
+const shortHash = (t) => { t = String(t || ''); return t.length > 20 ? t.slice(0, 8) + '…' + t.slice(-6) : t; };
+
+// Deposit / withdrawal / P2P / general notices — same options as before.
 function mailHtml(opts) {
   const o = opts || {};
-  const subject = o.subject || '';
-  const message = o.message || '';
-  const amount  = o.amount  || '';
-  const status  = o.status  || '';
-  const uid     = o.uid     || '';
-  const label   = o.label   || '';
-  const coin    = o.coin    || '';
-  const network = o.network || '';
-  const address = o.address || '';
-  const txid    = o.txid    || o.txnId || '';
-  const hid     = o.hid     || '';
-  const type    = o.type    || '';
-  const oldBal  = o.oldBal;
-  const newBal  = o.newBal;
-
-  const esc = (v) => String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  const nl2br = (v) => esc(v).replace(/\n/g, '<br>');
-
-  const isOk  = status === 'COMPLETED';
-  const isBad = status === 'CANCELLED' || status === 'REJECTED';
-  const accent   = isOk ? '#0ECB81' : isBad ? '#F6465D' : '#F0B90B';
-  const accentBg = isOk ? 'rgba(14,203,129,.10)' : isBad ? 'rgba(246,70,93,.10)' : 'rgba(240,185,11,.10)';
-  const badge    = isOk ? 'COMPLETED' : isBad ? 'CANCELLED' : (status || 'PENDING');
-  const verb     = isOk ? 'Completed' : isBad ? 'Cancelled' : 'Update';
-  const headline = o.headline || (label ? (label + ' ' + verb) : (subject || 'Transaction Update'));
-  const sign     = type === 'dep' ? '+' : '−';
-  const direction = type === 'dep' ? 'Incoming' : 'Outgoing';
-
-  const now = new Date();
-  const istStr = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
-  const utcStr = now.toISOString().replace('T',' ').slice(0,16) + ' UTC';
-  const refNo  = 'BIEXC-' + (hid ? String(hid).slice(-8).toUpperCase() : (txid ? String(txid).slice(-8).toUpperCase() : Math.random().toString(36).slice(2,10).toUpperCase()));
-
-  const det = (k, v, mono) => '<tr><td class="det-k" style="padding:11px 0;color:#8B95A7;font-size:12px;line-height:1.4;width:38%;vertical-align:top;letter-spacing:.2px;">' + esc(k) + '</td><td class="det-v" style="padding:11px 0;color:#EAECEF;font-size:13px;line-height:1.4;text-align:right;font-weight:600;' + (mono ? "font-family:'SF Mono',Menlo,Consolas,monospace;letter-spacing:-.2px;" : '') + 'word-break:break-all;">' + v + '</td></tr>';
-
-  const sec = (t) => '<tr><td colspan="2" style="padding:18px 0 6px;border-top:1px solid #1c222b;"><div style="font-size:10px;color:#5E6673;letter-spacing:2.5px;font-weight:700;text-transform:uppercase;">' + esc(t) + '</div></td></tr>';
-
-  const node = (n, txt, active) => '<td align="center" width="33.33%" style="padding:0 4px;"><div style="width:28px;height:28px;line-height:28px;margin:0 auto;border-radius:50%;background:' + (active?accent:'#1c222b') + ';color:' + (active?'#0a0d12':'#5E6673') + ';font-size:12px;font-weight:800;border:2px solid ' + (active?accent:'#1c222b') + ';">' + n + '</div><div style="margin-top:8px;font-size:10px;letter-spacing:1.2px;color:' + (active?'#EAECEF':'#5E6673') + ';text-transform:uppercase;font-weight:600;">' + esc(txt) + '</div></td>';
-
-  const logo = '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr><td align="center" style="width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 30%, #2a2a2a 0%, #0a0a0a 75%);border:2px solid #F0B90B;box-shadow:0 0 0 4px rgba(240,185,11,.06), 0 6px 18px rgba(240,185,11,.18);font:800 20px/64px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#F0B90B;letter-spacing:1.5px;text-align:center;">BN</td></tr></table>';
-
-  const stage3Active = isOk;
-  const stage2Label = o.stage2 || (type === 'wit' ? 'Broadcast' : 'Verified');
-  const stage3Label = o.stage3 || (isBad ? 'Cancelled' : (type === 'wit' ? 'Sent' : 'Credited'));
-
-  const addrBlock = address ? '<tr><td style="padding:14px 16px;background:#06080b;border:1px solid #1c222b;border-radius:10px;"><div style="font-size:10px;color:#5E6673;letter-spacing:2px;font-weight:700;text-transform:uppercase;margin-bottom:6px;">' + (type==='wit'?'Destination Address':'Sender Address') + '</div><div style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;color:#EAECEF;word-break:break-all;line-height:1.5;">' + esc(address) + '</div></td></tr><tr><td style="height:10px;line-height:10px;font-size:0;">&nbsp;</td></tr>' : '';
-
-  const txidBlock = txid ? '<tr><td style="padding:14px 16px;background:#06080b;border:1px solid #1c222b;border-radius:10px;"><div style="font-size:10px;color:#5E6673;letter-spacing:2px;font-weight:700;text-transform:uppercase;margin-bottom:6px;">Transaction Hash</div><div style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;color:#EAECEF;word-break:break-all;line-height:1.5;">' + esc(txid) + '</div></td></tr><tr><td style="height:10px;line-height:10px;font-size:0;">&nbsp;</td></tr>' : '';
-
-  const balDelta = (oldBal !== undefined && newBal !== undefined) ? (Number(newBal) - Number(oldBal)) : null;
-  const deltaStr = balDelta === null ? '' : '<span style="color:' + (balDelta>=0?'#0ECB81':'#F6465D') + ';">' + (balDelta>=0?'+':'') + r8(balDelta) + ' ' + esc(coin) + '</span>';
-
-  const stepperFill = stage3Active ? 100 : (isBad ? 100 : 66);
-
-  let html = '';
-  html += '<!doctype html><html lang="en"><head>';
-  html += '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
-  html += '<meta name="color-scheme" content="dark only"><meta name="supported-color-schemes" content="dark only">';
-  html += '<title>' + esc(subject) + '</title>';
-  html += '<style>@media (max-width:520px){.wrap{padding:14px 6px !important;}.card{padding:22px 14px !important;border-radius:14px !important;}.hero-amt{font-size:22px !important;letter-spacing:-.4px !important;}.h1{font-size:20px !important;}.det-k{width:44% !important;font-size:11px !important;}.det-v{font-size:12px !important;}.stage-lbl{font-size:9px !important;}}a{color:#F0B90B;text-decoration:none;}</style>';
-  html += '</head><body style="margin:0;padding:0;background:#06080b;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,\'Helvetica Neue\',Arial,sans-serif;color:#EAECEF;-webkit-font-smoothing:antialiased;">';
-  html += '<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#06080b;">' + esc(headline) + ' · ' + esc(amount) + ' · Ref ' + refNo + '</div>';
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#06080b;"><tr><td align="center" class="wrap" style="padding:30px 16px;">';
-  html += '<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;">';
-
-  // Brand
-  html += '<tr><td align="center" style="padding:4px 0 22px;">' + logo;
-  html += '<div style="margin-top:12px;font-size:18px;font-weight:800;color:#F0B90B;letter-spacing:4px;">BIEXC</div>';
-  html += '<div style="margin-top:3px;font-size:10px;color:#5E6673;letter-spacing:2.5px;text-transform:uppercase;font-weight:600;">Pro Trading Terminal</div></td></tr>';
-
-  // Card
-  html += '<tr><td class="card" style="background:linear-gradient(180deg,#10151d 0%,#0c1117 100%);border:1px solid #1c222b;border-radius:16px;padding:32px 30px;">';
-
-  // Ribbon
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:22px;"><tr>';
-  html += '<td align="left" style="vertical-align:middle;"><span style="display:inline-block;background:' + accentBg + ';color:' + accent + ';padding:5px 12px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:1.8px;border:1px solid ' + accent + ';">● ' + badge + '</span></td>';
-  html += '<td align="right" style="vertical-align:middle;"><span style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:11px;color:#5E6673;letter-spacing:.5px;">Ref · ' + refNo + '</span></td>';
-  html += '</tr></table>';
-
-  // Headline
-  html += '<h1 class="h1" style="margin:0 0 8px;font-size:23px;font-weight:700;color:#FFFFFF;letter-spacing:-.3px;line-height:1.25;">' + esc(headline) + '</h1>';
-  html += '<p style="margin:0 0 26px;font-size:13.5px;line-height:1.6;color:#B7BDC6;">' + nl2br(message) + '</p>';
-
-  // Amount hero
-  if (amount) {
-    html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 24px;"><tr><td style="background:#06080b;border:1px solid #1c222b;border-left:3px solid ' + accent + ';border-radius:12px;padding:22px 22px;">';
-    html += '<div style="font-size:10px;color:#5E6673;letter-spacing:2.2px;text-transform:uppercase;font-weight:700;">' + esc(direction) + ' ' + esc(label) + '</div>';
-    html += '<div class="hero-amt" style="margin-top:8px;font-size:34px;font-weight:700;color:#FFFFFF;letter-spacing:-.8px;font-family:\'SF Mono\',Menlo,Consolas,monospace;line-height:1.1;">';
-    html += '<span style="color:' + accent + ';">' + sign + '</span> ' + esc(amount);
-    if (network) html += ' <span style="font-size:13px;color:#5E6673;font-weight:600;letter-spacing:1px;text-transform:uppercase;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">· ' + esc(network) + '</span>';
-    html += '</div></td></tr></table>';
-  }
-
-  // Stepper
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 22px;"><tr><td>';
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>';
-  html += node('1','Requested',true);
-  html += node('2',stage2Label,true);
-  html += node('3',stage3Label,stage3Active || isBad);
-  html += '</tr><tr><td colspan="3" style="padding:10px 14px 0;">';
-  html += '<div style="height:2px;background:linear-gradient(to right, ' + accent + ' 0%, ' + accent + ' ' + stepperFill + '%, #1c222b ' + stepperFill + '%, #1c222b 100%);border-radius:2px;"></div>';
-  html += '</td></tr></table></td></tr></table>';
-
-  // Address & TXID blocks
-  if (address || txid) {
-    html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">';
-    html += addrBlock + txidBlock;
-    html += '</table>';
-  }
-
-  // Details
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">';
-  html += sec('Transaction');
-  if (label) html += det('Type', esc(direction) + ' ' + esc(label));
-  if (coin) html += det('Asset', esc(coin));
-  if (network) html += det('Network', esc(network));
-  if (amount) html += det('Amount', '<span style="color:' + accent + ';">' + sign + '</span> ' + esc(amount), true);
-
-  if (oldBal !== undefined && newBal !== undefined) {
-    html += sec('Wallet Balance');
-    html += det('Before', r8(oldBal) + ' ' + esc(coin), true);
-    html += det('After',  r8(newBal) + ' ' + esc(coin), true);
-    if (balDelta !== null) html += det('Net Change', deltaStr, true);
-  }
-
-  html += sec('System');
-  if (uid) html += det('Account UID', esc(uid), true);
-  html += det('Reference', refNo, true);
-  html += det('Status', '<span style="color:' + accent + ';">● ' + badge + '</span>');
-  html += det('Time (IST)', esc(istStr));
-  html += det('Time (UTC)', esc(utcStr));
-  html += '</table>';
-
-  // Security
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:26px;"><tr><td style="background:rgba(240,185,11,.04);border:1px solid rgba(240,185,11,.20);border-radius:10px;padding:14px 16px;">';
-  html += '<div style="font-size:12px;color:#B7BDC6;line-height:1.6;"><span style="color:#F0B90B;font-weight:700;">🔒 Security · </span>BIEXC will never ask for your password, 2FA code, recovery phrase, or private keys. All transactions are final and recorded on-chain.</div>';
-  html += '</td></tr></table>';
-
-  // CTAs
-  html += '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 0;"><tr><td align="center" style="padding:0 4px 8px;">';
-  html += '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr>';
-  html += '<td style="background:linear-gradient(135deg,#F0B90B 0%,#F8D12F 100%);border-radius:10px;"><a href="https://t.me/biexc10" style="display:inline-block;padding:13px 24px;font-size:12.5px;font-weight:800;color:#0a0d12;text-decoration:none;letter-spacing:.4px;">Contact Support →</a></td>';
-  html += '<td style="width:10px;font-size:0;line-height:0;">&nbsp;</td>';
-  html += '<td style="background:transparent;border:1px solid #2b3139;border-radius:10px;"><a href="https://t.me/biexc10" style="display:inline-block;padding:12px 22px;font-size:12.5px;font-weight:700;color:#EAECEF;text-decoration:none;letter-spacing:.4px;">View History</a></td>';
-  html += '</tr></table></td></tr></table>';
-
-  html += '</td></tr>';
-
-  // Footer
-  html += '<tr><td align="center" style="padding:24px 16px 8px;"><div style="font-size:11px;color:#5E6673;line-height:1.8;">';
-  html += 'This is an automated transaction notification — please do not reply.<br>';
-  html += 'Need help? <a href="https://t.me/biexc10">t.me/biexc10</a> · Telegram: <a href="https://t.me/biexc10">@biexc10</a><br>';
-  html += '© ' + now.getFullYear() + ' BIEXC · Pro Trading Terminal · All rights reserved.';
-  html += '</div></td></tr>';
-
-  html += '</table></td></tr></table></body></html>';
-  return html;
+  const status = String(o.status || '').toUpperCase(), type = o.type || '';
+  const isOk = status === 'COMPLETED', isBad = status === 'CANCELLED' || status === 'REJECTED';
+  const label = o.label || '';
+  const headline = o.headline || (label ? label + (isOk ? ' completed' : isBad ? ' cancelled' : ' update') : (o.subject || 'Account update'));
+  const coin = o.coin || '', network = o.network || '', address = o.address || '', txid = o.txid || o.txnId || '';
+  const pill = isOk ? ['Completed', '#03A66D', '#E7F8F0'] : isBad ? [status === 'REJECTED' ? 'Rejected' : 'Cancelled', '#CF304A', '#FDECEE'] : status && status !== 'NEW_MESSAGE' ? ['Pending', '#C99400', '#FEF6D8'] : null;
+  const amtColor = isBad ? '#929AA5' : !isOk ? '#1E2329' : type === 'dep' ? '#03A66D' : type === 'wit' ? '#CF304A' : '#1E2329';
+  const sign = isBad ? '' : type === 'dep' ? '+' : type === 'wit' ? '−' : '';
+  const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
+  const ref = o.hid ? 'BIEXC-' + String(o.hid).slice(-8).toUpperCase() : txid ? 'BIEXC-' + String(txid).slice(-8).toUpperCase() : '';
+  let inner = '';
+  if (pill) inner += '<div style="margin-bottom:14px;"><span style="display:inline-block;padding:4px 10px;border-radius:999px;background-color:' + pill[2] + ';color:' + pill[1] + ';font-size:11px;font-weight:700;letter-spacing:.4px;">' + pill[0] + '</span></div>';
+  inner += mH1(headline) + mP(o.message || '');
+  if (o.amount) inner += '<div class="bx-amt" style="margin:22px 0 6px;font-size:30px;font-weight:700;color:' + amtColor + ';' + (isBad ? 'text-decoration:line-through;' : '') + '">' + sign + mEsc(o.amount) + '</div>';
+  const exp = explorerUrl(txid, network);
+  const rows = [
+    ['Network', network],
+    [type === 'wit' ? 'To address' : 'From address', address, { block: true }],
+    ['Transaction hash', exp ? shortHash(txid) : txid, exp ? { mono: true } : { block: true }],
+  ];
+  if (o.oldBal !== undefined && o.newBal !== undefined) rows.push(['New balance', r8(o.newBal) + (coin ? ' ' + coin : ''), { mono: true }]);
+  rows.push(['Account UID', o.uid && o.uid !== 'TEST' ? o.uid : '', { mono: true }]);
+  if (ref) rows.push(['Reference', ref, { mono: true }]);
+  if (o.amount || label) rows.push(['Time', ist]);
+  inner += mRows(rows);
+  if (exp) inner += mBtn(/tronscan/.test(exp) ? 'View on Tronscan' : /etherscan/.test(exp) ? 'View on Etherscan' : 'View on BscScan', exp);
+  return mailShell({ title: o.subject || headline, preheader: headline + (o.amount ? ' · ' + o.amount : ''), inner });
 }
+
+// OTP / sign-in / sign-up / KYC codes.
+function otpMailHtml({ code, purpose, minutes } = {}) {
+  const p = String(purpose || 'login');
+  const what = p === 'signup' ? 'create your BIEXC account' : p === 'kyc' ? 'confirm your identity' : p === 'withdraw' ? 'confirm your withdrawal' : 'finish signing in to BIEXC';
+  const inner = mH1('Your verification code') + mP('Use this code to ' + what + '. It expires in ' + (minutes || 10) + ' minutes.') + mCode(code)
+    + '<div class="bx-m" style="font-size:12px;color:#707A8A;">Never share this code. BIEXC staff will never ask for it.</div>';
+  return mailShell({ title: 'BIEXC verification code', preheader: 'Your BIEXC code is ' + code, inner });
+}
+
+// Password reset — code version (current app) or link version.
+function resetMailHtml({ code, link, minutes } = {}) {
+  let inner = mH1('Reset your password');
+  inner += mP('We received a request to reset the password for your BIEXC account. ' + (code ? 'Enter this code in the app to choose a new password.' : 'Tap the button below to choose a new one.') + ' It expires in ' + (minutes || (code ? 10 : 60)) + ' minutes.');
+  inner += code ? mCode(code) : mBtn('Reset password', link || 'https://t.me/biexc10');
+  inner += '<div class="bx-m" style="margin-top:20px;font-size:12px;color:#707A8A;">Didn\'t ask for this? Ignore this email — your password stays the same.</div>';
+  return mailShell({ title: 'Reset your BIEXC password', preheader: code ? 'Your BIEXC reset code is ' + code : 'Reset your BIEXC password', inner });
+}
+
+// Admin announcements (/allmail).
+function allMailHtml(subject, body, name) {
+  const inner = mH1(subject) + mP((name ? 'Hi ' + name + ',\n\n' : '') + (body || ''))
+    + '<div class="bx-m" style="margin-top:22px;font-size:12px;color:#707A8A;">You are receiving this because you have a BIEXC account.</div>';
+  return mailShell({ title: subject, preheader: String(body || '').slice(0, 90), inner });
+}
+
+app.get('/mail/logo.png', (_req, res) => { res.set('Content-Type', 'image/png'); res.set('Cache-Control', 'public, max-age=31536000, immutable'); res.send(MAIL_LOGO_PNG); });
 
 app.get('/api/mail-status', (_req, res) => {
   res.json({
@@ -4066,7 +4015,7 @@ BIEXC — t.me/biexc10`
 
 // ─── WHATSAPP OTP LOGIN (QR page, /api/otp/send, /api/otp/verify) ───
 mountOtp(app, { admin, db, log, adminKey: process.env.WA_ADMIN_KEY || '' });
-mountEmailOtp(app, { admin, db, log });
+mountEmailOtp(app, { admin, db, log, mailTemplates: { otp: otpMailHtml, reset: resetMailHtml }, sendMail: sendMailAny });
 mountKycOtp(app);
 mountAutoDeposit(app);
 if (db) {
