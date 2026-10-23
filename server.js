@@ -180,6 +180,26 @@ const ok  = (title, rows) => card(`✅ ${title}`, rows);
 const bad = (msg) => `❌ ${msg}`;
 const good = (msg) => `✅ ${msg}`;
 
+// <V43_HELPERS> ── clean HTML bot messages (addresses/UIDs tap-to-copy) ──
+const hEsc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const hCode = (v) => `<code>${hEsc(v)}</code>`;
+/** hcard('📤 TITLE', ['line', '', 'line']) — every value must already be escaped. */
+function hcard(title, rows = [], foot) {
+  const out = [`<b>${hEsc(title)}</b>`, ''];
+  for (const r of rows) { if (r == null || r === false) continue; out.push(Array.isArray(r) ? `${r[0]} ${r[1]}` : String(r)); }
+  out.push('', foot === undefined ? `<i>⏰ ${hEsc(nowIST())} IST</i>` : foot);
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+/** Telegram refused the formatting → plain text without markup. */
+function deFmt(t, mode) {
+  if (mode === 'HTML') return String(t).replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return String(t).replace(/[*`]/g, '');
+}
+const isBscTx = (h) => /^0x[0-9a-fA-F]{64}$/.test(String(h || '').trim());
+const bscTxUrl = (h) => `https://bscscan.com/tx/${String(h || '').trim()}`;
+const bscBtn = (h, label = '🔎 View on BscScan') => isBscTx(h) ? [{ text: label, url: bscTxUrl(h) }] : null;
+// </V43_HELPERS>
+
 /** IST midnight for a moment, and its YYYY-MM-DD key. */
 const IST_OFF = 5.5 * 3600_000;
 function istDayStart(ts = Date.now()) {
@@ -559,8 +579,8 @@ async function tgFetch(endpoint, body) {
     // message (that is why some user cards never appeared). Retry as plain text.
     if (!data.ok && body && body.parse_mode && /parse entities|can't find end/i.test(data.description || '')) {
       const plain = { ...body }; delete plain.parse_mode;
-      if (typeof plain.text === 'string') plain.text = plain.text.replace(/[*`]/g, '');
-      if (typeof plain.caption === 'string') plain.caption = plain.caption.replace(/[*`]/g, '');
+      if (typeof plain.text === 'string') plain.text = deFmt(plain.text, body.parse_mode);
+      if (typeof plain.caption === 'string') plain.caption = deFmt(plain.caption, body.parse_mode);
       const r2 = await fetch(`${TG_API}/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(plain) });
       data = await r2.json();
     }
@@ -571,6 +591,10 @@ async function tgFetch(endpoint, body) {
 const tgSend   = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'Markdown', ...extra });
 const tgEdit   = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
 const tgAnswer = (cbId, text, alert = false) => tgFetch('answerCallbackQuery', { callback_query_id: cbId, text, show_alert: !!alert });
+const tgSendH  = (text, extra={}) => tgFetch('sendMessage', { chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
+const tgEditH  = (msgId, text, extra={}) => tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: msgId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
+/** Small 👍 on the admin's own message = "delivered" (no extra chat noise). */
+const tgReact  = (msgId, emoji = '👍') => tgFetch('setMessageReaction', { chat_id: TG_CHAT, message_id: msgId, reaction: [{ type: 'emoji', emoji }] });
 
 async function tgFetchSup(endpoint, body) {
   if(!SUPPORT_ENABLED)return {ok:false,description:'Customer-care bot is not configured'};
@@ -585,8 +609,8 @@ async function tgFetchSup(endpoint, body) {
     // message (that is why some user cards never appeared). Retry as plain text.
     if (!data.ok && body && body.parse_mode && /parse entities|can't find end/i.test(data.description || '')) {
       const plain = { ...body }; delete plain.parse_mode;
-      if (typeof plain.text === 'string') plain.text = plain.text.replace(/[*`]/g, '');
-      if (typeof plain.caption === 'string') plain.caption = plain.caption.replace(/[*`]/g, '');
+      if (typeof plain.text === 'string') plain.text = deFmt(plain.text, body.parse_mode);
+      if (typeof plain.caption === 'string') plain.caption = deFmt(plain.caption, body.parse_mode);
       const r2 = await fetch(`${TG_API_SUP}/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(plain) });
       data = await r2.json();
     }
@@ -597,6 +621,7 @@ async function tgFetchSup(endpoint, body) {
 const tgSendSup   = (text, extra={}) => tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text, parse_mode: 'Markdown', ...extra });
 const tgEditSup   = (msgId, text, extra={}) => tgFetchSup('editMessageText', { chat_id: TG_CHAT_SUPPORT, message_id: msgId, text, parse_mode: 'Markdown', ...extra });
 const tgAnswerSup = (cbId, text, alert = false) => tgFetchSup('answerCallbackQuery', { callback_query_id: cbId, text, show_alert: !!alert });
+const tgReactSup  = (msgId, emoji = '👍') => tgFetchSup('setMessageReaction', { chat_id: TG_CHAT_SUPPORT, message_id: msgId, reaction: [{ type: 'emoji', emoji }] });
 
 // ════════════════════════════════════════════════════════════════════
 // ONE-TAP GUARD — an Approve / Reject button can work ONLY ONCE.
@@ -659,13 +684,13 @@ function debounceTap(key, ms = 8000) {
   return true;
 }
 
-async function tgSendButtons(text, cbId) {
+async function tgSendButtons(text, cbId, extraRows = []) {
   const r = await tgFetch('sendMessage', {
-    chat_id: TG_CHAT, text, parse_mode: 'Markdown',
+    chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true,
     reply_markup: { inline_keyboard: [[
       { text: '✅ APPROVE', callback_data: `approve_${cbId}` },
       { text: '❌ REJECT',  callback_data: `reject_${cbId}` }
-    ]] }
+    ], ...extraRows.filter(Boolean)] }
   });
   return r.ok ? r.result.message_id : null;
 }
@@ -689,22 +714,20 @@ function fmtRequestMsg(type, user, req) {
   const coin = (req.coin || 'USDT').toUpperCase();
   const amt  = parseFloat(req.amt) || 0;
   const bals = user.balances || {};
+  const net = req.network || req.chain, addr = req.address || req.addr;
+  const wallet = bals[coin] ?? (coin === 'USDT' ? user.balance : 0) ?? 0;
   const rows = [
-    ['👤 UID', `\`${user.uid || '—'}\``],
-    ['📛 Name', user.name || '—'],
-    ['📧 Email', user.email || '—'],
-    ['💵 Amount', `${fmtNum(amt)} ${coin}`],
+    `👤 <b>${hEsc(user.name || 'User')}</b> · ${hCode(user.uid || '—')}`,
+    user.email ? `📧 ${hEsc(user.email)}` : null,
+    '',
+    `💵 <b>${hEsc(fmtNum(amt))} ${hEsc(coin)}</b>${net ? ` · ${hEsc(net)}` : ''}`,
   ];
-  if (req.network || req.chain) rows.push(['🌐 Network', req.network || req.chain]);
-  if (req.txid)                 rows.push(['🔗 TxID', `\`${req.txid}\``]);
-  if (req.address || req.addr)  rows.push(['📬 Address', `\`${req.address || req.addr}\``]);
-  if (req.utr)                  rows.push(['🧾 UTR', `\`${req.utr}\``]);
-  rows.push([`💰 Wallet ${coin}`, fmtNum(bals[coin] || (coin === 'USDT' ? user.balance : 0) || 0)]);
-  if (coin !== 'USDT') rows.push(['💰 Wallet USDT', fmtNum(bals.USDT || user.balance || 0)]);
-  if (coin === 'USDT' && amt >= BIG_AMOUNT) {
-    rows.push('', `🚨 *LARGE ${type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL'}* — verify before approving`);
-  }
-  return card(type === 'dep' ? '📥 DEPOSIT REQUEST' : '📤 WITHDRAWAL REQUEST', rows);
+  if (addr)     rows.push('', `📬 ${type === 'wit' ? 'Send to' : 'Address'} <i>(tap to copy)</i>`, hCode(addr));
+  if (req.txid) rows.push('', '🔗 TxID <i>(tap to copy)</i>', hCode(req.txid));
+  if (req.utr)  rows.push(`🧾 UTR ${hCode(req.utr)}`);
+  rows.push('', `💼 Wallet ${hEsc(fmtNum(wallet || 0))} ${hEsc(coin)}${coin !== 'USDT' ? ` · USDT ${hEsc(fmtNum(bals.USDT || user.balance || 0))}` : ''}`);
+  if (coin === 'USDT' && amt >= BIG_AMOUNT) rows.push('', `🚨 <b>LARGE ${type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL'}</b> — verify before approving`);
+  return hcard(type === 'dep' ? '📥 DEPOSIT REQUEST' : '📤 WITHDRAWAL REQUEST', rows);
 }
 
 async function maybeSendButtons(fuid, type, req, cbId) {
@@ -735,11 +758,12 @@ async function maybeSendButtons(fuid, type, req, cbId) {
   const user = (await db.ref(`users/${fuid}`).once('value')).val() || {};
   await migrateLegacyBalanceOnce(fuid, user);
   const text = fmtRequestMsg(type, user, claimed);
-  const msgId = await tgSendButtons(text, cbId);
+  const msgId = await tgSendButtons(text, cbId, [type === 'dep' ? bscBtn(claimed.txid, '🔎 Check TxID on BscScan') : null]);
   if (msgId) {
     await reqRef.update({ botMsgId: msgId, msgId, cbId, _sending: null, _sendingTs: null });
     sentByCbId.set(cbId, { fuid, type, msgId, hid: claimed.hid, amt: parseFloat(claimed.amt), coin: claimed.coin });
     log(type.toUpperCase(), `UID=${user.uid} Amt=${claimed.amt} ${claimed.coin || 'USDT'} cbId=${cbId} → sent msgId=${msgId}`);
+    queueRequestMail(type, user, claimed, cbId);
   } else {
     locallySentCbIds.delete(cbId);
     await reqRef.update({ _sending: null, _sendingTs: null }).catch(()=>{});
@@ -908,6 +932,18 @@ async function supLite(fuid) {
   return { uid: String(uid || String(fuid).slice(0, 8)).toUpperCase(), name: nick || name || 'User', email: email || '—', phone: phone || '—' };
 }
 const supPush = (fuid, m) => supRef(fuid, 'msgs').push({ ts: Date.now(), ...m });
+/** Remember which user a support-bot message belongs to (for reply-tags). */
+async function supMap(mid, fuid) { if (!mid || !fuid) return; try { await db.ref(`${SUP_STATE}/messages/${mid}`).set(fuid); } catch {} }
+/** Which user is a reply-tag aimed at? Saved map first, then "UID XXXXXX" in the tagged text. */
+async function supFuidFromReply(rtMsg) {
+  if (!rtMsg?.message_id) return null;
+  const mapped = (await db.ref(`${SUP_STATE}/messages/${rtMsg.message_id}`).once('value')).val();
+  if (mapped) return mapped;
+  const m = String(rtMsg.text || rtMsg.caption || '').match(/UID[:\s]*([A-Z0-9]{4,12})\b/);
+  if (!m) return null;
+  const f = await findUserByUID(m[1]).catch(() => null);
+  return f && String(shownUID(f.fuid, f.user)).toUpperCase() === m[1].toUpperCase() ? f.fuid : null;
+}
 function supQueue(fuid) {
   const prev = SUP_CHAIN.get(fuid) || Promise.resolve();
   const next = prev.then(() => supProcess(fuid)).catch(e => log('SUP', `err ${e.message}`));
@@ -960,9 +996,9 @@ async function supProcess(fuid) {
     const ctx = Object.values(msgs).filter(x => x && x.ts >= (meta.sessionAt || 0)).sort((a, b) => a.ts - b.ts).slice(-6)
       .map(x => `${x.from === 'user' ? '👤' : x.from === 'agent' ? '🎧' : '🤖'} ${x.img ? '[photo] ' : ''}${String(x.text || '').slice(0, 140)}`).join('\n');
     const r = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT,
-      text: `🎧 LIVE SUPPORT REQUEST\n\n👤 ${lite.name}\n🆔 UID: ${lite.uid}\n📧 ${lite.email}\n📱 ${lite.phone}\n📝 Topic: ${meta.topic || 'General'}\n\nRecent chat:\n${ctx || '—'}`,
+      text: `🎧 NEW SUPPORT REQUEST\n\n👤 ${lite.name} · UID ${lite.uid}\n📧 ${lite.email}\n📱 ${lite.phone}\n📝 ${meta.topic || 'General'}\n\nRecent messages\n${ctx || '—'}\n\n↩️ After accepting, reply (swipe) on this user's message to answer only them.`,
       reply_markup: { inline_keyboard: [meta.status==='live' ? [{text:'Reply to user',callback_data:`sup_sw_${fuid}`},{text:'End chat',callback_data:`sup_end_${fuid}`}] : [{ text: '✅ Accept chat', callback_data: `sup_acc_${fuid}` }, { text: '⏳ Busy', callback_data: `sup_rej_${fuid}` }]] } });
-    if (r?.result?.message_id) await supRef(fuid, 'meta').update({ [cardKey]: r.result.message_id, [notifiedKey + '_r']: Number(meta.reqAt || 0) });
+    if (r?.result?.message_id) { await supRef(fuid, 'meta').update({ [cardKey]: r.result.message_id, [notifiedKey + '_r']: Number(meta.reqAt || 0) }); await supMap(r.result.message_id, fuid); }
     else {await supRef(fuid, `meta/${notifiedKey}`).remove();return;}
     log('SUP', `request from ${lite.uid}`);
   }
@@ -1006,8 +1042,9 @@ async function handleSupCb(cb, act, fuid) {
     await supSetActive(fuid);
     await tgAnswerSup(cb.id, '✅ Connected');
     if (cb.message?.message_id) await tgFetchSup('editMessageReplyMarkup', { chat_id: TG_CHAT_SUPPORT, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Accepted — chatting now', callback_data: 'noop_done' }]] } });
-    await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🎧 Live chat started with ${lite.name} · UID ${lite.uid}\n\nJust type here — your text and photos go straight to the user.\nReply (swipe) to any of their messages to answer a specific user.\n/end — finish this chat · /chats — all open chats`,
+    const started = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `🟢 Live chat started — ${lite.name} · UID ${lite.uid}\n\n↩️ Reply (swipe) on any message of a user → goes ONLY to that user.\n✍️ Normal message → goes to the active chat (${lite.uid}).\n👍 on your message = delivered.\n\n/chats — open chats · /end — finish active chat`,
       reply_markup: { inline_keyboard: [[{ text: '🔚 End chat', callback_data: `sup_end_${fuid}` }]] } });
+    await supMap(started?.result?.message_id, fuid);
     return supQueue(fuid);
   }
   if (act === 'rej') {
@@ -1024,7 +1061,8 @@ async function handleSupCb(cb, act, fuid) {
     if (st !== 'live') return tgAnswerSup(cb.id, 'This chat is not live any more', true);
     await supSetActive(fuid);
     await tgAnswerSup(cb.id, `Now replying to ${lite.uid}`);
-    return tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `↩️ Now replying to ${lite.name} · UID ${lite.uid}. Type your message.` });
+    const sw = await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: `↩️ Active chat: ${lite.name} · UID ${lite.uid}. Type your message.` });
+    return supMap(sw?.result?.message_id, fuid);
   }
 }
 async function supEnd(fuid, cbId) {
@@ -1062,24 +1100,28 @@ async function supRouteAdmin(msg, text) {
     return false;
   }
   let fuid = null;
-  const rt = msg.reply_to_message?.message_id;
-  if (rt) { fuid = (await db.ref(`${SUP_STATE}/messages/${rt}`).once('value')).val(); if (!fuid) return false; }
-  else { fuid = SUP.active; }
+  const rtMsg = msg.reply_to_message, rt = rtMsg?.message_id;
+  // V43: a reply-tag ALWAYS wins and goes only to the tagged user — even when
+  // several chats are open and a different chat is "active".
+  if (rt) {
+    fuid = await supFuidFromReply(rtMsg);
+    if (!fuid) { await tgSendSup('⚠️ I could not tell which user this reply is for. Reply directly on the user\'s message, or open /chats.', { parse_mode: undefined, reply_to_message_id: msg.message_id }); return true; }
+  } else { fuid = SUP.active; }
   if (!fuid) return false;
   const st = (await supRef(fuid, 'meta/status').once('value')).val();
-  if (st !== 'live') { if (!rt) { await supSetActive(null); return false; } await tgSendSup('⚠️ That chat is closed — the user did not get this message.'); return true; }
+  if (st !== 'live') { if (!rt) { await supSetActive(null); return false; } await tgSendSup('⚠️ That chat is closed — the user did not get this message.', { parse_mode: undefined, reply_to_message_id: msg.message_id }); return true; }
+  const delivered = async (m) => { await supAgentMsg(fuid, m); await supMap(msg.message_id, fuid); tgReactSup(msg.message_id).catch(() => {}); return true; };
   const caption = msg.caption || '';
   if (Array.isArray(msg.photo) && msg.photo.length) {
     const img = await supTgPhotoToDataUrl(msg.photo).catch(() => null);
     if (!img) { await tgSendSup('⚠️ Could not deliver that photo, please try again.'); return true; }
-    await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) });
-    return true;
+    return delivered({ img, ...(caption ? { text: caption } : {}) });
   }
   if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
     const img = await supTgPhotoToDataUrl([{ file_id: msg.document.file_id, file_size: msg.document.file_size }]).catch(() => null);
-    if (img) { await supAgentMsg(fuid, { img, ...(caption ? { text: caption } : {}) }); return true; }
+    if (img) return delivered({ img, ...(caption ? { text: caption } : {}) });
   }
-  if (text) { await supAgentMsg(fuid, { text: text.slice(0, 4000) }); return true; }
+  if (text) return delivered({ text: text.slice(0, 4000) });
   if (msg.sticker || msg.document || msg.video || msg.voice) { await tgSendSup('ℹ️ Only text and photos can be sent to the user.'); return true; }
   return false;
 }
@@ -1100,7 +1142,7 @@ const AD = {
   TOPIC: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
   RPCS: (process.env.BSC_RPC_URLS || 'https://bsc-dataseed.binance.org,https://bsc-rpc.publicnode.com').split(',').map(s => s.trim()).filter(Boolean),
   CONF: 3, WINDOW: 60_000, MIN: parseFloat(process.env.AUTO_DEPOSIT_MIN || '1'),
-  DEFAULT_WALLET: (process.env.DEPOSIT_WALLET || '0x415c84ea67b273e17b3c03b010e7d5d9b20091d9').toLowerCase(),
+  DEFAULT_WALLET: (process.env.DEPOSIT_WALLET || '0x34df4807cafcc8ab0b251f8d9e5abd3b15f12172').toLowerCase(),
   rlStart: new Map(), rlCheck: new Map(), scanning: false,
 };
 async function adRpc(method, params) {
@@ -1131,7 +1173,7 @@ async function adBlockMs(latest) {
   try { const a = await adBlockTs(latest), b = await adBlockTs(latest - 200); AD_BT = { v: Math.max(200, (a - b) / 200), at: Date.now() }; } catch {}
   return AD_BT.v;
 }
-const AD_GRACE = 30_000;   // a transfer up to 30s before "I Have Paid" belongs to that user
+const AD_GRACE = 60_000;   // V43: a transfer up to 1 min before "I Have Paid" belongs to that user
 const AD_HOLD = 90_000;    // the background scan leaves fresh transfers for a click first
 async function adWallet() {
   const v = (await db.ref('settings/depositAddress').once('value')).val();
@@ -1166,7 +1208,7 @@ async function adCredit(fuid,t,source){
  const hid='h_auto_'+key;let res=null;
  const credit=await db.ref(`users/${fuid}`).transaction(cur=>{
   res=null;if(!cur)return;
-  const receipt=cur.depositCredits?.[key];if(receipt){res={oldBal:receipt.oldBal,newBal:receipt.newBal};return cur;}
+  const receipt=cur.depositCredits?.[key];if(receipt){res={oldBal:receipt.oldBal,newBal:receipt.newBal,dup:true};return cur;}
   const old=Number(cur.balances?.USDT??cur.balance??0);if(!Number.isFinite(old))return;
   const next=r8(old+amt);res={oldBal:old,newBal:next};
   return {...cur,balances:{...(cur.balances||{}),USDT:next},balance:next,
@@ -1178,6 +1220,7 @@ async function adCredit(fuid,t,source){
  await db.ref(`unmatchedDeposits/${key}`).remove().catch(()=>{});
  if(REF)REF.onDeposit(fuid,'USDT',amt).catch(()=>{});bonusCountAction(fuid,`dep_auto_${key}`).catch(()=>{});
  pushNotif(fuid,{title:'Deposit received',body:`${amt} USDT credited.`,type:'INFO'}).catch(()=>{});
+ if(!res.dup)adNotifyCredited(fuid,t,source,res,key,hid).catch(e=>log('AUTODEP',`notify ${e.message}`));
  return {...t,hid,newBal:res.newBal};
 }
 async function adUnmatched(t, reason) {
@@ -1186,7 +1229,89 @@ async function adUnmatched(t, reason) {
   const tx = await db.ref(`unmatchedDeposits/${key}`).transaction(cur => cur ? undefined : { ...t, reason, status: 'pending_review', ts: Date.now() });
   if (!tx.committed) return;
   log('AUTODEP', `UNMATCHED ${t.amt} USDT tx=${t.txHash} (${reason})`);
-  tgSend(card('⚠️ UNMATCHED DEPOSIT', [['💰 Amount', `${t.amt} USDT · BEP-20`], ['📤 From', `\`${t.from}\``], ['🔗 TxID', `\`${t.txHash}\``], ['ℹ️ Reason', reason], ['✅ Credit', `\`/assign ${key} UID\``]])).catch(() => {});
+  const why = /no open deposit window/.test(reason) ? 'Nobody tapped “I have paid” within 1 minute' : reason;
+  const b = bscBtn(t.txHash);
+  const r = await tgSendH(hcard('⚠️ UNASSIGNED DEPOSIT', [
+    `💰 <b>${hEsc(fmtNum(t.amt))} USDT</b> · BEP-20`,
+    `📤 From ${hCode(t.from)}`,
+    `ℹ️ ${hEsc(why)}`,
+    '',
+    '↩️ <b>Reply to this message with the user\'s UID</b> to assign it.',
+  ]), b ? { reply_markup: { inline_keyboard: [b] } } : {}).catch(() => null);
+  const mid = r?.result?.message_id;
+  if (mid) { await db.ref(`botState/depAssignMsg/${mid}`).set(key).catch(() => {}); await db.ref(`unmatchedDeposits/${key}/tgMsgId`).set(mid).catch(() => {}); }
+}
+/** Bot notice + user email after a deposit is credited (auto-detected or assigned). */
+async function adNotifyCredited(fuid, t, source, res, key, hid) {
+  const g = async (k) => (await db.ref(`users/${fuid}/${k}`).once('value')).val();
+  const [uid, name, email, nick] = await Promise.all([g('uid'), g('name'), g('email'), g('profile/nickname')]);
+  const how = source === 'admin' ? 'Assigned by admin' : source === 'window' ? 'Auto-detected · user tapped “I have paid”' : 'Auto-detected';
+  const b = bscBtn(t.txHash, '🔎 View transaction');
+  await tgSendH(hcard('✅ DEPOSIT CREDITED', [
+    `👤 <b>${hEsc(nick || name || 'User')}</b> · ${hCode(uid || '—')}`,
+    '',
+    `💰 <b>+${hEsc(fmtNum(t.amt))} USDT</b> · BEP-20`,
+    `💼 ${hEsc(fmtNum(res.oldBal))} → <b>${hEsc(fmtNum(res.newBal))}</b> USDT`,
+    `📤 From ${hCode(t.from)}`,
+    `⚙️ ${hEsc(how)}`,
+  ]), b ? { reply_markup: { inline_keyboard: [b] } } : {}).catch(() => {});
+  queueUserTxMail(`dep_auto_${key}`, { uid, name, email }, {
+    subject: `Deposit Completed — ${r8(t.amt)} USDT`, headline: 'Deposit Completed',
+    message: source === 'admin'
+      ? 'Your USDT (BEP-20) deposit has been verified by our team and credited to your Spot Wallet. Funds are available immediately.'
+      : 'Your USDT (BEP-20) deposit was detected on-chain and credited to your Spot Wallet automatically. Funds are available immediately.',
+    amount: `${r8(t.amt)} USDT`, status: 'COMPLETED', label: 'Deposit', type: 'dep', coin: 'USDT', network: 'BEP-20',
+    address: t.from, txid: t.txHash, hid, oldBal: res.oldBal, newBal: res.newBal,
+  });
+}
+/** Admin replied to an UNASSIGNED DEPOSIT card with a UID → ask Confirm / Reject. */
+async function depAssignReply(msg, text) {
+  const rt = msg.reply_to_message?.message_id; if (!rt) return false;
+  const key = (await db.ref(`botState/depAssignMsg/${rt}`).once('value')).val();
+  if (!key) return false;
+  const opt = { reply_to_message_id: msg.message_id };
+  const t = (await db.ref(`unmatchedDeposits/${key}`).once('value')).val();
+  if (!t || t.status !== 'pending_review') { await tgSendH('ℹ️ This deposit is already assigned or closed.', opt); return true; }
+  const want = String(text || '').trim().replace(/^#/, '').split(/\s+/)[0].toUpperCase();
+  if (!/^[A-Z0-9]{4,12}$/.test(want)) { await tgSendH('✍️ Reply with only the user\'s UID, e.g. <code>AB12CD</code>', opt); return true; }
+  const f = await findUserByUID(want).catch(() => null);
+  if (!f || String(shownUID(f.fuid, f.user)).toUpperCase() !== want) { await tgSendH(`❌ UID ${hCode(want)} not found. Reply again with the correct UID.`, opt); return true; }
+  const rid = crypto.randomBytes(5).toString('hex');
+  await db.ref(`botState/depAssignReq/${rid}`).set({ key, fuid: f.fuid, uid: want, cardId: rt, ts: Date.now() });
+  const u = f.user || {}, bal = Number(u.balances?.USDT ?? u.balance ?? 0);
+  const b = bscBtn(t.txHash);
+  await tgSendH(hcard('🧾 CONFIRM DEPOSIT ASSIGNMENT', [
+    `💰 <b>${hEsc(fmtNum(t.amt))} USDT</b> · BEP-20`,
+    `👤 <b>${hEsc(u.profile?.nickname || u.name || 'User')}</b> · ${hCode(want)}`,
+    u.email ? `📧 ${hEsc(u.email)}` : null,
+    `💼 Balance now ${hEsc(fmtNum(bal))} USDT → <b>${hEsc(fmtNum(r8(bal + Number(t.amt))))}</b>`,
+  ]), { ...opt, reply_markup: { inline_keyboard: [[{ text: '✅ Confirm', callback_data: `dasg_ok_${rid}` }, { text: '✖ Reject', callback_data: `dasg_no_${rid}` }], ...(b ? [b] : [])] } });
+  return true;
+}
+async function handleDepAssignCb(cb, act, rid) {
+  const ref = db.ref(`botState/depAssignReq/${rid}`);
+  const r = (await ref.once('value')).val();
+  const mid = cb.message?.message_id;
+  if (!r) { await tgAnswer(cb.id, 'This request has expired.', true); return; }
+  const lock = await claimTapOnce(`dasg_${rid}`, act === 'ok' ? 'approve' : 'reject');
+  if (!lock.ok) { await tgAnswer(cb.id, `Already ${doneWord(lock.prev)}`, true); return; }
+  if (act === 'no') {
+    await tgAnswer(cb.id, 'Rejected');
+    await ref.remove().catch(() => {});
+    if (mid) await tgEditH(mid, '✖ <b>Assignment rejected.</b> The deposit is still unassigned — reply to the deposit card with another UID.').catch(() => {});
+    return;
+  }
+  const t = (await db.ref(`unmatchedDeposits/${r.key}`).once('value')).val();
+  if (!t || t.status !== 'pending_review') { await tgAnswer(cb.id, 'Already assigned or closed.', true); await ref.remove().catch(() => {}); return; }
+  await tgAnswer(cb.id, 'Crediting…');
+  let c = null;
+  try { c = await adCredit(r.fuid, t, 'admin'); }
+  catch (e) { await releaseTap(`dasg_${rid}`); await tgSendH(`❌ Could not credit: ${hEsc(e.message)}`, mid ? { reply_to_message_id: mid } : {}); return; }
+  await ref.remove().catch(() => {});
+  if (!c) { if (mid) await tgEditH(mid, 'ℹ️ This deposit was already credited.').catch(() => {}); return; }
+  if (mid) tgFetch('deleteMessage', { chat_id: TG_CHAT, message_id: mid }).catch(() => {});
+  const b = bscBtn(t.txHash);
+  if (r.cardId) tgEditH(r.cardId, hcard('✅ DEPOSIT ASSIGNED', [`💰 <b>${hEsc(fmtNum(t.amt))} USDT</b> · BEP-20`, `👤 Credited to ${hCode(r.uid)}`, `📤 From ${hCode(t.from)}`]), b ? { reply_markup: { inline_keyboard: [b] } } : {}).catch(() => {});
 }
 /** Who owns a transfer: saved sender wallet, else a deposit window covering its block. */
 async function adOwner(t) {
@@ -1436,7 +1561,7 @@ async function adAdminCmd(text) {
     const v = (await db.ref('unmatchedDeposits').orderByChild('status').equalTo('pending_review').limitToLast(15).once('value')).val() || {};
     const keys = Object.keys(v);
     if (!keys.length) return tgSend('✅ No unmatched deposits.'), true;
-    return tgSend(['⚠️ *Unmatched deposits*', ...keys.map(k => `• ${v[k].amt} USDT — \`/assign ${k} UID\``)].join('\n')), true;
+    return tgSendH(hcard(`⚠️ UNASSIGNED DEPOSITS (${keys.length})`, [...keys.map(k => `• <b>${hEsc(fmtNum(v[k].amt))} USDT</b> · from ${hCode(String(v[k].from || '').slice(0, 10) + '…')}\n   ${v[k].tgMsgId ? '↩️ reply to its card with the UID' : hCode(`/assign ${k} UID`)}`)], '<i>Reply to a deposit card with a UID to assign it.</i>')), true;
   }
   if ((m = text.match(/^\/assign\s+(\S+)\s+(\S+)/i))) {
     const t = (await db.ref(`unmatchedDeposits/${m[1]}`).once('value')).val();
@@ -1444,7 +1569,8 @@ async function adAdminCmd(text) {
     const f = await findUserByUID(m[2]);
     if (!f) return tgSend(bad(`UID \`${m[2]}\` not found.`)), true;
     const c = await adCredit(f.fuid, t, 'admin');
-    return tgSend(c ? `✅ Credited ${t.amt} USDT to \`${m[2]}\`` : bad('Already credited.')), true;
+    if (c && t.tgMsgId) tgEditH(t.tgMsgId, hcard('✅ DEPOSIT ASSIGNED', [`💰 <b>${hEsc(fmtNum(t.amt))} USDT</b> · BEP-20`, `👤 Credited to ${hCode(m[2].toUpperCase())}`]), bscBtn(t.txHash) ? { reply_markup: { inline_keyboard: [bscBtn(t.txHash)] } } : {}).catch(() => {});
+    return (c ? true : tgSend(bad('Already credited.'))), true;
   }
   return false;
 }
@@ -1569,20 +1695,16 @@ function fmtResolutionMsg(label, action, ctx, req) {
   const coin = (ctx.coin || req?.coin || 'USDT').toUpperCase();
   const ico = action === 'approve' ? '✅' : '❌';
   const verb = action === 'approve' ? 'APPROVED' : 'REJECTED';
-  const sign = ctx.type === 'dep' ? '+' : '-';
-  const lines = [`${ico} *${label} ${verb}*`, ''];
-  if (ctx.user) {
-    lines.push(`👤 UID: \`${ctx.user.uid || '—'}\``);
-    lines.push(`📛 Name: *${ctx.user.name || '—'}*`);
-  }
-  lines.push(`💵 Amount: *${sign}${ctx.amt} ${coin}*`);
-  if (req?.network || req?.chain) lines.push(`🌐 Network: ${req.network || req.chain}`);
-  if (req?.txid)                  lines.push(`🔗 TxID: \`${req.txid}\``);
-  if (req?.address || req?.addr)  lines.push(`📬 Address: \`${req.address || req.addr}\``);
-  if (ctx.newBal !== undefined)   lines.push(`💰 ${coin} Balance: ${ctx.oldBal} → *${ctx.newBal}*`);
-  lines.push(`⏰ ${nowIST()} IST`);
-  lines.push(`${ico} ${verb} by Admin`);
-  return lines.join('\n');
+  const sign = ctx.type === 'dep' ? '+' : '−';
+  const net = req?.network || req?.chain, addr = req?.address || req?.addr;
+  const rows = [];
+  if (ctx.user) rows.push(`👤 <b>${hEsc(ctx.user.name || 'User')}</b> · ${hCode(ctx.user.uid || '—')}`, '');
+  rows.push(`💵 <b>${sign}${hEsc(fmtNum(ctx.amt))} ${hEsc(coin)}</b>${net ? ` · ${hEsc(net)}` : ''}`);
+  if (addr)     rows.push('', '📬 Address', hCode(addr));
+  if (req?.txid) rows.push('', '🔗 TxID', hCode(req.txid));
+  if (ctx.newBal !== undefined) rows.push('', `💼 ${hEsc(fmtNum(ctx.oldBal))} → <b>${hEsc(fmtNum(ctx.newBal))}</b> ${hEsc(coin)}`);
+  if (action !== 'approve' && ctx.type === 'wit') rows.push('🔄 Funds returned to the user');
+  return hcard(`${ico} ${label} ${verb}`, rows);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1616,6 +1738,7 @@ async function handleCallback(cb, upd = null) {
     return resetAllBalances().catch(e => tgSend(bad(e.message)));
   }
   if (data === 'noop_done') { await tgAnswer(cb.id, '✔ Already done — nothing more to do.'); return; }
+  if ((m = data.match(/^dasg_(ok|no)_([a-f0-9]{6,20})$/))) return handleDepAssignCb(cb, m[1], m[2]);
   if ((m = data.match(/^(approve|reject)_(dep_|wit_)(.+)$/))) return handleApproveRejectCb(cb, m[1], m[2] + m[3], upd);
   // Trade/P2P callbacks (cbId starts with trade_) are completed by the app
   // via the buffered /api/tg/getUpdates feed. The server now makes sure only
@@ -1649,6 +1772,7 @@ async function handleCallback(cb, upd = null) {
     setCbButtons(cb, action === 'approve' ? '✅ APPROVED' : '❌ REJECTED');
     if (upd) pushRecentUpdate(upd);                  // hand it to the app — exactly once
     log('TRADE', `${action} ${tradeCb} → forwarded once`);
+    queueP2PMail(owner.user, orderId, owner.user.orders?.[orderId], action === 'approve' ? 'complete' : 'reject');
     // Safety net: if the user's app is closed / offline the order would never
     // settle and the balance would never update. Settle it server-side after 30s.
     setTimeout(async () => {
@@ -1869,15 +1993,18 @@ async function settleP2PAtomic(fuid,orderId,action){
   u.tradeDone={...(cur.tradeDone||{}),[key]:{action:action==='complete'?'approve':'reject',by:'server',ts},[orderId]:{action:action==='complete'?'approve':'reject',by:'server',ts}};
   const hid='h_p2p_'+orderId;u.history={...(cur.history||{}),[hid]:{hid,ts,date:nowIST(),type:action==='complete'?mode:mode+'_CANCEL',status:action==='complete'?'COMPLETED':'CANCELLED',coin:'USDT',amt,orderId,merchant:o.merchant||'',rate:o.rate||0,inr:o.inr||0,paymentMethod:o.payMethod||'UPI',network:'BEP20',reason:action==='complete'?'':'Order cancelled; held SELL funds returned.'}};
   result={ok:true,order:o,chat,user:u,oldBal:old,newBal:b.USDT};return u;
- });return tx.committed?result:{ok:false,error};
+ });
+ if(tx.committed&&result)queueP2PMail(result.user,orderId,result.order,action);
+ return tx.committed?result:{ok:false,error};
 }
 async function adminSettleOrder(orderId,action,quiet=false){
  orderId=String(orderId).replace(/^#/,'');const f=await findOrderById(orderId);if(!f)return quiet?{ok:false,error:'Order not found'}:tgSend(bad('Order not found or already finished'));
  const r=await settleP2PAtomic(f.fuid,orderId,action);if(!r.ok)return quiet?r:tgSend(bad(r.error));
  if(action==='complete')bonusCountAction(f.fuid,`trade_${orderId}`).catch(()=>{});
  pushNotif(f.fuid,{title:action==='complete'?'P2P order completed':'P2P order cancelled',body:`Order #${orderId}: ${r.order.usdt} USDT.`,type:'INFO'}).catch(()=>{});
- if(r.chat.tgMsgId)tgEdit(r.chat.tgMsgId,`${action==='complete'?'✅ TRADE COMPLETED':'❌ TRADE CANCELLED'}\nOrder #${orderId}\nUID ${r.user.uid}`).catch(()=>{});
- return quiet?r:tgSend(card('P2P settlement',[['Order',orderId],['Balance',`${r.oldBal} → ${r.newBal}`]]));
+ const p2pLine=`🧾 Order ${hCode('#'+orderId)} · ${hCode(r.user.uid||'—')} · <b>${hEsc(fmtNum(r.order.usdt))} USDT</b>`;
+ if(r.chat.tgMsgId)tgEditH(r.chat.tgMsgId,[`${action==='complete'?'✅ <b>P2P TRADE COMPLETED</b>':'❌ <b>P2P TRADE CANCELLED</b>'}`,p2pLine].join('\n')).catch(()=>{});
+ return quiet?r:tgSendH(hcard(action==='complete'?'✅ P2P SETTLED — COMPLETED':'❌ P2P SETTLED — CANCELLED',[p2pLine,`💼 ${hEsc(fmtNum(r.oldBal))} → <b>${hEsc(fmtNum(r.newBal))}</b> USDT`]));
 }
 
 /** /cancelalltrades — reject every pending deposit/withdrawal and every open P2P order (SELL USDT refunded once) and clear stuck chats. */
@@ -1902,7 +2029,7 @@ async function cancelAllTrades() {
   for (const q of reqs) {
     try {
       const res = await handleReject(q.fuid, q.type, q.r, q.cbId);
-      if (res) { rDone++; if (q.type === 'wit') rRefund++; if (q.r.botMsgId) tgEdit(q.r.botMsgId, fmtResolutionMsg(q.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL', 'reject', { type: q.type, ...res }, q.r)).catch(() => {}); }
+      if (res) { rDone++; if (q.type === 'wit') rRefund++; if (q.r.botMsgId) tgEditH(q.r.botMsgId, fmtResolutionMsg(q.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL', 'reject', { type: q.type, ...res }, q.r)).catch(() => {}); }
       else {
         // Preserve unresolved money-bearing requests for manual reconciliation.
         rForced++;log('REVIEW',`pending request ${q.fuid}/${q.type}/${q.cbId} retained; outcome unknown`);
@@ -1967,7 +2094,7 @@ async function askWithdrawHash(w) {
   const uid = u.uid || '—';
   ask('withash', { fuid: w.fuid, hid: w.hid, amt: w.amt, coin: w.coin, uid });
   log('WIT', `asking hash UID=${uid} hid=${w.hid}`);
-  await tgSend(`🔗 *WITHDRAWAL APPROVED*\n\nUID: \`${uid}\`\nAmount: *${w.amt} ${w.coin}*\n\nNow send the *transaction hash (TxID)* as a message. It will show in the user's history.`, { reply_markup: cancelKb });
+  await tgSendH(hcard('🔗 WITHDRAWAL APPROVED — SEND TxID', [`👤 ${hCode(uid)}`, `💵 <b>${hEsc(fmtNum(w.amt))} ${hEsc(w.coin)}</b>`, '', 'Send the <b>transaction hash (TxID)</b> as your next message. It will show in the user\'s history.']), { reply_markup: cancelKb });
 }
 
 async function processApproveReject(cb, action, cbId) {
@@ -1998,7 +2125,7 @@ async function processApproveReject(cb, action, cbId) {
   if (!r) { return false; }
   const label = ctx.type === 'dep' ? 'DEPOSIT' : 'WITHDRAWAL';
   const msgId = ctx.msgId || cb.message?.message_id;
-  if (msgId) await tgEdit(msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req));
+  if (msgId) await tgEditH(msgId, fmtResolutionMsg(label, action, { ...ctx, ...r }, req), (ctx.type === 'dep' && isBscTx(req?.txid)) ? { reply_markup: { inline_keyboard: [bscBtn(req.txid)] } } : {});
   sentByCbId.delete(cbId);
   return true;
 }
@@ -2911,6 +3038,14 @@ async function handleUpdate(upd) {
   if (chatId !== String(TG_CHAT)) return;
   const text = (msg.text || '').trim();
 
+  // V43: reply-tags first — deposit assignment and P2P chat go to exactly the tagged user/order.
+  if (db && !msg.from?.is_bot) {
+    try {
+      if (msg.reply_to_message && await depAssignReply(msg, text)) { SERVER_HANDLED_UPD.add(upd.update_id); return; }
+      if (await p2pAdminReply(msg, text)) { SERVER_HANDLED_UPD.add(upd.update_id); return; }
+    } catch (e) { log('ROUTE', `reply routing: ${e.message}`); }
+  }
+
   // A pending withdrawal TxID request takes priority over live support routing.
   if (ASK && ASK.kind === 'withash' && text && !text.startsWith('/') && Date.now() - ASK.ts < ASK_TTL) return handleAskReply(text);
   // Customer-care messages are exclusively handled by the separate bot.
@@ -2929,6 +3064,9 @@ async function handleUpdate(upd) {
   if (/^\/allmailstop(?:@\S+)?\s*$/i.test(text)) { ASK = null; if (!ALLMAIL.job) return tgSend('No email sending in progress.'); ALLMAIL.job.stop = true; return tgSend('⏹ Stopping — no more emails will be sent.'); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (/^\/today(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleToday().catch(e => tgSend(bad(e.message))); }
+  { const mt = text.match(/^\/mailtest(?:@\S+)?(?:\s+(\S+))?\s*$/i);
+    if (mt) { ASK = null; return mailTestCmd(mt[1]).catch(e => tgSend(bad(e.message))); } }
+  if (/^\/mailstatus(?:@\S+)?\s*$/i.test(text)) { ASK = null; return tgSendH(mailStatusCard()); }
   if (text === '/ping') return tgSend(card('🟢 BOT ONLINE', [
     ['⏱ Uptime', `${Math.floor((Date.now() - BOT_START_TIME) / 60000)}m`],
     ['🔑 Instance', `\`${INSTANCE_ID}\``],
@@ -3003,8 +3141,12 @@ async function pollUpdates() {
       saveLastUpdateId(lastUpdateId).catch(() => {});
     }
     for (const upd of batch) {
-      if (!isGuardedTap(upd)) pushRecentUpdate(upd);
+      // Messages reach the app only when the server did not deliver them itself
+      // (stops double chat bubbles and stray "#UID" text in old app versions).
+      const isMsg = !!upd.message;
+      if (!isGuardedTap(upd) && !isMsg) pushRecentUpdate(upd);
       try { await handleUpdate(upd); } catch (e) { log('ERR', `handleUpdate: ${e.message}`); }
+      if (isMsg && !SERVER_HANDLED_UPD.delete(upd.update_id)) pushRecentUpdate(upd);
     }
   } catch (e) {
     pollFailStreak++;
@@ -3026,7 +3168,7 @@ async function handleSupportUpdate(upd){
   }
   const msg=upd.message;if(!msg||String(msg.chat?.id)!==String(TG_CHAT_SUPPORT)||msg.from?.is_bot)return;
   const text=String(msg.text||'').trim();
-  if(/^\/(start|menu|help)(?:@\S+)?\b/i.test(text))return tgSendSup('BIEXC Customer Care\n\n/chats — waiting and live chats\n/end — close the active chat\nReply to a user message to answer that user.\n\nTrading, withdrawal and deposit commands remain on the main bot.',{parse_mode:undefined});
+  if(/^\/(start|menu|help)(?:@\S+)?\b/i.test(text))return tgSendSup('BIEXC Customer Care\n\n/chats — waiting and live chats\n/end — close the active chat\n↩️ Reply (swipe) on a user\'s message → goes only to that user\n👍 on your message = delivered\n\nTrading, withdrawal and deposit commands remain on the main bot.',{parse_mode:undefined});
   if(await supRouteAdmin(msg,text))return;
   return tgSendSup(text.startsWith('/')?'Use the main bot for financial commands. /chats opens customer-care requests.':'Select a live chat with /chats before sending a reply.',{parse_mode:undefined});
 }
@@ -3075,6 +3217,7 @@ function startPollWatchdog() {
 // trade approve/reject and admin chat replies.
 // ════════════════════════════════════════════════════════════════════
 const RECENT_UPDATES = [];
+const SERVER_HANDLED_UPD = new Set();
 const RECENT_UPDATES_MAX = 500;
 function pushRecentUpdate(upd) {
   if (!upd || typeof upd.update_id !== 'number') return;
@@ -3119,6 +3262,178 @@ if (fs.existsSync(PUBLIC_DIR)) {
 app.get('/health', (_req, res) => res.json({
   ok: true, instance: INSTANCE_ID, uptimeMs: Date.now() - BOT_START_TIME, ts: nowIST(),
 }));
+
+// ════════════════════════════════════════════════════════════════════
+// V43 P2P — clean bot messages + reply-tag chat routing
+// Every P2P message the app sends is re-drawn as one tidy card. Each card is
+// remembered (botState/p2pMsgs/{message_id} → order) so the admin can simply
+// reply (swipe) on it and the text/photo lands in that order's chat — no UID
+// needed. "#UID message" / "#ORDERID message" keeps working too.
+// ════════════════════════════════════════════════════════════════════
+// <P2P_PRETTY>
+function p2pFields(raw) {
+  const s = String(raw || '').replace(/[*`]/g, '');
+  const get = (re) => { const m = s.match(re); return m ? m[1].trim() : ''; };
+  const msg = s.match(/Msg:\s*"([\s\S]*)"\s*(?:\n\s*⏰|$)/);
+  return {
+    title: (s.split('\n').find(l => l.trim()) || '').trim(),
+    uid: get(/UID:?\s*([A-Za-z0-9_-]{3,40})/),
+    user: get(/User:\s*([^\n]+)/),
+    email: get(/Email:\s*([^\n]+)/),
+    order: get(/Order:?\s*#?(\d{3,15})/),
+    mode: get(/Mode:\s*([A-Za-z]+)/).toUpperCase(),
+    merchant: get(/Merchant:\s*([^\n]+)/),
+    inr: get(/INR(?: Paid)?:\s*([^\n]+)/),
+    usdt: get(/USDT:\s*([^\n]+)/),
+    rate: get(/Rate:\s*([^\n]+)/),
+    upi: get(/UPI:\s*([^\n]+)/),
+    time: get(/⏰\s*([^\n]+?)\s*IST/),
+    msg: msg ? msg[1] : get(/Msg:\s*([^\n]+)/),
+    proof: /Payment proof:\s*attached/i.test(s),
+  };
+}
+/** Order id + UID inside any P2P text (used to remember messages). */
+function p2pIds(raw) {
+  const f = p2pFields(raw);
+  return f.order ? { orderId: f.order, uid: f.uid ? f.uid.toUpperCase() : '' } : null;
+}
+/** Re-draw a P2P app message as a clean HTML card. null = not a P2P message, send unchanged. */
+function p2pPretty(raw) {
+  const s = String(raw || ''); if (!s) return null;
+  const f = p2pFields(s), T = f.title.toUpperCase();
+  let kind = null;
+  if (/NEW ORDER/.test(T)) kind = 'new';
+  else if (/PAYMENT CLAIMED/.test(T)) kind = 'claim';
+  else if (/RELEASE REQUEST/.test(T)) kind = 'release';
+  else if (/USER MSG/.test(T)) kind = 'msg';
+  else if (/TRADE COMPLETE/.test(T)) kind = 'done';
+  else if (/TRADE (REJECTED|CANCELLED|CANCELED)/.test(T)) kind = 'cancel';
+  else if (/USER PHOTO/.test(T)) kind = 'photo';
+  else if (/PAYMENT PROOF/.test(T)) kind = 'proof';
+  if (!kind || !f.order) return null;
+  const uid = (f.uid || '—').toUpperCase();
+  const who = `👤 <b>${hEsc(f.user || 'User')}</b> · ${hCode(uid)}`;
+  const mail = f.email && f.email !== '—' ? `📧 ${hEsc(f.email)}` : null;
+  const ord = `🧾 Order ${hCode('#' + f.order)}${f.merchant ? ` · ${hEsc(f.merchant)}` : ''}`;
+  const when = `<i>⏰ ${hEsc(f.time || nowIST())} IST</i>`;
+  const replyHint = '<i>↩️ Reply to this message to chat with the user</i>';
+  let lines;
+  if (kind === 'new') lines = [`🆕 <b>NEW P2P ORDER · ${hEsc(f.mode || 'BUY')}</b>`, '', who, mail, ord, `💵 ${hEsc(f.inr)}  ⇄  <b>${hEsc(f.usdt)}</b>${f.rate ? ` @ ${hEsc(f.rate)}` : ''}`, '', `${when} · auto-cancel in 30 min`];
+  else if (kind === 'claim') lines = ['💸 <b>P2P BUY · PAYMENT CLAIMED</b>', '', who, mail, ord, `💵 Paid <b>${hEsc(f.inr)}</b>  →  <b>${hEsc(f.usdt)}</b>`, f.upi ? `📲 UPI ${hCode(f.upi)}` : null, f.proof ? '🖼 Payment proof attached below' : null, '', `${when} · timer 12h`, '', '✅ Approve = complete  ·  ❌ Reject = cancel', replyHint];
+  else if (kind === 'release') lines = ['🔓 <b>P2P SELL · RELEASE REQUEST</b>', '', who, mail, ord, `🪙 <b>${hEsc(f.usdt)}</b>  →  ${hEsc(f.inr)}`, '', when, '', '✅ Approve = complete  ·  ❌ Reject = refund USDT', replyHint];
+  else if (kind === 'msg') lines = [`💬 <b>${hEsc(f.user || 'User')}</b> · ${hCode(uid)} · Order ${hCode('#' + f.order)}`, `<blockquote>${hEsc(f.msg || '')}</blockquote>`, '<i>↩️ Reply to answer this user</i>'];
+  else if (kind === 'done') lines = ['✅ <b>P2P TRADE COMPLETED</b>', `🧾 Order ${hCode('#' + f.order)} · ${hCode(uid)}${f.usdt ? ` · <b>${hEsc(f.usdt)}</b>` : ''}`];
+  else if (kind === 'cancel') lines = ['❌ <b>P2P TRADE CANCELLED</b>', `🧾 Order ${hCode('#' + f.order)} · ${hCode(uid)}`];
+  else if (kind === 'photo') lines = [`🖼 <b>User photo</b> · ${hCode(uid)} · Order ${hCode('#' + f.order)}`, '<i>↩️ Reply to answer this user</i>'];
+  else lines = [`🧾 <b>Payment proof</b> · ${hCode(uid)} · Order ${hCode('#' + f.order)}`];
+  const text = lines.filter(l => l != null).join('\n').replace(/\n{3,}/g, '\n\n');
+  return { text, orderId: f.order, uid: uid === '—' ? '' : uid, kind };
+}
+/** Which order does an admin message target? Returns null when it is not a P2P chat message. */
+function p2pTargetFromText(body, reply) {
+  const t = String(body || '').trim();
+  if (reply) {
+    const hint = String(reply.text || reply.caption || '');
+    const om = hint.match(/Order[:\s]*#?(\d{5,15})/i);
+    if (!om) return null;
+    const um = hint.match(/(?:UID[:\s]*|· )([A-Z0-9]{4,12})\b/);
+    return { orderId: om[1], uid: um ? um[1] : '', text: t };
+  }
+  if (/^#[A-Z0-9]{4,10}\s+[\d.]+$/i.test(t)) return null;      // "#UID 500" = balance command, not chat
+  const hm = t.match(/^#([A-Za-z0-9]{4,15})(?:[\s:,-]+([\s\S]*))?$/);
+  if (!hm) return null;
+  const tok = hm[1];
+  return /^\d{5,15}$/.test(tok) ? { orderId: tok, uid: '', text: (hm[2] || '').trim() } : { orderId: '', uid: tok.toUpperCase(), text: (hm[2] || '').trim() };
+}
+// </P2P_PRETTY>
+
+async function p2pRemember(mid, ids) {
+  if (!db || !mid || !ids || !ids.orderId) return;
+  try {
+    await db.ref(`botState/p2pMsgs/${mid}`).set({ orderId: String(ids.orderId), uid: ids.uid || '', ts: Date.now() });
+    if (Math.random() < 0.02) { // occasional clean-up of week-old entries
+      const old = (await db.ref('botState/p2pMsgs').orderByChild('ts').endAt(Date.now() - 7 * 86400_000).limitToFirst(200).once('value')).val() || {};
+      for (const k of Object.keys(old)) db.ref(`botState/p2pMsgs/${k}`).remove().catch(() => {});
+    }
+  } catch (e) { log('P2P', `remember ${e.message}`); }
+}
+async function tgPhotoToDataUrlMain(photos) {
+  const list = [...photos].sort((a, b) => (a.file_size || 0) - (b.file_size || 0));
+  const pick = list.filter(p => (p.file_size || 0) <= 700_000).pop() || list[0];
+  const j = await (await fetch(`${TG_API}/getFile?file_id=${encodeURIComponent(pick.file_id)}`)).json();
+  if (!j.ok) return null;
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${j.result.file_path}`);
+  if (!r.ok) return null;
+  return `data:image/jpeg;base64,${Buffer.from(await r.arrayBuffer()).toString('base64')}`;
+}
+async function p2pStrictUser(uid) {
+  if (!uid) return null;
+  const f = await findUserByUID(uid).catch(() => null);
+  return f && String(shownUID(f.fuid, f.user)).toUpperCase() === String(uid).toUpperCase() ? f : null;
+}
+async function p2pResolveTarget({ orderId, uid }) {
+  if (orderId) {
+    const f = await p2pStrictUser(uid);
+    if (f) { const o = (await db.ref(`users/${f.fuid}/orders/${orderId}`).once('value')).val(); if (o) return { fuid: f.fuid, orderId, order: o, uid: uid.toUpperCase() }; }
+    const hit = await findOrderById(orderId);
+    if (hit) return { fuid: hit.fuid, orderId, order: hit.order, uid: shownUID(hit.fuid, hit.user) };
+    return { error: `Order ${hCode('#' + orderId)} is already finished — the user did not get this message.` };
+  }
+  const f = await p2pStrictUser(uid);
+  if (!f) return { error: `UID ${hCode(uid)} not found.` };
+  const orders = (await db.ref(`users/${f.fuid}/orders`).once('value')).val() || {};
+  const list = Object.entries(orders).filter(([, o]) => o && typeof o === 'object').sort((a, b) => (Number(b[1].time) || 0) - (Number(a[1].time) || 0));
+  if (!list.length) return { error: `UID ${hCode(uid)} has no open P2P order.` };
+  return { fuid: f.fuid, orderId: list[0][0], order: list[0][1], uid: uid.toUpperCase(), many: list.length };
+}
+/** Append the admin's message to users/{fuid}/chats/{orderId} once (dedup by Telegram id). */
+async function p2pDeliverAdminMsg(fuid, orderId, order, tgMsgId, text, img) {
+  const arr = (v) => Array.isArray(v) ? v.filter(x => x != null) : (v && typeof v === 'object' ? Object.values(v) : []);
+  let dup = false;
+  const tx = await db.ref(`users/${fuid}/chats/${orderId}`).transaction(cur => {
+    dup = false;
+    const st = cur && typeof cur === 'object' ? { ...cur } : { messages: [], tgMsgId: null, cbId: null, dealStage: 'init', upiSubmitted: false, seenMsgIds: [] };
+    const seen = arr(st.seenMsgIds), msgs = arr(st.messages);
+    if (seen.includes(tgMsgId)) { dup = true; return; }
+    const m = { type: 'them', sender: order.merchant || 'Merchant', text: text || '', ts: Date.now() };
+    if (img) { m.kind = 'image'; m.imageBase64 = img; }
+    msgs.push(m); seen.push(tgMsgId);
+    st.messages = msgs; st.seenMsgIds = seen.slice(-300);
+    return st;
+  });
+  return tx.committed || dup;
+}
+/** Admin message in the main bot → P2P chat. true = handled (never reaches search/menu). */
+async function p2pAdminReply(msg, text) {
+  const body = String(msg.text || msg.caption || '').trim();
+  if (body.startsWith('/')) return false;
+  const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
+  const rt = msg.reply_to_message;
+  let target = null;
+  if (rt) {
+    if (rt.from && !rt.from.is_bot) return false;
+    const mapped = (await db.ref(`botState/p2pMsgs/${rt.message_id}`).once('value')).val();
+    target = mapped ? { orderId: mapped.orderId, uid: mapped.uid || '', text: body } : p2pTargetFromText(body, rt);
+  } else {
+    target = p2pTargetFromText(body, null);
+  }
+  if (!target) return false;
+  if (!target.text && !hasPhoto) { await tgSendH('✍️ Write a message after the UID, e.g. <code>#AB12CD Payment received?</code>', { reply_to_message_id: msg.message_id }); return true; }
+  const dest = await p2pResolveTarget(target);
+  if (dest.error) { await tgSendH(`⚠️ ${dest.error}`, { reply_to_message_id: msg.message_id }); return true; }
+  let img = null;
+  if (hasPhoto) {
+    img = await tgPhotoToDataUrlMain(msg.photo).catch(() => null);
+    if (!img) { await tgSendH('⚠️ Could not deliver that photo — please send it again.', { reply_to_message_id: msg.message_id }); return true; }
+  }
+  const ok = await p2pDeliverAdminMsg(dest.fuid, dest.orderId, dest.order, msg.message_id, target.text, img);
+  if (!ok) { await tgSendH('⚠️ Message not delivered — please try again.', { reply_to_message_id: msg.message_id }); return true; }
+  await p2pRemember(msg.message_id, { orderId: dest.orderId, uid: dest.uid });
+  tgReact(msg.message_id).catch(() => {});
+  if (dest.many > 1) tgSendH(`ℹ️ ${hCode(dest.uid)} has ${dest.many} open orders — sent to the newest, ${hCode('#' + dest.orderId)}. Reply on a specific order's message to pick another.`, { reply_to_message_id: msg.message_id }).catch(() => {});
+  log('P2P', `admin msg → UID ${dest.uid} order #${dest.orderId}${img ? ' [photo]' : ''}`);
+  return true;
+}
 
 // ─── TELEGRAM PROXY — used by the P2P iframe ────────────────────────
 // The iframe can't talk to Telegram directly (we hold the single poll lock
@@ -3168,8 +3483,11 @@ app.post('/api/tg/:method', async (req, res, next) => {
   const body = { ...(req.body || {}) };
   // Force chat_id to the configured admin chat — never trust the client.
   if (m === 'sendMessage' || m === 'editMessageText') body.chat_id = TG_CHAT;
+  const pretty = (m === 'sendMessage' || m === 'editMessageText') ? p2pPretty(body.text) : null;
+  if (pretty) { body.text = pretty.text; body.parse_mode = 'HTML'; body.disable_web_page_preview = true; }
   try {
     const r = await tgFetch(m, body);
+    if (r.ok && m === 'sendMessage') p2pRemember(r.result?.message_id, pretty || p2pIds(body.text));
     if (r.ok && m === 'sendMessage' && body.reply_markup?.inline_keyboard) {
       log('P2P', `proxied button msgId=${r.result?.message_id || '—'} text="${String(body.text || '').slice(0, 45)}"`);
     }
@@ -3195,13 +3513,15 @@ app.post('/api/tg/sendPhotoBase64', async (req, res) => {
     }
     const fd = new FormData();
     fd.append('chat_id', String(TG_CHAT));
-    if (caption) fd.append('caption', String(caption).slice(0, 1024));
+    const prettyCap = caption ? p2pPretty(String(caption)) : null;
+    if (prettyCap) { fd.append('caption', prettyCap.text.slice(0, 1024)); fd.append('parse_mode', 'HTML'); }
+    else if (caption) fd.append('caption', String(caption).slice(0, 1024));
     if (reply_to_message_id) fd.append('reply_to_message_id', String(reply_to_message_id));
     const blob = new Blob([buf], { type: 'image/jpeg' });
     fd.append('photo', blob, 'photo.jpg');
     const r = await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: fd });
     const j = await r.json();
-    if (j.ok) log('P2P', `photo sent msgId=${j.result?.message_id || '—'} size=${buf.length}b`);
+    if (j.ok) { log('P2P', `photo sent msgId=${j.result?.message_id || '—'} size=${buf.length}b`); p2pRemember(j.result?.message_id, prettyCap || p2pIds(caption)); }
     res.json(j);
   } catch (e) {
     log('P2P', 'sendPhotoBase64 error: ' + e.message);
@@ -3343,6 +3663,111 @@ async function sendMailAny({ to, subject, html, text }) {
   return info;
 }
 
+// ════════════════════════════════════════════════════════════════════
+// V43 EMAILS — one email per event (mailLog/{key}), server-side for:
+// deposit/withdrawal request received, auto-detected & assigned deposits,
+// P2P completed / cancelled. Failures alert the admin in the bot.
+// ════════════════════════════════════════════════════════════════════
+const SERVER_MAIL_RECENT = new Map(); // `${email}|${cat}` -> ts
+function mailCat(subject) { const t = String(subject || ''); return /p2p/i.test(t) ? 'p2p' : /deposit/i.test(t) ? 'dep' : /withdraw/i.test(t) ? 'wit' : ''; }
+function noteServerMail(to, cat) {
+  if (!to || !cat) return;
+  SERVER_MAIL_RECENT.set(`${String(to).toLowerCase()}|${cat}`, Date.now());
+  if (SERVER_MAIL_RECENT.size > 2000) { const c = Date.now() - 3600_000; for (const [k, t] of SERVER_MAIL_RECENT) if (t < c) SERVER_MAIL_RECENT.delete(k); }
+}
+function serverMailedRecently(to, cat, ms = 15 * 60_000) { const t = SERVER_MAIL_RECENT.get(`${String(to || '').toLowerCase()}|${cat}`); return !!t && Date.now() - t < ms; }
+let MAIL_ALERT_AT = 0;
+function mailFixHint(reason) {
+  const r = String(reason || '');
+  if (/not configured|not set up|missing/i.test(r)) return 'Add RESEND_API_KEY (or SMTP_USER + SMTP_PASS) in Render → Environment, then redeploy.';
+  if (/domain|verify|testing emails|own email|not allowed|403/i.test(r)) return 'Resend only sends to everyone after your domain is verified — set RESEND_FROM to an address on that verified domain.';
+  if (/auth|535|invalid login|credentials/i.test(r)) return 'The SMTP username/password is wrong — re-check SMTP_USER and SMTP_PASS.';
+  if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND/i.test(r)) return 'The mail server did not answer — check SMTP_HOST / SMTP_PORT or use Resend.';
+  return 'Run /mailtest your@email to see the exact problem.';
+}
+function mailAlert(reason) {
+  if (Date.now() - MAIL_ALERT_AT < 30 * 60_000) return;
+  MAIL_ALERT_AT = Date.now();
+  tgSendH(hcard('⚠️ EMAIL NOT DELIVERED', [`❗ ${hEsc(String(reason || 'unknown error').slice(0, 300))}`, '', `🔧 ${hEsc(mailFixHint(reason))}`, '', 'Check any time with /mailstatus or /mailtest your@email'])).catch(() => {});
+}
+async function sendUserTxMail(key, user, mail) {
+  const to = String(user?.email || '').trim();
+  const uid = user?.uid || '—';
+  if (!to || !to.includes('@')) { log('MAIL', `skip ${key} UID=${uid} — no email`); return false; }
+  if (!RESEND_API_KEY && !mailer) { log('MAIL', `skip ${key} — mail not configured`); mailAlert('Email is not set up on the server.'); return false; }
+  const k = tapKey(`mail_${key}`);
+  if (db) { const tx = await db.ref(`mailLog/${k}`).transaction(c => c ? undefined : { ts: Date.now(), to, by: INSTANCE_ID }); if (!tx.committed) return false; }
+  try {
+    const info = await sendMailAny({ to, subject: mail.subject, html: mailHtml({ ...mail, uid }), text: `${mail.subject}\n\n${mail.message}\n\n${mail.amount ? 'Amount: ' + mail.amount + '\n\n' : ''}BIEXC — t.me/biexc10` });
+    noteServerMail(to, mailCat(mail.subject));
+    log('MAIL', `✅ sent ${key} UID=${uid} → ${to} msg=${info.messageId || 'ok'}`);
+    return true;
+  } catch (e) {
+    lastMailError = e.message;
+    if (db) await db.ref(`mailLog/${k}`).remove().catch(() => {});
+    log('MAIL', `❌ failed ${key} UID=${uid} → ${to}: ${e.message}`);
+    mailAlert(e.message);
+    return false;
+  }
+}
+function queueUserTxMail(key, user, mail) { setTimeout(() => { sendUserTxMail(key, user, mail).catch(e => log('MAIL', `crash ${e.message}`)); }, 0); }
+function queueRequestMail(type, user, req, cbId) {
+  const coin = String(req.coin || 'USDT').toUpperCase(), amount = `${r8(Number(req.amt) || 0)} ${coin}`, dep = type === 'dep';
+  queueUserTxMail(`req_${type}_${cbId}`, user, {
+    subject: dep ? `Deposit Request Received — ${amount}` : `Withdrawal Request Received — ${amount}`,
+    headline: dep ? 'Deposit Request Received' : 'Withdrawal Request Received',
+    message: dep
+      ? 'We have received your deposit request. It will be credited to your Spot Wallet as soon as it is verified — you will get another email then.'
+      : 'We have received your withdrawal request. The amount is on hold while our team reviews it, and you will get another email as soon as it is sent.',
+    amount, status: 'PENDING', label: dep ? 'Deposit' : 'Withdrawal', type, coin,
+    network: req.network || req.chain || '', address: req.address || req.addr || '', txid: req.txid || '', hid: req.hid,
+    stage2: 'In review', stage3: dep ? 'Credited' : 'Sent',
+  });
+}
+function queueP2PMail(user, orderId, order, action) {
+  if (!user || !order || !orderId) return;
+  const mode = String(order.mode || 'BUY').toUpperCase(), usdt = r8(Number(order.usdt) || 0), inr = Number(order.inr) || 0;
+  const done = action === 'complete', label = mode === 'SELL' ? 'P2P Sell' : 'P2P Buy', amount = `${usdt} USDT`;
+  const message = done
+    ? (mode === 'SELL'
+      ? `Your P2P sell order #${orderId} is complete. ${amount} was released to the buyer for ₹${inr.toLocaleString('en-IN')}.`
+      : `Your P2P buy order #${orderId} is complete. ${amount} has been credited to your Spot Wallet.`)
+    : (mode === 'SELL'
+      ? `Your P2P sell order #${orderId} was cancelled. The ${amount} held for this order has been returned to your Spot Wallet.`
+      : `Your P2P buy order #${orderId} was cancelled and no USDT was credited. If you already paid, please contact support with your payment proof.`);
+  queueUserTxMail(`p2p_${orderId}_${done ? 'complete' : 'reject'}`, user, {
+    subject: done ? `${label} Completed — ${amount}` : `${label} Order Cancelled — ${amount}`,
+    headline: done ? `${label} Completed` : `${label} Cancelled`, message, amount,
+    status: done ? 'COMPLETED' : 'CANCELLED', label, type: mode === 'SELL' ? 'wit' : 'dep', coin: 'USDT',
+    hid: `p2p_${orderId}`, stage2: 'Payment', stage3: done ? 'Completed' : 'Cancelled',
+  });
+}
+function mailStatusCard() {
+  const yes = (v) => v ? '✅' : '❌';
+  return hcard('📧 EMAIL STATUS', [
+    `${yes(RESEND_API_KEY)} Resend ${RESEND_API_KEY ? `· from ${hCode(RESEND_FROM)}` : '· not set'}`,
+    `${yes(smtpReady)} SMTP ${SMTP_USER ? `${hCode(SMTP_USER)} · ${hEsc(SMTP_HOST)}:${SMTP_PORT}` : '· not set'}${smtpDisabledReason ? `\n   ${hEsc(smtpDisabledReason.slice(0, 200))}` : ''}`,
+    '',
+    `📤 Last sent: ${hEsc(lastMailSentAt || '—')}${lastMailProvider ? ` via ${hEsc(lastMailProvider)}` : ''}`,
+    `❗ Last error: ${hEsc((lastMailError || '—').slice(0, 300))}`,
+    lastMailError ? `🔧 ${hEsc(mailFixHint(lastMailError))}` : null,
+    '',
+    'Test: <code>/mailtest you@example.com</code>',
+  ]);
+}
+async function mailTestCmd(to) {
+  to = String(to || '').trim();
+  if (!to.includes('@')) return tgSendH(mailStatusCard());
+  if (!RESEND_API_KEY && !mailer) return tgSendH(hcard('❌ EMAIL NOT SET UP', [hEsc(mailFixHint('not configured'))]));
+  try {
+    const info = await sendMailAny({ to, subject: 'BIEXC test email', html: mailHtml({ subject: 'BIEXC test email', headline: 'Email is working', message: 'This is a test from the BIEXC bot. Deposit, withdrawal and P2P emails will arrive like this.', amount: '0 USDT', status: 'COMPLETED', uid: 'TEST', label: 'Test', coin: 'USDT', type: 'dep' }), text: 'BIEXC test email — email is working.' });
+    return tgSendH(hcard('✅ TEST EMAIL SENT', [`📧 ${hEsc(to)}`, `📮 via ${hEsc(lastMailProvider || '—')} · ${hCode(info.messageId || 'ok')}`, '', 'Not in the inbox? Check Spam/Promotions.']));
+  } catch (e) {
+    lastMailError = e.message;
+    return tgSendH(hcard('❌ TEST EMAIL FAILED', [`📧 ${hEsc(to)}`, `❗ ${hEsc(e.message.slice(0, 300))}`, '', `🔧 ${hEsc(mailFixHint(e.message))}`]));
+  }
+}
+
 function queueResolutionEmail(ctx) {
   setTimeout(() => {
     sendResolutionEmail(ctx).catch(e => log('MAIL', `async send crashed: ${e.message}`));
@@ -3385,6 +3810,7 @@ async function sendResolutionEmail(ctx) {
   }
   if (!RESEND_API_KEY && !mailer) {
     log('MAIL', `skip ${label} UID=${uid} → ${to} — mail not configured`);
+    mailAlert('Email is not set up on the server.');
     return false;
   }
   const mail = buildResolutionEmail(ctx);
@@ -3402,10 +3828,12 @@ Amount: ${mail.amount}
 BIEXC — t.me/biexc10`
     });
     log('MAIL', `✅ sent ${label} ${mail.status} UID=${uid} → ${to} msg=${info.messageId || 'ok'}`);
+    noteServerMail(to, ctx.type);
     return true;
   } catch (e) {
     lastMailError = e.message;
     log('MAIL', `❌ failed ${label} UID=${uid} → ${to}: ${e.message}`);
+    mailAlert(e.message);
     return false;
   }
 }
@@ -3436,7 +3864,7 @@ function mailHtml(opts) {
   const accentBg = isOk ? 'rgba(14,203,129,.10)' : isBad ? 'rgba(246,70,93,.10)' : 'rgba(240,185,11,.10)';
   const badge    = isOk ? 'COMPLETED' : isBad ? 'CANCELLED' : (status || 'PENDING');
   const verb     = isOk ? 'Completed' : isBad ? 'Cancelled' : 'Update';
-  const headline = label ? (label + ' ' + verb) : (subject || 'Transaction Update');
+  const headline = o.headline || (label ? (label + ' ' + verb) : (subject || 'Transaction Update'));
   const sign     = type === 'dep' ? '+' : '−';
   const direction = type === 'dep' ? 'Incoming' : 'Outgoing';
 
@@ -3454,8 +3882,8 @@ function mailHtml(opts) {
   const logo = '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;"><tr><td align="center" style="width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 30%, #2a2a2a 0%, #0a0a0a 75%);border:2px solid #F0B90B;box-shadow:0 0 0 4px rgba(240,185,11,.06), 0 6px 18px rgba(240,185,11,.18);font:800 20px/64px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#F0B90B;letter-spacing:1.5px;text-align:center;">BN</td></tr></table>';
 
   const stage3Active = isOk;
-  const stage2Label = type === 'wit' ? 'Broadcast' : 'Verified';
-  const stage3Label = isBad ? 'Cancelled' : (type === 'wit' ? 'Sent' : 'Credited');
+  const stage2Label = o.stage2 || (type === 'wit' ? 'Broadcast' : 'Verified');
+  const stage3Label = o.stage3 || (isBad ? 'Cancelled' : (type === 'wit' ? 'Sent' : 'Credited'));
 
   const addrBlock = address ? '<tr><td style="padding:14px 16px;background:#06080b;border:1px solid #1c222b;border-radius:10px;"><div style="font-size:10px;color:#5E6673;letter-spacing:2px;font-weight:700;text-transform:uppercase;margin-bottom:6px;">' + (type==='wit'?'Destination Address':'Sender Address') + '</div><div style="font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;color:#EAECEF;word-break:break-all;line-height:1.5;">' + esc(address) + '</div></td></tr><tr><td style="height:10px;line-height:10px;font-size:0;">&nbsp;</td></tr>' : '';
 
@@ -3613,6 +4041,9 @@ app.post('/api/send-mail', async (req, res) => {
     if (!RESEND_API_KEY && !mailer) return res.status(503).json({ ok: false, error: 'mail not configured' });
     const { to_email, to_name, subject, message, amount, status, uid } = req.body || {};
     if (!to_email || !subject) return res.status(400).json({ ok: false, error: 'to_email & subject required' });
+    // The server already emailed this user about this deposit/withdrawal/P2P → skip the app's duplicate.
+    const cat = mailCat(subject);
+    if (cat && serverMailedRecently(to_email, cat)) { log('MAIL', `skip app duplicate (${cat}) → ${to_email}`); return res.json({ ok: true, skipped: 'duplicate' }); }
     await sendMailAny({
       to: to_email,
       subject,
@@ -3666,6 +4097,10 @@ tgFetch('setMyCommands', { commands: [
   { command: 'whatsapp', description: 'WhatsApp linked account / QR' },
   { command: 'complete', description: 'Complete a P2P order: /complete ORDERID' },
   { command: 'reject', description: 'Reject a P2P order: /reject ORDERID' },
+  { command: 'today', description: 'Today report (IST)' },
+  { command: 'unmatched', description: 'Deposits waiting to be assigned' },
+  { command: 'mailstatus', description: 'Is user email working?' },
+  { command: 'mailtest', description: 'Send a test email: /mailtest you@mail.com' },
 ] }).catch(() => {});
 
 // Self-ping to keep Render free tier awake
