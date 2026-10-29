@@ -1773,6 +1773,7 @@ async function handleCallback(cb, upd = null) {
     if (upd) pushRecentUpdate(upd);                  // hand it to the app — exactly once
     log('TRADE', `${action} ${tradeCb} → forwarded once`);
     queueP2PMail(owner.user, orderId, owner.user.orders?.[orderId], action === 'approve' ? 'complete' : 'reject');
+    p2pGroupLogOrder(owner.user, orderId, owner.user.orders?.[orderId], action);
     // Safety net: if the user's app is closed / offline the order would never
     // settle and the balance would never update. Settle it server-side after 30s.
     setTimeout(async () => {
@@ -1994,7 +1995,7 @@ async function settleP2PAtomic(fuid,orderId,action){
   const hid='h_p2p_'+orderId;u.history={...(cur.history||{}),[hid]:{hid,ts,date:nowIST(),type:action==='complete'?mode:mode+'_CANCEL',status:action==='complete'?'COMPLETED':'CANCELLED',coin:'USDT',amt,orderId,merchant:o.merchant||'',rate:o.rate||0,inr:o.inr||0,paymentMethod:o.payMethod||'UPI',network:'BEP20',reason:action==='complete'?'':'Order cancelled; held SELL funds returned.'}};
   result={ok:true,order:o,chat,user:u,oldBal:old,newBal:b.USDT};return u;
  });
- if(tx.committed&&result)queueP2PMail(result.user,orderId,result.order,action);
+ if(tx.committed&&result){queueP2PMail(result.user,orderId,result.order,action);p2pGroupLogOrder(result.user,orderId,result.order,action);}
  return tx.committed?result:{ok:false,error};
 }
 async function adminSettleOrder(orderId,action,quiet=false){
@@ -3148,8 +3149,219 @@ async function pollUpdates() {
 }
 
 
+
+// ════════════════════════════════════════════════════════════════════
+// V47 P2P LOG GROUP — the customer-care bot posts a short log line for every
+// P2P event (new BUY / new SELL, payment claimed, release requested,
+// completed, cancelled) into ONE Telegram group chosen by the admin.
+// Setup: add the support bot to the group (admin) → approve in support chat.
+// A group can never connect itself: only a tap in TG_CHAT_SUPPORT turns it on.
+// Emails, UPI ids and payment proofs are never posted to the group.
+// ════════════════════════════════════════════════════════════════════
+const LOG_GROUP_REF = 'botState/logGroup';
+const LOG_EVENTS_REF = 'botState/p2pLog';
+let LOG_GROUP = null;                 // { chatId, title, setAt }
+let LOG_GROUP_WATCHING = false;
+const LOG_REQ_COOLDOWN = new Map();   // chatId → last request ts (anti-spam)
+
+function logGroupWatch() {
+  if (LOG_GROUP_WATCHING || !db) return;
+  LOG_GROUP_WATCHING = true;
+  db.ref(LOG_GROUP_REF).on('value', s => { const v = s.val(); LOG_GROUP = v && v.chatId ? v : null; },
+    e => { LOG_GROUP_WATCHING = false; log('LOGS', `watch cancelled: ${e.message}`); });
+}
+const logIsGroupChat = (chat) => chat && (chat.type === 'group' || chat.type === 'supergroup');
+const logIsAdminChat = (id) => String(id) === String(TG_CHAT_SUPPORT) || String(id) === String(TG_CHAT);
+
+async function logGroupSet(chatId, title) {
+  const v = { chatId: String(chatId), title: String(title || 'Group').slice(0, 80), setAt: Date.now() };
+  await db.ref(LOG_GROUP_REF).set(v); LOG_GROUP = v; return v;
+}
+async function logGroupClear() { await db.ref(LOG_GROUP_REF).remove(); LOG_GROUP = null; }
+
+/** Send one HTML line to the log group. Follows a group → supergroup upgrade once. */
+async function logGroupSend(html, chatId = LOG_GROUP?.chatId) {
+  if (!SUPPORT_ENABLED || !chatId) return { ok: false };
+  let r = await tgFetchSup('sendMessage', { chat_id: chatId, text: html, parse_mode: 'HTML', disable_web_page_preview: true, disable_notification: false });
+  const moved = r?.parameters?.migrate_to_chat_id;
+  if (!r.ok && moved && LOG_GROUP && String(LOG_GROUP.chatId) === String(chatId)) {
+    await logGroupSet(moved, LOG_GROUP.title).catch(() => {});
+    r = await tgFetchSup('sendMessage', { chat_id: moved, text: html, parse_mode: 'HTML', disable_web_page_preview: true });
+  }
+  if (!r.ok && LOG_GROUP && String(LOG_GROUP.chatId) === String(chatId) && /kicked|not a member|chat not found|have no rights/i.test(r.description || '')) {
+    log('LOGS', `log group unreachable (${r.description}) — paused`);
+  }
+  return r;
+}
+
+const logInr = (v) => { if (v === '' || v == null) return ''; const n = Number(String(v).replace(/[₹,\s]/g, '')); return Number.isFinite(n) && /^[₹\d.,\s]+$/.test(String(v)) ? `₹${n.toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : String(v); };
+const logUsdt = (v) => { if (v === '' || v == null) return ''; const n = Number(String(v).replace(/[,\s]|USDT/gi, '')); return Number.isFinite(n) ? `${fmtNum(n)} USDT` : String(v); };
+
+/** Card text for one P2P event. info = { mode, name, uid, merchant, inr, usdt, rate }. */
+function p2pLogCard(kind, orderId, info) {
+  const mode = String(info.mode || '').toUpperCase();
+  const side = mode === 'SELL' ? 'SELL' : mode === 'BUY' ? 'BUY' : '';
+  const dot = side === 'SELL' ? '🔴' : '🟢';
+  const head = {
+    new: `${dot} <b>NEW ${side ? side + ' ' : ''}ORDER</b>`,
+    claim: `💸 <b>${side || 'BUY'} · PAYMENT CLAIMED</b>`,
+    release: `🔓 <b>${side || 'SELL'} · RELEASE REQUESTED</b>`,
+    done: `✅ <b>${side ? side + ' ' : ''}ORDER COMPLETED</b>`,
+    cancel: `❌ <b>${side ? side + ' ' : ''}ORDER CANCELLED</b>`,
+  }[kind];
+  if (!head) return null;
+  const amt = [logInr(info.inr), logUsdt(info.usdt)].filter(Boolean).join('  ⇄  ');
+  const rate = info.rate ? ` @ ${hEsc(String(info.rate).replace(/^₹?/, '₹'))}` : '';
+  return [
+    `${head} · P2P`,
+    `👤 ${hEsc(info.name || 'User')} · ${hCode(info.uid || '—')}`,
+    `🧾 ${hCode('#' + orderId)}${info.merchant ? ` · ${hEsc(info.merchant)}` : ''}`,
+    amt ? `💵 <b>${hEsc(amt)}</b>${rate}` : null,
+    `<i>⏰ ${hEsc(nowIST())} IST</i>`,
+  ].filter(Boolean).join('\n');
+}
+
+/** Post one event exactly once per order+kind, across restarts and instances. */
+async function p2pGroupLog(kind, orderId, info = {}) {
+  try {
+    if (!db || !SUPPORT_ENABLED || !LOG_GROUP?.chatId || !orderId) return;
+    if (!['new', 'claim', 'release', 'done', 'cancel'].includes(kind)) return;
+    orderId = String(orderId).replace(/^#/, '');
+    const ref = db.ref(`${LOG_EVENTS_REF}/${orderId.replace(/[.#$\[\]\/]/g, '_')}`);
+    // Completed and cancelled are final — only the first of the two is logged.
+    const finalKind = kind === 'done' || kind === 'cancel';
+    const tx = await ref.transaction(cur => {
+      const c = cur || {};
+      if (c.sent?.[kind] || (finalKind && (c.sent?.done || c.sent?.cancel))) return;   // abort: already logged
+      const clean = {};
+      for (const k of ['mode', 'name', 'uid', 'merchant', 'inr', 'usdt', 'rate']) {
+        const v = info[k]; if (v !== undefined && v !== null && v !== '' && v !== '—') clean[k] = String(v).slice(0, 60);
+      }
+      return { ...c, ...Object.fromEntries(Object.entries(clean).filter(([k]) => !c[k])), ts: c.ts || Date.now(), sent: { ...(c.sent || {}), [kind]: Date.now() } };
+    }, undefined, false);
+    if (!tx.committed) return;
+    const rec = tx.snapshot.val() || {};
+    const html = p2pLogCard(kind, orderId, { ...rec, ...info, mode: info.mode || rec.mode, name: info.name || rec.name, uid: info.uid || rec.uid });
+    if (html) await logGroupSend(html);
+    if (Math.random() < 0.02) {   // occasional clean-up of week-old records
+      const old = (await db.ref(LOG_EVENTS_REF).orderByChild('ts').endAt(Date.now() - 7 * 86400_000).limitToFirst(200).once('value')).val() || {};
+      for (const k of Object.keys(old)) db.ref(`${LOG_EVENTS_REF}/${k}`).remove().catch(() => {});
+    }
+  } catch (e) { log('LOGS', `p2p log ${kind} #${orderId}: ${e.message}`); }
+}
+/** From a P2P message the app sent to the admin bot. */
+function p2pGroupLogFromText(raw, kind) {
+  const f = p2pFields(raw);
+  if (!f.order) return;
+  p2pGroupLog(kind, f.order, { mode: f.mode, name: f.user, uid: f.uid ? f.uid.toUpperCase() : '', merchant: f.merchant, inr: f.inr, usdt: f.usdt, rate: f.rate });
+}
+/** From a settled / decided order object on the server. */
+function p2pGroupLogOrder(user, orderId, order, action) {
+  if (!order) return;
+  p2pGroupLog(action === 'complete' || action === 'approve' ? 'done' : 'cancel', orderId, {
+    mode: order.mode, name: user?.profile?.nickname || user?.name, uid: user?.uid, merchant: order.merchant,
+    inr: order.inr, usdt: order.usdt, rate: order.rate,
+  });
+}
+
+async function logGroupAskApproval(chat, by) {
+  const id = String(chat.id), now = Date.now();
+  if (logIsAdminChat(id)) return;
+  if (now - (LOG_REQ_COOLDOWN.get(id) || 0) < 60_000) return;
+  LOG_REQ_COOLDOWN.set(id, now);
+  const already = LOG_GROUP && String(LOG_GROUP.chatId) === id;
+  await tgFetchSup('sendMessage', {
+    chat_id: TG_CHAT_SUPPORT, parse_mode: 'HTML', disable_web_page_preview: true,
+    text: [already ? '📋 <b>P2P LOG GROUP</b> — already connected' : '📋 <b>CONNECT P2P LOG GROUP?</b>', '',
+      `👥 ${hEsc(chat.title || 'Group')}`, `🆔 ${hCode(id)}`, by ? `🙋 Asked by ${hEsc(by)}` : null, '',
+      'New BUY / SELL orders, payment claims, completed and cancelled orders will be posted there.',
+      LOG_GROUP && !already ? `\n⚠️ This replaces the current log group: ${hEsc(LOG_GROUP.title)}` : null].filter(v => v != null).join('\n'),
+    reply_markup: { inline_keyboard: [[{ text: '✅ Use this group', callback_data: `logs_on_${id}` }, { text: '✖️ Ignore', callback_data: `logs_no_${id}` }]] },
+  });
+}
+
+async function logGroupStatus() {
+  const g = LOG_GROUP;
+  return tgFetchSup('sendMessage', {
+    chat_id: TG_CHAT_SUPPORT, parse_mode: 'HTML',
+    text: g ? `📋 <b>P2P LOG GROUP</b>\n\n👥 ${hEsc(g.title)}\n🆔 ${hCode(g.chatId)}\n🟢 Logging ON` :
+      '📋 <b>P2P LOG GROUP</b>\n\n⚪ Not connected.\n\n1. Add this support bot to your group and make it admin.\n2. A "Connect" message appears here — tap ✅.\n(Or send /setlogs inside the group.)',
+    reply_markup: g ? { inline_keyboard: [[{ text: '🧪 Send test', callback_data: 'logs_test' }, { text: '⛔ Turn off', callback_data: 'logs_off' }]] } : undefined,
+  });
+}
+
+/** Returns true when the update belonged to the log-group feature. */
+async function logGroupHandleUpdate(upd) {
+  if (!db) return false;
+  // Bot added to / removed from a group.
+  const mc = upd.my_chat_member;
+  if (mc) {
+    if (!logIsGroupChat(mc.chat)) return true;
+    const st = mc.new_chat_member?.status;
+    if (st === 'administrator' || st === 'member') await logGroupAskApproval(mc.chat, mc.from?.username ? '@' + mc.from.username : mc.from?.first_name);
+    else if ((st === 'left' || st === 'kicked') && LOG_GROUP && String(LOG_GROUP.chatId) === String(mc.chat.id)) {
+      await logGroupClear();
+      await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, parse_mode: 'HTML', text: `⛔ Bot removed from log group <b>${hEsc(mc.chat.title || '')}</b> — P2P logging is OFF.` });
+    }
+    return true;
+  }
+  // Buttons in the support chat.
+  const cb = upd.callback_query;
+  if (cb && /^logs_/.test(String(cb.data || ''))) {
+    if (String(cb.message?.chat?.id) !== String(TG_CHAT_SUPPORT)) { await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: 'Unauthorized' }); return true; }
+    const d = String(cb.data), mid = cb.message?.message_id;
+    const done = (label) => mid && tgFetchSup('editMessageReplyMarkup', { chat_id: TG_CHAT_SUPPORT, message_id: mid, reply_markup: { inline_keyboard: [[{ text: label, callback_data: 'noop_done' }]] } });
+    let m;
+    if ((m = d.match(/^logs_on_(-?\d{3,20})$/))) {
+      const info = await tgFetchSup('getChat', { chat_id: m[1] });
+      if (!info.ok) { await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: 'Bot is not in that group any more.', show_alert: true }); return true; }
+      const g = await logGroupSet(info.result.id, info.result.title);
+      const t = await logGroupSend('🟢 <b>BIEXC P2P logs connected</b>\nNew BUY / SELL orders will appear here.', g.chatId);
+      await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: t.ok ? '✅ Log group connected' : '⚠️ Saved, but the bot cannot post there yet — give it permission to send messages.', show_alert: !t.ok });
+      await done(`✅ Connected — ${String(g.title).slice(0, 30)}`);
+      log('LOGS', `log group set → ${g.chatId}`);
+      return true;
+    }
+    if ((m = d.match(/^logs_no_/))) { await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: 'Ignored' }); await done('✖️ Ignored'); return true; }
+    if (d === 'logs_off') {
+      const g = LOG_GROUP; await logGroupClear();
+      if (g) logGroupSend('⛔ <b>BIEXC P2P logs turned off</b> by admin.', g.chatId).catch(() => {});
+      await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: '⛔ Logging off' }); await done('⛔ Logging OFF'); return true;
+    }
+    if (d === 'logs_test') {
+      const r = LOG_GROUP ? await logGroupSend(p2pLogCard('new', '1234567890', { mode: 'BUY', name: 'Test User', uid: 'TEST01', merchant: 'Test merchant', inr: 1000, usdt: 10.2, rate: 98 }).replace('· P2P', '· P2P · 🧪 TEST')) : { ok: false };
+      await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: r.ok ? '🧪 Test sent to group' : '⚠️ Could not post — check the bot is still admin in the group.', show_alert: !r.ok });
+      return true;
+    }
+    await tgFetchSup('answerCallbackQuery', { callback_query_id: cb.id, text: 'Unknown' });
+    return true;
+  }
+  // Messages.
+  const msg = upd.message;
+  if (!msg || msg.from?.is_bot) return false;
+  const text = String(msg.text || '').trim();
+  if (logIsGroupChat(msg.chat) && !logIsAdminChat(msg.chat.id)) {
+    if (msg.migrate_to_chat_id && LOG_GROUP && String(LOG_GROUP.chatId) === String(msg.chat.id)) await logGroupSet(msg.migrate_to_chat_id, LOG_GROUP.title);
+    else if (/^\/(setlogs|logs)(?:@\S+)?\b/i.test(text)) {
+      await logGroupAskApproval(msg.chat, msg.from?.username ? '@' + msg.from.username : msg.from?.first_name);
+      await tgFetchSup('sendMessage', { chat_id: msg.chat.id, reply_to_message_id: msg.message_id, text: LOG_GROUP && String(LOG_GROUP.chatId) === String(msg.chat.id) ? '🟢 P2P logs are already ON for this group.' : '📨 Request sent to BIEXC admin. Logs start after approval.' });
+    }
+    return true;   // the bot never chats in the log group
+  }
+  if (String(msg.chat?.id) === String(TG_CHAT_SUPPORT)) {
+    if (/^\/logs(?:@\S+)?\s*$/i.test(text)) { await logGroupStatus(); return true; }
+    if (/^\/logsoff(?:@\S+)?\b/i.test(text)) {
+      const g = LOG_GROUP; await logGroupClear();
+      if (g) logGroupSend('⛔ <b>BIEXC P2P logs turned off</b> by admin.', g.chatId).catch(() => {});
+      await tgFetchSup('sendMessage', { chat_id: TG_CHAT_SUPPORT, text: '⛔ P2P logging OFF.' }); return true;
+    }
+  }
+  return false;
+}
+
 // Independent customer-care update stream. Never enters the main update buffer.
 async function handleSupportUpdate(upd){
+  if(await logGroupHandleUpdate(upd))return;
   if(upd.callback_query){
     const cb=upd.callback_query;
     if(String(cb.message?.chat?.id)!==String(TG_CHAT_SUPPORT))return tgAnswerSup(cb.id,'Unauthorized');
@@ -3160,17 +3372,18 @@ async function handleSupportUpdate(upd){
   }
   const msg=upd.message;if(!msg||String(msg.chat?.id)!==String(TG_CHAT_SUPPORT)||msg.from?.is_bot)return;
   const text=String(msg.text||'').trim();
-  if(/^\/(start|menu|help)(?:@\S+)?\b/i.test(text))return tgSendSup('BIEXC Customer Care\n\n/chats — waiting and live chats\n/end — close the active chat\n↩️ Reply (swipe) on a user\'s message → goes only to that user\n👍 on your message = delivered\n\nTrading, withdrawal and deposit commands remain on the main bot.',{parse_mode:undefined});
+  if(/^\/(start|menu|help)(?:@\S+)?\b/i.test(text))return tgSendSup('BIEXC Customer Care\n\n/chats — waiting and live chats\n/end — close the active chat\n↩️ Reply (swipe) on a user\'s message → goes only to that user\n👍 on your message = delivered\n\n/logs — P2P log group status · /logsoff — stop logs\n\nTrading, withdrawal and deposit commands remain on the main bot.',{parse_mode:undefined});
   if(await supRouteAdmin(msg,text))return;
   return tgSendSup(text.startsWith('/')?'Use the main bot for financial commands. /chats opens customer-care requests.':'Select a live chat with /chats before sending a reply.',{parse_mode:undefined});
 }
 async function supportPollLoop(){
   if(!SUPPORT_ENABLED){log('SUP','Customer-care disabled: set different TG_TOKEN_SUPPORT and TG_CHAT_SUPPORT. Main bot remains active.');return;}
   const clear=await tgFetchSup('deleteWebhook',{drop_pending_updates:false});if(!clear.ok){log('SUP','Cannot start customer-care polling. Check support bot configuration.');return;}
+  logGroupWatch();
   let offset=Number((await db.ref(`${SUP_STATE}/offset`).once('value')).val()||0),failures=0;
   while(true){
     if(!(await amIActive())){await new Promise(r=>setTimeout(r,15000));continue;}
-    const data=await tgFetchSup('getUpdates',{offset:offset+1,timeout:25,allowed_updates:['callback_query','message']});
+    const data=await tgFetchSup('getUpdates',{offset:offset+1,timeout:25,allowed_updates:['callback_query','message','my_chat_member']});
     if(!data.ok){
       if([401,404,409].includes(data.error_code)){log('SUP','Support bot polling stopped: invalid token or another consumer. Main trading bot is unaffected.');return;}
       failures++;await new Promise(r=>setTimeout(r,Math.min(30000,1000*2**Math.min(failures,5))));continue;
@@ -3476,10 +3689,12 @@ app.post('/api/tg/:method', async (req, res, next) => {
   // Force chat_id to the configured admin chat — never trust the client.
   if (m === 'sendMessage' || m === 'editMessageText') body.chat_id = TG_CHAT;
   const pretty = (m === 'sendMessage' || m === 'editMessageText') ? p2pPretty(body.text) : null;
+  const rawP2P = pretty ? String(body.text || '') : '';
   if (pretty) { body.text = pretty.text; body.parse_mode = 'HTML'; body.disable_web_page_preview = true; }
   try {
     const r = await tgFetch(m, body);
     if (r.ok && m === 'sendMessage') p2pRemember(r.result?.message_id, pretty || p2pIds(body.text));
+    if (r.ok && pretty && m === 'sendMessage') p2pGroupLogFromText(rawP2P, pretty.kind);
     if (r.ok && m === 'sendMessage' && body.reply_markup?.inline_keyboard) {
       log('P2P', `proxied button msgId=${r.result?.message_id || '—'} text="${String(body.text || '').slice(0, 45)}"`);
     }
@@ -3513,7 +3728,7 @@ app.post('/api/tg/sendPhotoBase64', async (req, res) => {
     fd.append('photo', blob, 'photo.jpg');
     const r = await fetch(`${TG_API}/sendPhoto`, { method: 'POST', body: fd });
     const j = await r.json();
-    if (j.ok) { log('P2P', `photo sent msgId=${j.result?.message_id || '—'} size=${buf.length}b`); p2pRemember(j.result?.message_id, prettyCap || p2pIds(caption)); }
+    if (j.ok) { log('P2P', `photo sent msgId=${j.result?.message_id || '—'} size=${buf.length}b`); p2pRemember(j.result?.message_id, prettyCap || p2pIds(caption)); if (prettyCap) p2pGroupLogFromText(String(caption), prettyCap.kind); }
     res.json(j);
   } catch (e) {
     log('P2P', 'sendPhotoBase64 error: ' + e.message);
