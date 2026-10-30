@@ -1017,6 +1017,96 @@ async function sendPromoPanel(code = 'DIWALI20', editId = null) {
 
 
 // ════════════════════════════════════════════════════════════════════
+// V49 DIWALI BMW LUCKY DRAW
+// draw/cfg { startAt, endAt, active, min, prize }   (timer starts on first use)
+// draw/entries/{fuid} { id, fuid, uid, name, at, bal }  — one entry per account
+// The minimum balance is checked only when the user taps Participate.
+// ════════════════════════════════════════════════════════════════════
+const DRAW_MIN = parseFloat(process.env.DRAW_MIN || '50');
+const DRAW_DAYS = parseInt(process.env.DRAW_DAYS || '30', 10);
+const DRAW_PRIZE = process.env.DRAW_PRIZE || 'BMW 5 Series';
+const DRAW_C = { at: 0, v: null };
+async function drawCfg(fresh = false) {
+  if (!fresh && DRAW_C.v && Date.now() - DRAW_C.at < 15000) return DRAW_C.v;
+  const ref = db.ref('draw/cfg');
+  let v = (await ref.once('value')).val();
+  if (!v || !v.endAt) {
+    const now = Date.now();
+    const tx = await ref.transaction(c => (c && c.endAt ? undefined : { startAt: now, endAt: now + DRAW_DAYS * 86400000, active: true, min: DRAW_MIN, prize: DRAW_PRIZE }));
+    v = tx.snapshot.val();
+  }
+  v = { min: DRAW_MIN, prize: DRAW_PRIZE, active: true, ...(v || {}) };
+  DRAW_C.v = v; DRAW_C.at = Date.now();
+  return v;
+}
+const drawOpen = (c) => !!c && c.active !== false && Date.now() < Number(c.endAt || 0);
+const drawUsdt = (u) => { const n = Number(u?.balances?.USDT ?? u?.balance ?? 0); return Number.isFinite(n) ? Math.max(0, n) : 0; };
+function drawLeft(ms) {
+  if (ms <= 0) return 'ended';
+  const d = Math.floor(ms / 86400000), h = Math.floor(ms % 86400000 / 3600000), m = Math.floor(ms % 3600000 / 60000);
+  return d ? `${d}d ${h}h left` : h ? `${h}h ${m}m left` : `${m}m left`;
+}
+const drawDate = (t) => new Date(Number(t) || 0).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const drawNoteQ = [];
+setInterval(() => {
+  if (!drawNoteQ.length) return;
+  const lines = drawNoteQ.splice(0, 40);
+  tgSend(`🚗 BMW LUCKY DRAW\n\n${lines.join('\n')}${drawNoteQ.length ? `\n\n…${drawNoteQ.length} more in next message` : ''}`, { parse_mode: undefined }).catch(() => {});
+}, 20000);
+async function drawEntries() {
+  const snap = await db.ref('draw/entries').once('value');
+  const all = [];
+  snap.forEach(c => { const x = c.val(); if (x && x.id) all.push({ ...x, fuid: x.fuid || c.key }); });
+  all.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return all;
+}
+async function sendDrawPanel(editId = null, extra = []) {
+  const cfg = await drawCfg(true);
+  const all = await drawEntries();
+  const open = drawOpen(cfg);
+  const rows = [
+    open ? '🟢 <b>Draw is OPEN</b>' : (cfg.active === false ? '🔴 <b>Draw is OFF</b>' : '⌛ <b>Draw has ENDED</b>'),
+    '',
+    `🏆 Prize: <b>${hEsc(cfg.prize)}</b>`,
+    `💵 Minimum balance to join: <b>$${hEsc(cfg.min)}</b> (checked at Participate)`,
+    `🕒 Started: ${hEsc(drawDate(cfg.startAt))}`,
+    `⏳ Ends: <b>${hEsc(drawDate(cfg.endAt))}</b> · ${hEsc(drawLeft(Number(cfg.endAt) - Date.now()))}`,
+    '',
+    `👥 Entries: <b>${all.length}</b>`,
+  ];
+  const recent = all.slice(0, 8);
+  if (recent.length) {
+    rows.push('', '<b>Latest entries</b>');
+    for (const x of recent) rows.push(`${hCode(x.id)} · ${hCode(x.uid || '—')} ${hEsc(x.name || '')} · $${hEsc(r8(x.bal || 0))}`);
+  }
+  if (extra.length) rows.push('', ...extra);
+  const kb = { inline_keyboard: [
+    [cfg.active === false ? { text: '🟢 Turn draw ON', callback_data: 'draw_on' } : { text: '🔴 Turn draw OFF', callback_data: 'draw_off' }],
+    [{ text: `🔁 Restart ${DRAW_DAYS}-day timer`, callback_data: 'draw_restart' }, { text: '🎲 Pick random winner', callback_data: 'draw_pick' }],
+    [{ text: '🔄 Refresh', callback_data: 'draw_ref' }, { text: '🏠 Menu', callback_data: 'menu_home' }],
+  ] };
+  const text = hcard('🚗 BMW LUCKY DRAW', rows);
+  if (editId) return tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: editId, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: kb }).catch(() => tgSendH(text, { reply_markup: kb }));
+  return tgSendH(text, { reply_markup: kb });
+}
+async function drawPickWinner() {
+  const all = await drawEntries();
+  if (!all.length) return ['🎲 No entries yet.'];
+  const x = all[crypto.randomInt(all.length)];
+  let email = '—', phone = '—', banned = false;
+  try { const u = (await db.ref(`users/${x.fuid}`).once('value')).val() || {}; email = u.email || '—'; phone = u.phone || '—'; banned = u.banned === true || u.frozen === true; } catch {}
+  await db.ref('draw/picks').push({ at: Date.now(), id: x.id, fuid: x.fuid, uid: x.uid || null, of: all.length }).catch(() => {});
+  return [
+    `🎲 <b>Random pick</b> (out of ${all.length} entries)`,
+    `Entry ${hCode(x.id)} · UID ${hCode(x.uid || '—')} ${hEsc(x.name || '')}`,
+    `Email: ${hCode(email)} · Phone: ${hCode(phone)}`,
+    `Joined ${hEsc(drawDate(x.at))} with $${hEsc(r8(x.bal || 0))}${banned ? '\n⚠️ This account is banned/frozen' : ''}`,
+    'Nothing is announced automatically. Pick again if needed.',
+  ];
+}
+
+
+// ════════════════════════════════════════════════════════════════════
 // UID — every account gets a short UID (KYC or not). Runs for every
 // existing user at boot (child_added) and for every new sign-up.
 // ════════════════════════════════════════════════════════════════════
@@ -1595,6 +1685,50 @@ function mountAutoDeposit(app) {
     } catch (e) { log('PROMO', `claim err ${e.message}`); res.json({ ok: false, error: 'server' }); }
   });
 
+  // ─── V49 BMW LUCKY DRAW ───
+  const DRAW_RL = new Map();
+  app.get('/api/draw/info', async (_req, res) => {
+    try {
+      const c = await drawCfg();
+      res.json({ ok: true, active: c.active !== false, open: drawOpen(c), startAt: c.startAt, endAt: c.endAt, min: c.min, prize: c.prize, now: Date.now() });
+    } catch { res.json({ ok: false, error: 'server' }); }
+  });
+  app.post('/api/draw/status', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      const e = (await db.ref(`draw/entries/${fuid}`).once('value')).val();
+      res.json({ ok: true, entry: e && e.id ? e.id : null });
+    } catch { res.json({ ok: false, error: 'server' }); }
+  });
+  app.post('/api/draw/join', async (req, res) => {
+    try {
+      const fuid = await fuidFromIdToken(req);
+      if (!fuid) return res.json({ ok: false, error: 'auth' });
+      if (adLimited(DRAW_RL, fuid, 2500)) return res.json({ ok: false, error: 'slow_down' });
+      const have = (await db.ref(`draw/entries/${fuid}`).once('value')).val();
+      if (have && have.id) return res.json({ ok: true, already: true, entry: have.id });
+      const cfg = await drawCfg();
+      if (!drawOpen(cfg)) return res.json({ ok: false, error: 'ended' });
+      const u = (await db.ref(`users/${fuid}`).once('value')).val();
+      if (!u) return res.json({ ok: false, error: 'no_user' });
+      if (u.banned === true || u.frozen === true) return res.json({ ok: false, error: 'blocked' });
+      const bal = drawUsdt(u), min = Number(cfg.min) || DRAW_MIN;
+      if (!(bal >= min)) return res.json({ ok: false, error: 'balance', balance: r8(bal), min });
+      let id = 'DW-'; for (let j = 0; j < 6; j++) id += UID_CH[crypto.randomInt(32)];
+      const name = (u.profile && u.profile.nickname) || u.name || null;
+      const rec = { id, fuid, uid: u.uid || null, name, at: Date.now(), bal: r8(bal) };
+      let created = false;
+      const tx = await db.ref(`draw/entries/${fuid}`).transaction(c => { created = false; if (c) return; created = true; return rec; });
+      const fin = (tx.snapshot && tx.snapshot.val()) || rec;
+      if (created) {
+        log('DRAW', `entry ${fin.id} ${fuid} bal ${fin.bal}`);
+        drawNoteQ.push(`🎟 ${fin.id} → ${u.uid || fuid}${name ? ' ' + name : ''} · balance $${fin.bal}`);
+      }
+      res.json({ ok: true, already: !created, entry: fin.id });
+    } catch (e) { log('DRAW', `join err ${e.message}`); res.json({ ok: false, error: 'server' }); }
+  });
+
   // ─── QR LOGIN v2: server creates session, laptop polls with secret, phone approves ───
   const QR_TTL = 3 * 60 * 1000 + 30_000;
   const QR_TOK = new Map();   // qrId -> { token, exp }  (memory only; never written to the database)
@@ -2081,6 +2215,15 @@ async function handleCallback(cb, upd = null) {
     await tgAnswer(cb.id, m[1] === 'on' ? '🟢 Link ON' : m[1] === 'off' ? '🔴 Link OFF' : '🔄');
     return sendPromoPanel(m[2], cb.message?.message_id);
   }
+  if ((m = data.match(/^draw_(on|off|ref|restart|restartyes|pick)$/))) {
+    const k = m[1];
+    if (k === 'on' || k === 'off') { await db.ref('draw/cfg').update({ active: k === 'on', updatedAt: Date.now() }); DRAW_C.at = 0; await tgAnswer(cb.id, k === 'on' ? '🟢 Draw ON' : '🔴 Draw OFF'); return sendDrawPanel(cb.message?.message_id); }
+    if (k === 'restart') { await tgAnswer(cb.id, '🔁'); return tgSend(`🔁 Restart the BMW draw timer for ${DRAW_DAYS} days from now?\nExisting entries are kept.`, { parse_mode: undefined, reply_markup: { inline_keyboard: [[{ text: '✅ Yes, restart', callback_data: 'draw_restartyes' }, { text: '✖️ Cancel', callback_data: 'draw_ref' }]] } }); }
+    if (k === 'restartyes') { const now = Date.now(); await db.ref('draw/cfg').update({ startAt: now, endAt: now + DRAW_DAYS * 86400000, active: true, updatedAt: now }); DRAW_C.at = 0; await tgAnswer(cb.id, '🔁 Timer restarted'); return sendDrawPanel(); }
+    if (k === 'pick') { await tgAnswer(cb.id, '🎲'); return sendDrawPanel(null, await drawPickWinner()); }
+    await tgAnswer(cb.id, '🔄');
+    return sendDrawPanel(cb.message?.message_id);
+  }
   if (data === 'menu_promo') { await tgAnswer(cb.id, '🪔'); return sendPromoPanel('DIWALI20'); }
   if ((m = data.match(/^p2pr_(buyMin|buyMax|sellMin|sellMax|buyLimMin|buyLimMax|sellLimMin|sellLimMax)$/))) {
     await tgAnswer(cb.id, '✏️');
@@ -2379,11 +2522,10 @@ const MENU_KB = { inline_keyboard: [
   [{ text: '🆔 Open user by UID', callback_data: 'menu_find' }],
   [{ text: '🔎 Search by name', callback_data: 'menu_search' }, { text: '👥 All users', callback_data: 'menu_users' }],
   [{ text: '⏳ Pending', callback_data: 'menu_pending' }, { text: '📊 Stats', callback_data: 'menu_stats' }],
-  [{ text: '📅 Today', callback_data: 'menu_today' }],
   [{ text: '📈 Today', callback_data: 'menu_today' }, { text: '📢 Broadcasts', callback_data: 'menu_broad' }],
   [{ text: '✉️ New broadcast', callback_data: 'menu_bcnew' }, { text: '↻ Refresh', callback_data: 'menu_home' }],
   [{ text: '📱 WhatsApp', callback_data: 'wa_panel' }, { text: '💱 P2P rates', callback_data: 'menu_p2prates' }],
-  [{ text: '🪔 Diwali bonus', callback_data: 'menu_promo' }],
+  [{ text: '🪔 Diwali bonus', callback_data: 'menu_promo' }, { text: '🚗 BMW draw', callback_data: 'draw_ref' }],
 ] };
 
 // ════════════════════════════════════════════════════════════════════
@@ -3281,6 +3423,7 @@ async function handleUpdate(upd) {
   if (/^\/allmailstop(?:@\S+)?\s*$/i.test(text)) { ASK = null; if (!ALLMAIL.job) return tgSend('No email sending in progress.'); ALLMAIL.job.stop = true; return tgSend('⏹ Stopping — no more emails will be sent.'); }
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (/^\/today(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleToday().catch(e => tgSend(bad(e.message))); }
+  if (/^\/(draw|bmw)(?:@\S+)?\s*$/i.test(text)) { ASK = null; return sendDrawPanel().catch(e => tgSend(bad(e.message))); }
   if (/^\/(diwali|promo)(?:@\S+)?\s*$/i.test(text)) { ASK = null; return sendPromoPanel('DIWALI20').catch(e => tgSend(bad(e.message))); }
   { const mt = text.match(/^\/allmailtest(?:@\S+)?\s+(\S+@\S+)\s+([\s\S]+)$/i);
     if (mt) { ASK = null; return allMailTest(mt[1], mt[2].trim()).catch(e => tgSend(bad(e.message))); }
