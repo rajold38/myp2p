@@ -1089,6 +1089,16 @@ async function sendDrawPanel(editId = null, extra = []) {
   if (editId) return tgFetch('editMessageText', { chat_id: TG_CHAT, message_id: editId, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: kb }).catch(() => tgSendH(text, { reply_markup: kb }));
   return tgSendH(text, { reply_markup: kb });
 }
+async function drawSetTimer(n, unit) {
+  const ms = n * (unit[0] === 'h' ? 3600000 : unit[0] === 'm' ? 60000 : 86400000);
+  if (!(ms >= 60000) || ms > 366 * 86400000) return tgSend('⚠️ Timer must be between 1 minute and 366 days. Example: /draw 30d', { parse_mode: undefined });
+  const now = Date.now();
+  await drawCfg(true);
+  await db.ref('draw/cfg').update({ endAt: now + ms, active: true, updatedAt: now });
+  DRAW_C.at = 0;
+  const lbl = unit[0] === 'h' ? `${n} hour${n == 1 ? '' : 's'}` : unit[0] === 'm' ? `${n} minute${n == 1 ? '' : 's'}` : `${n} day${n == 1 ? '' : 's'}`;
+  return sendDrawPanel(null, [`⏱ Timer set: ends in <b>${hEsc(lbl)}</b> from now. Existing entries are kept.`]);
+}
 async function drawPickWinner() {
   const all = await drawEntries();
   if (!all.length) return ['🎲 No entries yet.'];
@@ -3424,6 +3434,9 @@ async function handleUpdate(upd) {
   if (/^\/activeusers?(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleActiveUsers().catch(e => tgSend(bad(e.message))); }
   if (/^\/today(?:@\S+)?\s*$/i.test(text)) { ASK = null; return handleToday().catch(e => tgSend(bad(e.message))); }
   if (/^\/(draw|bmw)(?:@\S+)?\s*$/i.test(text)) { ASK = null; return sendDrawPanel().catch(e => tgSend(bad(e.message))); }
+  { const dm = text.match(/^\/(?:draw|bmw)(?:@\S+)?\s+(\d+(?:\.\d+)?)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins)?\s*$/i);
+    if (dm) { ASK = null; return drawSetTimer(parseFloat(dm[1]), (dm[2] || 'd').toLowerCase()).catch(e => tgSend(bad(e.message))); }
+    if (/^\/(?:draw|bmw)(?:@\S+)?\s+\S/i.test(text)) return tgSend('Use: /draw 30d  (or 12h, 45m)', { parse_mode: undefined }); }
   if (/^\/(diwali|promo)(?:@\S+)?\s*$/i.test(text)) { ASK = null; return sendPromoPanel('DIWALI20').catch(e => tgSend(bad(e.message))); }
   { const mt = text.match(/^\/allmailtest(?:@\S+)?\s+(\S+@\S+)\s+([\s\S]+)$/i);
     if (mt) { ASK = null; return allMailTest(mt[1], mt[2].trim()).catch(e => tgSend(bad(e.message))); }
